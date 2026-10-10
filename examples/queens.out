@@ -1,0 +1,20 @@
+ 1 queens:    1 solutions
+ 2 queens:    0 solutions
+ 3 queens:    0 solutions
+ 4 queens:    2 solutions
+ 5 queens:   10 solutions
+ 6 queens:    4 solutions
+ 7 queens:   40 solutions
+ 8 queens:   92 solutions
+ 9 queens:  352 solutions
+10 queens:  724 solutions
+
+first solution for 8:
+ Q . . . . . . .
+ . . . . Q . . .
+ . . . . . . . Q
+ . . . . . Q . .
+ . . Q . . . . .
+ . . . . . . Q .
+ . Q . . . . . .
+ . . . Q . . . .

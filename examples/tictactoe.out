@@ -1,0 +1,35 @@
+perfect play from an empty board:
+ X | X | O
+---+---+---
+ O | O | X
+---+---+---
+ X | O | X
+
+draw (618175 positions searched)
+
+X opens in a corner:
+ X | X | O
+---+---+---
+ O | O | X
+---+---+---
+ X | O | X
+
+draw (68230 positions searched)
+
+X opens on an edge:
+ O | X | O
+---+---+---
+ X | O | X
+---+---+---
+ X | O | X
+
+draw (74426 positions searched)
+
+O to move on
+ X | X |  
+---+---+---
+ O | O |  
+---+---+---
+   |   |  
+
+O plays square 5

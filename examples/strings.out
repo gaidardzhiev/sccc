@@ -1,0 +1,18 @@
+A man, a plan, a canal: Panama   palindrome=1
+hello                            palindrome=0
+Was it a car or a cat I saw?     palindrome=1
+No lemon, no melon               palindrome=1
+abcab                            palindrome=0
+reverse(stressed) = desserts
+caesar +3: Dwwdfn dw Gdzq!
+caesar -3: Attack at Dawn!
+tokens: [alpha] [beta] [gamma] [delta] [epsilon]
+count of "ana" in "bananarama ananas" = 4
+strspn = 3, strcspn = 5
+strchr = /b/c, strrchr = /c
+strcmp: 1 1 1
+snprintf: [   ab|cd   |ef|Z| 99.4%]
+snprintf returned 16, kept "truncat"
+strtol: -31, rest " rest"
+atoi: 42, atof: 6.02e+23
+====================

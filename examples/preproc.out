@@ -1,0 +1,16 @@
+STR(a + b) = a + b
+XSTR(VERSION) = 2, STR(VERSION) = VERSION
+MAX(x1, x2) = 20, SQUARE(x1 + 1) = 121
+get_answer() = 42
+preproc.c:30: x1=10 x2=20
+debug: no extra arguments
+debug: with arguments
+RED   = #ff0000
+GREEN = #00ff00
+BLUE  = #0000ff
+WHITE = #ffffff
+ARRAY_LEN(color_rgb) = 4
+version 2 features on
+target is x86-64
+VERSION undefined
+__func__ = main, __STDC_VERSION__ = 199901L

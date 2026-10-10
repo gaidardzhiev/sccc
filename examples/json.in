@@ -1,0 +1,2 @@
+{"name":"sccc","self_hosting":true,"version":1.0,"targets":["x86-64"],"stats":{"lines":6400,"tests":[96,15,40],"ratio":0.125e1},
+"empty":{},"none":[],"escaped":"tab\tquote\"","nested":[[1,2],[3,[4,[5]]]],"null_value":null,"negative":-17.5}

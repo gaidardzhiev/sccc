@@ -1,0 +1,10 @@
+crc32 00000000  base64 ""  roundtrip ok
+crc32 76d32be0  base64 "Zg=="  roundtrip ok
+crc32 af73a217  base64 "Zm8="  roundtrip ok
+crc32 8c736521  base64 "Zm9v"  roundtrip ok
+crc32 3d5b8cc2  base64 "Zm9vYg=="  roundtrip ok
+crc32 9de04653  base64 "Zm9vYmE="  roundtrip ok
+crc32 9ef61f95  base64 "Zm9vYmFy"  roundtrip ok
+crc32 414fa339  base64 "VGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZw=="  roundtrip ok
+rot13: Uryyb sebz n frys-ubfgvat pbzcvyre
+rot13 again: Hello from a self-hosting compiler

@@ -1,0 +1,23 @@
+x              11011110_10101101_10111110_11101111  0xdeadbeef
+~x             00100001_01010010_01000001_00010000  0x21524110
+x >> 4         00001101_11101010_11011011_11101110  0x0deadbee
+x << 4         11101010_11011011_11101110_11110000  0xeadbeef0
+rotl(x, 8)     10101101_10111110_11101111_11011110  0xadbeefde
+reverse(x)     11110111_01111101_10110101_01111011  0xf77db57b
+x & -x         00000000_00000000_00000000_00000001  0x00000001
+x & (x - 1)    11011110_10101101_10111110_11101110  0xdeadbeee
+popcount(x) = 24, clz(x >> 9) = 9
+popcount(UINT64_MAX) = 64
+1 is a power of two: 1
+4 is a power of two: 1
+16 is a power of two: 1
+64 is a power of two: 1
+256 is a power of two: 1
+1024 is a power of two: 1
+12 is a power of two: 0
+-17 >> 2 = -5, -17 / 4 = -4, -17 % 4 = -1
+(unsigned)-1 = 4294967295, (unsigned char)300 = 44, (signed char)200 = -56
+INT_MAX = 2147483647, INT_MIN = -2147483648, LLONG_MAX = 9223372036854775807
+UINT_MAX + 1u = 0, 0u - 1 = 4294967295
+byte 0xa5 swapped nibbles 0x5a
+flags = 0x80000080, bit 7 set: 1, bit 3 set: 0

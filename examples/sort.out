@@ -1,0 +1,6 @@
+insertion  sorted=1 same=1
+quick      sorted=1 same=1
+merge      sorted=1 same=1
+qsort      sorted=1 same=1
+min 28  median 50763  max 99974
+28 10260 21234 30585 40627 50763 61058 70819 80748 90343 

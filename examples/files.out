@@ -1,0 +1,18 @@
+1| line 1: 1 squared is 1
+2| line 2: 2 squared is 4
+3| line 3: 3 squared is 9
+4| line 4: 4 squared is 16
+5| line 5: 5 squared is 25
+6| last line without number
+read 6 lines
+file size 142 bytes
+byte at offset 8: '1'
+after ungetc: '#'
+first 6 bytes: "line 1"
+feof = 1, ferror = 0
+after append 151 bytes, ends with "5 squared is 25
+last line without number
+appended
+"
+remove: 0
+open removed file: failed

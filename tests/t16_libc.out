@@ -1,0 +1,27 @@
+0x1p0                        3ff0000000000000 1 rest ""
+0x1.8p3                      4028000000000000 12 rest ""
+-0x.8p-1                     bfd0000000000000 -0.25 rest ""
+0X1P-1074                    0000000000000001 4.9406564584124654e-324 rest ""
+0x1p-1075                    0000000000000000 0 rest ""
+0x1.fffffffffffff8p1023      7ff0000000000000 inf rest ""
+0x1.fffffffffffff7ffp1023    7fefffffffffffff 1.7976931348623157e+308 rest ""
+0x123456789abcdef0123p0      44723456789abcdf 5.3730036427316852e+21 rest ""
+0x                           0000000000000000 0 rest "x"
+0xg                          0000000000000000 0 rest "xg"
+0x1p                         3ff0000000000000 1 rest "p"
+  +0xAbC.dEfp-7z             403579bde0000000 21.475553512573242 rest "z"
+inf                          7ff0000000000000 inf rest ""
+-Infinity                    fff0000000000000 -inf rest ""
+infinit                      7ff0000000000000 inf rest "init"
+nan                          7ff8000000000000 nan rest ""
+NaN(abc_1)                   7ff8000000000000 nan rest ""
+-nan                         fff8000000000000 -nan rest ""
+1e-400                       0000000000000000 0 rest ""
+2.5e-324                     0000000000000001 4.9406564584124654e-324 rest ""
+nan -nan +nan -nan NAN   inf|-inf  |
+3.40282347e+38 1.7976931348623157e+308 15 24 1.1920929e-07
+0.25 1 10 3 1.7976931348623157e+308
+0
+unbuffered stderr line
+line buffered
+1

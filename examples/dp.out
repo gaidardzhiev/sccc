@@ -1,0 +1,8 @@
+kitten     sitting    edit distance 3, lcs "ittn"
+flaw       lawn       edit distance 2, lcs "law"
+compiler   complier   edit distance 2, lcs "compler"
+           abc        edit distance 3, lcs ""
+intention  execution  edit distance 5, lcs "etion"
+knapsack capacity 40: best value 79, items 1(w7,v13) 2(w11,v23) 3(w8,v15) 6(w14,v28)
+ways to make 200 from uk coins: 73682
+ways to make 100 from 1,5,10,25,50: 292

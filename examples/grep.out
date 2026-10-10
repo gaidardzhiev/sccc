@@ -1,0 +1,17 @@
+pattern "^int":
+   1: int main(void)
+  1 matching lines
+pattern "ab*c":
+   6: abbbbbc
+   7: ac
+  2 matching lines
+pattern "text)$":
+   2: static int match(const char *re, const char *text)
+  1 matching lines
+pattern "^#.*h>$":
+   8: #include <stdio.h>
+  1 matching lines
+pattern "o.*o":
+   2: static int match(const char *re, const char *text)
+   4: the quick brown fox
+  2 matching lines

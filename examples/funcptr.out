@@ -1,0 +1,11 @@
+fold add = 31
+fold sub = -31
+fold mul = 6480
+fold max = 9
+lookup("mul")(6, 7) = 42
+(*lookup("sub"))(6, 7) = -1
+lookup("div") is NULL
+squared: 9 1 16 1 25 81 4 36
+negated: -9 -1 -16 -1 -25 -81 -4 -36
+by length: fig date kiwi pear apple banana cherry
+called puts through a pointer

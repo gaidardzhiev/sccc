@@ -1,0 +1,20 @@
+from Amsterdam:
+  Berlin       750 km via A H B
+  Copenhagen   800 km via A H C
+  Dresden      880 km via A E F J D
+  Essen        210 km via A E
+  Frankfurt    460 km via A E F
+  Geneva      1050 km via A E F G
+  Hamburg      460 km via A H
+  Innsbruck    980 km via A E F I
+  Jena         720 km via A E F J
+from Geneva:
+  Amsterdam   1050 km via G F E A
+  Berlin      1090 km via G F J B
+  Copenhagen  1540 km via G F E H C
+  Dresden     1010 km via G F J D
+  Essen        840 km via G F E
+  Frankfurt    590 km via G F
+  Hamburg     1200 km via G F E H
+  Innsbruck    560 km via G I
+  Jena         850 km via G F J

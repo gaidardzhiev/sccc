@@ -1,0 +1,12 @@
+circle   at (0,0) area 12.566
+rect     at (1,1) area 13.500
+triangle at (0,0) area 6.000
+point sum (0.5, 12)
+copy w=10, original w=3
+flags: ready=1 mode=5 count=4000 delta=-7
+flags: ready=1 mode=1 count=4 delta=-8
+1 2 0 0 
+0 5 0 0 
+0 0 0 9 
+sizeof Point 16, Shape 80, offsetof(Shape, u) 32
+byte order: 4 3 2 1

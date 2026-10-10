@@ -1,0 +1,14 @@
+copy  0: "Duff's d________________________________________________________Duff's device copies eight bytes per loop."
+copy  5: "Duff'"
+copy 10: "Duff's dev"
+copy 15: "Duff's device c"
+7 found at [1][2]
+14 found at [3][1]
+21 not found
+numbers in "a1 b22 333c d 4e55": 5
+100 -> A
+93 -> A
+85 -> B
+71 -> C
+64 -> D
+12 -> F

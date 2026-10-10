@@ -1,0 +1,9 @@
+argc = 8
+argv[1] = "-v"
+argv[2] = "10"
+argv[3] = "-n"
+argv[5] = "20"
+argv[6] = "-v"
+argv[7] = "12"
+argv[argc] is NULL
+hello, compiler; verbose level 2; sum of numbers 42

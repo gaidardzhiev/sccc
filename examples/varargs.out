@@ -1,0 +1,7 @@
+sum() = 0
+sum(1..10) = 55
+average = 4.250
+concat = self-hosting compiler
+mini: -42 str x 3.14 %
+[info] 3 files, no errors
+[warn]  87.2% done

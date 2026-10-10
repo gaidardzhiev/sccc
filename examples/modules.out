@@ -1,0 +1,4 @@
+stack full at 33
+size 32
+popped: 1024 961 900 841 784
+size 27, operations 39, local bump() -1

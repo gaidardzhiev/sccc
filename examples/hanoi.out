@@ -1,0 +1,37 @@
+move disk 1 from A to B
+move disk 2 from A to C
+move disk 1 from B to C
+move disk 3 from A to B
+move disk 1 from C to A
+move disk 2 from C to B
+move disk 1 from A to B
+move disk 4 from A to C
+move disk 1 from B to C
+move disk 2 from B to A
+move disk 1 from C to A
+move disk 3 from B to C
+move disk 1 from A to B
+move disk 2 from A to C
+move disk 1 from B to C
+15 moves
+
+ 1 disks:       1 moves
+ 2 disks:       3 moves
+ 3 disks:       7 moves
+ 4 disks:      15 moves
+ 5 disks:      31 moves
+ 6 disks:      63 moves
+ 7 disks:     127 moves
+ 8 disks:     255 moves
+ 9 disks:     511 moves
+10 disks:    1023 moves
+11 disks:    2047 moves
+12 disks:    4095 moves
+13 disks:    8191 moves
+14 disks:   16383 moves
+15 disks:   32767 moves
+16 disks:   65535 moves
+17 disks:  131071 moves
+18 disks:  262143 moves
+19 disks:  524287 moves
+20 disks: 1048575 moves

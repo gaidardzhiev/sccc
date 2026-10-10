@@ -1,0 +1,14 @@
+   1 = I               -> 1
+   4 = IV              -> 4
+   9 = IX              -> 9
+  14 = XIV             -> 14
+  40 = XL              -> 40
+  90 = XC              -> 90
+ 400 = CD              -> 400
+1066 = MLXVI           -> 1066
+1984 = MCMLXXXIV       -> 1984
+1999 = MCMXCIX         -> 1999
+2026 = MMXXVI          -> 2026
+3888 = MMMDCCCLXXXVIII -> 3888
+3999 = MMMCMXCIX       -> 3999
+round trip 1..3999: 0 mismatches

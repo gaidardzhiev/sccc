@@ -1,0 +1,19 @@
+70
+"hello, world"
+12
+[1, 2, 3, 42, [28, "z"]]
+5
+110
+1
+0
+8
+error: undefined variable 'undefined_thing'
+1
+error: unknown function foo
+0
+alice   90
+dave    70
+bob     50
+carol   50
+5 14
+words=5

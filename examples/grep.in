@@ -1,0 +1,10 @@
+int main(void)
+static int match(const char *re, const char *text)
+return 0;
+the quick brown fox
+aaa
+abbbbbc
+ac
+#include <stdio.h>
+while (*text++ != '\0')
+end of file
