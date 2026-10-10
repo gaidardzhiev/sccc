@@ -1,5 +1,8 @@
 CC=gcc
 BIN=sccc
+STAGE2=sccc2
+STAGE3=sccc3
+TESTC=test_sccc
 FLAGS=-std=c99 -pedantic -Wall -Wextra -O2
 
 .PHONY: all embed test bootstrap check examples fuzz clean
@@ -13,20 +16,20 @@ embed:
 	tools/embed.sh
 
 test:
-	$(CC) -o test_sccc test_sccc.c
+	$(CC) -o $(TESTC) test_sccc.c
 
 bootstrap: $(BIN)
-	./$(BIN) sccc.c -o sccc2
-	./sccc2 sccc.c -o sccc3
-	cmp sccc2 sccc3 && echo "bootstrap verified: sccc2 == sccc3"
+	./$(BIN) sccc.c -o $(STAGE2)
+	./$(STAGE2) sccc.c -o $(STAGE3)
+	cmp $(STAGE2) $(STAGE3) && printf "bootstrap verified: sccc2 == sccc3\n"
 
 check: $(BIN) test bootstrap
-	./test_sccc ./$(BIN) | tail -1
+	./$(TESTC) ./$(BIN) | tail -1
 	tests/run.sh ./$(BIN)
-	./test_sccc ./sccc2 | tail -1
-	tests/run.sh ./sccc2
+	./$(TESTC) ./$(STAGE2) | tail -1
+	tests/run.sh ./$(STAGE2)
 	examples/run.sh ./$(BIN)
-	examples/run.sh ./sccc2
+	examples/run.sh ./$(STAGE2)
 
 examples: $(BIN)
 	examples/run.sh ./$(BIN)
@@ -35,4 +38,4 @@ fuzz: $(BIN)
 	tools/fuzz_expr.py ./$(BIN) 50
 
 clean:
-	rm -rf $(BIN) test_sccc sccc2 sccc3
+	rm -rf $(BIN) $(TESTC) $(STAGE2) $(STAGE3)
