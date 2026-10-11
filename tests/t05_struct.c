@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Ivan Gaydardzhiev
+ * Licensed under the GPL-3.0-only
+ */
+
 struct point { int x, y; };
 typedef struct { char c; long l; short s; } Mixed;
 struct node { int val; struct node *next; };

@@ -1,9 +1,15 @@
 #!/bin/sh
+# Copyright (C) 2026 Ivan Gaydardzhiev
+# Licensed under the GPL-3.0-only
+
 CC=${1:-./sccc}
 DIR=$(dirname "$0")
 TMP=${TMPDIR:-/tmp}/sccc-tests.$$
+
 mkdir -p "$TMP"
+
 pass=0; fail=0
+
 for t in "$DIR"/*.c; do
 	n=$(basename "$t" .c)
 	case "$n" in *_part*) continue;; esac
@@ -19,6 +25,9 @@ for t in "$DIR"/*.c; do
 	fi
 	pass=$((pass+1))
 done
+
 rm -rf "$TMP"
+
 echo "tests: $pass passed, $fail failed"
+
 [ $fail -eq 0 ]

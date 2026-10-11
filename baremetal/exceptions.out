@@ -1,0 +1,7 @@
+exceptions
+#BP ok
+#DE ok
+#BP again ok
+#PF ok
+pf err 0x0000000000000002 cr2 0x0000000040300000
+locals ok

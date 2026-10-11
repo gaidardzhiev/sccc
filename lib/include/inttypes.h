@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Ivan Gaydardzhiev
+ * Licensed under the GPL-3.0-only
+ */
+
 #ifndef _INTTYPES_H
 #define _INTTYPES_H
 #include <stdint.h>

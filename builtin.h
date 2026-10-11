@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Ivan Gaydardzhiev
+ * Licensed under the GPL-3.0-only
+ */
+
 static const char *builtin_names[] = {
 	"assert.h",
 	"ctype.h",
@@ -21,6 +26,11 @@ static const char *builtin_names[] = {
 	NULL
 };
 static const char *builtin_srcs[] = {
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#undef assert\n"
 	"#ifdef NDEBUG\n"
 	"#define assert(x) ((void)0)\n"
@@ -29,6 +39,11 @@ static const char *builtin_srcs[] = {
 	"#define assert(x) ((x) ? (void)0 : __assert_fail(#x, __FILE__, __LINE__))\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _CTYPE_H\n"
 	"#define _CTYPE_H\n"
 	"int isalnum(int c);\n"
@@ -47,6 +62,11 @@ static const char *builtin_srcs[] = {
 	"int toupper(int c);\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _ERRNO_H\n"
 	"#define _ERRNO_H\n"
 	"extern int errno;\n"
@@ -87,6 +107,11 @@ static const char *builtin_srcs[] = {
 	"#define ENOTEMPTY 39\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _FCNTL_H\n"
 	"#define _FCNTL_H\n"
 	"#include <sys/types.h>\n"
@@ -100,6 +125,11 @@ static const char *builtin_srcs[] = {
 	"int open(const char *path, int flags, ...);\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _FLOAT_H\n"
 	"#define _FLOAT_H\n"
 	"#define FLT_RADIX 2\n"
@@ -135,6 +165,11 @@ static const char *builtin_srcs[] = {
 	"#define LDBL_EPSILON DBL_EPSILON\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _INTTYPES_H\n"
 	"#define _INTTYPES_H\n"
 	"#include <stdint.h>\n"
@@ -152,6 +187,11 @@ static const char *builtin_srcs[] = {
 	"#define PRIX64 \"lX\"\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _LIMITS_H\n"
 	"#define _LIMITS_H\n"
 	"#define CHAR_BIT 8\n"
@@ -175,6 +215,11 @@ static const char *builtin_srcs[] = {
 	"#define PATH_MAX 4096\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _MATH_H\n"
 	"#define _MATH_H\n"
 	"#define HUGE_VAL (1e300 * 1e300)\n"
@@ -207,6 +252,11 @@ static const char *builtin_srcs[] = {
 	"double atan2(double y, double x);\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _STDARG_H\n"
 	"#define _STDARG_H\n"
 	"typedef struct {\n"
@@ -223,6 +273,11 @@ static const char *builtin_srcs[] = {
 	"#define va_copy(dst, src) ((dst)[0] = (src)[0])\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _STDBOOL_H\n"
 	"#define _STDBOOL_H\n"
 	"#define bool _Bool\n"
@@ -231,6 +286,11 @@ static const char *builtin_srcs[] = {
 	"#define __bool_true_false_are_defined 1\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _STDDEF_H\n"
 	"#define _STDDEF_H\n"
 	"typedef unsigned long size_t;\n"
@@ -242,6 +302,11 @@ static const char *builtin_srcs[] = {
 	"#define offsetof(type, member) ((size_t)&((type *)0)->member)\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _STDINT_H\n"
 	"#define _STDINT_H\n"
 	"typedef signed char int8_t;\n"
@@ -282,6 +347,11 @@ static const char *builtin_srcs[] = {
 	"#define UINT64_C(x) x ## UL\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _STDIO_H\n"
 	"#define _STDIO_H\n"
 	"#include <stddef.h>\n"
@@ -336,6 +406,11 @@ static const char *builtin_srcs[] = {
 	"int rename(const char *from, const char *to);\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _STDLIB_H\n"
 	"#define _STDLIB_H\n"
 	"#include <stddef.h>\n"
@@ -369,6 +444,11 @@ static const char *builtin_srcs[] = {
 	"void srand(unsigned int seed);\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _STRING_H\n"
 	"#define _STRING_H\n"
 	"#include <stddef.h>\n"
@@ -397,6 +477,11 @@ static const char *builtin_srcs[] = {
 	"char *strerror(int err);\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _SYS_MMAN_H\n"
 	"#define _SYS_MMAN_H\n"
 	"#include <sys/types.h>\n"
@@ -414,6 +499,11 @@ static const char *builtin_srcs[] = {
 	"int munmap(void *addr, size_t len);\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _SYS_STAT_H\n"
 	"#define _SYS_STAT_H\n"
 	"#include <sys/types.h>\n"
@@ -448,6 +538,11 @@ static const char *builtin_srcs[] = {
 	"int fstat(int fd, struct stat *st);\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _SYS_TYPES_H\n"
 	"#define _SYS_TYPES_H\n"
 	"#include <stddef.h>\n"
@@ -460,6 +555,11 @@ static const char *builtin_srcs[] = {
 	"typedef long time_t;\n"
 	"#endif\n"
 	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _UNISTD_H\n"
 	"#define _UNISTD_H\n"
 	"#include <sys/types.h>\n"
@@ -488,6 +588,11 @@ static const char *builtin_srcs[] = {
 	NULL
 };
 static const char *builtin_libc[] = {
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#include <stddef.h>\n"
 	"#include <stdint.h>\n"
 	"#include <stdarg.h>\n"
@@ -523,12 +628,12 @@ static const char *builtin_libc[] = {
 	"#define SYS_chmod 90\n"
 	"#define SYS_exit_group 231\n"
 	"\n"
+	,
 	"int errno;\n"
 	"char **environ;\n"
 	"\n"
 	"static long sys_ret(long r) {\n"
 	"\tif (r < 0 && r > -4096) { errno = (int)-r; return -1; }\n"
-	,
 	"\treturn r;\n"
 	"}\n"
 	"\n"
@@ -564,12 +669,12 @@ static const char *builtin_libc[] = {
 	"\treturn __syscall(SYS_ioctl, fd, 0x5401, termios) == 0;\n"
 	"}\n"
 	"\n"
+	,
 	"int open(const char *path, int flags, ...) {\n"
 	"\tva_list ap;\n"
 	"\tva_start(ap, flags);\n"
 	"\tint mode = va_arg(ap, int);\n"
 	"\tva_end(ap);\n"
-	,
 	"\treturn (int)sys_ret(__syscall(SYS_open, path, flags, mode));\n"
 	"}\n"
 	"\n"
@@ -605,12 +710,12 @@ static const char *builtin_libc[] = {
 	"\tif (r < 0 && r > -4096) return NULL;\n"
 	"\treturn (void *)r;\n"
 	"}\n"
+	,
 	"\n"
 	"void *malloc(size_t n) {\n"
 	"\tif (n == 0) n = 1;\n"
 	"\tint cls = 0;\n"
 	"\tunsigned long sz = 16;\n"
-	,
 	"\twhile (sz < n && cls < NCLASS) { sz <<= 1; cls++; }\n"
 	"\tBlock *b;\n"
 	"\tif (cls >= NCLASS) {\n"
@@ -646,12 +751,12 @@ static const char *builtin_libc[] = {
 	"\tif (b->cls >= NCLASS) {\n"
 	"\t\t__syscall(SYS_munmap, b, b->size + sizeof(Block));\n"
 	"\t\treturn;\n"
+	,
 	"\t}\n"
 	"\tb->next = free_lists[b->cls];\n"
 	"\tfree_lists[b->cls] = b;\n"
 	"}\n"
 	"\n"
-	,
 	"void *calloc(size_t n, size_t size) {\n"
 	"\tsize_t total = n * size;\n"
 	"\tif (size && total / size != n) { errno = ENOMEM; return NULL; }\n"
@@ -687,12 +792,12 @@ static const char *builtin_libc[] = {
 	"\td += n; s += n;\n"
 	"\twhile (n--) *--d = *--s;\n"
 	"\treturn dst;\n"
+	,
 	"}\n"
 	"\n"
 	"void *memset(void *s, int c, size_t n) {\n"
 	"\tunsigned char *p = (unsigned char *)s;\n"
 	"\twhile (n--) *p++ = (unsigned char)c;\n"
-	,
 	"\treturn s;\n"
 	"}\n"
 	"\n"
@@ -728,12 +833,12 @@ static const char *builtin_libc[] = {
 	"\twhile ((*d++ = *src++)) ;\n"
 	"\treturn dst;\n"
 	"}\n"
+	,
 	"\n"
 	"char *strncpy(char *dst, const char *src, size_t n) {\n"
 	"\tsize_t i = 0;\n"
 	"\tfor (; i < n && src[i]; i++) dst[i] = src[i];\n"
 	"\tfor (; i < n; i++) dst[i] = 0;\n"
-	,
 	"\treturn dst;\n"
 	"}\n"
 	"\n"
@@ -769,12 +874,12 @@ static const char *builtin_libc[] = {
 	"\t}\n"
 	"}\n"
 	"\n"
+	,
 	"char *strrchr(const char *s, int c) {\n"
 	"\tconst char *r = NULL;\n"
 	"\tfor (;; s++) {\n"
 	"\t\tif (*s == (char)c) r = s;\n"
 	"\t\tif (!*s) return (char *)r;\n"
-	,
 	"\t}\n"
 	"}\n"
 	"\n"
@@ -810,12 +915,12 @@ static const char *builtin_libc[] = {
 	"\ts += strspn(s, delim);\n"
 	"\tif (!*s) { save = NULL; return NULL; }\n"
 	"\tchar *e = s + strcspn(s, delim);\n"
+	,
 	"\tif (*e) { *e = 0; save = e + 1; } else save = NULL;\n"
 	"\treturn s;\n"
 	"}\n"
 	"\n"
 	"char *strdup(const char *s) {\n"
-	,
 	"\tsize_t n = strlen(s) + 1;\n"
 	"\tchar *p = (char *)malloc(n);\n"
 	"\tif (p) memcpy(p, s, n);\n"
@@ -851,12 +956,12 @@ static const char *builtin_libc[] = {
 	"\tcase EMFILE: return \"Too many open files\";\n"
 	"\tcase ENOTTY: return \"Inappropriate ioctl for device\";\n"
 	"\tcase ENOSPC: return \"No space left on device\";\n"
+	,
 	"\tcase ESPIPE: return \"Illegal seek\";\n"
 	"\tcase EROFS: return \"Read-only file system\";\n"
 	"\tcase EPIPE: return \"Broken pipe\";\n"
 	"\tcase ERANGE: return \"Numerical result out of range\";\n"
 	"\tcase ENAMETOOLONG: return \"File name too long\";\n"
-	,
 	"\tcase ENOSYS: return \"Function not implemented\";\n"
 	"\tcase ENOTEMPTY: return \"Directory not empty\";\n"
 	"\t}\n"
@@ -892,12 +997,12 @@ static const char *builtin_libc[] = {
 	"\tfor (;; p++) {\n"
 	"\t\tint d;\n"
 	"\t\tif (isdigit(*p)) d = *p - '0';\n"
+	,
 	"\t\telse if (islower(*p)) d = *p - 'a' + 10;\n"
 	"\t\telse if (isupper(*p)) d = *p - 'A' + 10;\n"
 	"\t\telse break;\n"
 	"\t\tif (d >= base) break;\n"
 	"\t\tv = v * base + d;\n"
-	,
 	"\t}\n"
 	"\tif (p == start) p = s;\n"
 	"\tif (end) *end = (char *)p;\n"
@@ -933,12 +1038,12 @@ static const char *builtin_libc[] = {
 	"\tif (carry && b->n < BIGN) b->d[b->n++] = (unsigned int)carry;\n"
 	"}\n"
 	"\n"
+	,
 	"static void big_mul_pow10(Big *b, int k) {\n"
 	"\twhile (k >= 9) { big_mul_add(b, 1000000000u, 0); k -= 9; }\n"
 	"\twhile (k-- > 0) big_mul_add(b, 10, 0);\n"
 	"}\n"
 	"\n"
-	,
 	"static int big_bitlen(Big *b) {\n"
 	"\tif (b->n == 0) return 0;\n"
 	"\tunsigned int top = b->d[b->n - 1];\n"
@@ -974,12 +1079,12 @@ static const char *builtin_libc[] = {
 	"}\n"
 	"\n"
 	"static void big_sub(Big *a, Big *b) {\n"
+	,
 	"\tlong borrow = 0;\n"
 	"\tfor (int i = 0; i < a->n; i++) {\n"
 	"\t\tlong t = (long)a->d[i] - (i < b->n ? (long)b->d[i] : 0) - borrow;\n"
 	"\t\tborrow = t < 0;\n"
 	"\t\ta->d[i] = (unsigned int)(t + (borrow ? 0x100000000L : 0));\n"
-	,
 	"\t}\n"
 	"\twhile (a->n > 0 && a->d[a->n - 1] == 0) a->n--;\n"
 	"}\n"
@@ -1015,12 +1120,12 @@ static const char *builtin_libc[] = {
 	"\treturn v;\n"
 	"}\n"
 	"\n"
+	,
 	"static double decimal_to_double(Big *digits, int e10, int sticky_in) {\n"
 	"\tBig n, p, t;\n"
 	"\tif (digits->n == 0) return 0.0;\n"
 	"\tif (e10 > 400) return INFINITY;\n"
 	"\tif (e10 < -1200) return 0.0;\n"
-	,
 	"\tif (e10 >= 0) {\n"
 	"\t\tn = *digits;\n"
 	"\t\tbig_mul_pow10(&n, e10);\n"
@@ -1056,12 +1161,12 @@ static const char *builtin_libc[] = {
 	"}\n"
 	"\n"
 	"static int strncasecmp_ascii(const char *a, const char *b, int n) {\n"
+	,
 	"\tfor (int i = 0; i < n; i++) {\n"
 	"\t\tint x = a[i] | 32, y = b[i];\n"
 	"\t\tif (!a[i] || x != y) return 1;\n"
 	"\t}\n"
 	"\treturn 0;\n"
-	,
 	"}\n"
 	"\n"
 	"double strtod(const char *s, char **end) {\n"
@@ -1097,12 +1202,12 @@ static const char *builtin_libc[] = {
 	"\t\t\tif (q >> 60) {\n"
 	"\t\t\t\tif (dv) sticky = 1;\n"
 	"\t\t\t\tif (!frac) e2 += 4;\n"
+	,
 	"\t\t\t} else {\n"
 	"\t\t\t\tq = q << 4 | (unsigned long)dv;\n"
 	"\t\t\t\tif (frac) e2 -= 4;\n"
 	"\t\t\t}\n"
 	"\t\t}\n"
-	,
 	"\t\tif (*p == 'p' || *p == 'P') {\n"
 	"\t\t\tconst char *r = p + 1;\n"
 	"\t\t\tint eneg = 0, e = 0;\n"
@@ -1138,12 +1243,12 @@ static const char *builtin_libc[] = {
 	"\t\t\tif (!frac) exp10++;\n"
 	"\t\t}\n"
 	"\t}\n"
+	,
 	"\tif (!any) { if (end) *end = (char *)s; return 0.0; }\n"
 	"\tif (*p == 'e' || *p == 'E') {\n"
 	"\t\tconst char *q = p + 1;\n"
 	"\t\tint eneg = 0, e = 0;\n"
 	"\t\tif (*q == '+') q++;\n"
-	,
 	"\t\telse if (*q == '-') { eneg = 1; q++; }\n"
 	"\t\tif (isdigit(*q)) {\n"
 	"\t\t\twhile (isdigit(*q)) { if (e < 100000) e = e * 10 + (*q - '0'); q++; }\n"
@@ -1179,12 +1284,12 @@ static const char *builtin_libc[] = {
 	"\tsize_t n = strlen(name);\n"
 	"\tif (!environ) return NULL;\n"
 	"\tfor (char **e = environ; *e; e++)\n"
+	,
 	"\t\tif (strncmp(*e, name, n) == 0 && (*e)[n] == '=') return *e + n + 1;\n"
 	"\treturn NULL;\n"
 	"}\n"
 	"\n"
 	"static void swap_bytes(char *a, char *b, size_t n) {\n"
-	,
 	"\twhile (n--) { char t = *a; *a++ = *b; *b++ = t; }\n"
 	"}\n"
 	"\n"
@@ -1220,12 +1325,12 @@ static const char *builtin_libc[] = {
 	"\t}\n"
 	"\treturn NULL;\n"
 	"}\n"
+	,
 	"\n"
 	"double fabs(double x) { return x < 0 ? -x : x; }\n"
 	"float fabsf(float x) { return x < 0 ? -x : x; }\n"
 	"\n"
 	"double trunc(double x) {\n"
-	,
 	"\tif (isnan(x) || fabs(x) >= 4503599627370496.0) return x;\n"
 	"\treturn (double)(long)x;\n"
 	"}\n"
@@ -1261,12 +1366,12 @@ static const char *builtin_libc[] = {
 	"\n"
 	"double ldexp(double x, int e) {\n"
 	"\twhile (e > 0) { x = x * 2.0; e--; }\n"
+	,
 	"\twhile (e < 0) { x = x * 0.5; e++; }\n"
 	"\treturn x;\n"
 	"}\n"
 	"\n"
 	"double frexp(double x, int *e) {\n"
-	,
 	"\t*e = 0;\n"
 	"\tif (x == 0 || isnan(x) || isinf(x)) return x;\n"
 	"\tdouble a = fabs(x);\n"
@@ -1302,12 +1407,12 @@ static const char *builtin_libc[] = {
 	"\tdouble ln2 = 0.69314718055994530942;\n"
 	"\tdouble z = (m - 1) / (m + 1), z2 = z * z, term = z, sum = 0;\n"
 	"\tfor (int i = 1; i < 60; i += 2) { sum = sum + term / i; term = term * z2; }\n"
+	,
 	"\treturn 2 * sum + e * ln2;\n"
 	"}\n"
 	"\n"
 	"double log10(double x) { return log(x) / 2.30258509299404568402; }\n"
 	"\n"
-	,
 	"double pow(double x, double y) {\n"
 	"\tif (y == 0) return 1.0;\n"
 	"\tif (y == trunc(y) && fabs(y) < 1e9) {\n"
@@ -1343,12 +1448,12 @@ static const char *builtin_libc[] = {
 	"\tdouble y = x / (1 + sqrt(1 + x * x));\n"
 	"\tdouble term = y, sum = 0, y2 = y * y;\n"
 	"\tfor (int i = 1; i < 80; i += 2) { sum = sum + term / i; term = -term * y2; }\n"
+	,
 	"\treturn 2 * sum;\n"
 	"}\n"
 	"\n"
 	"double atan2(double y, double x) {\n"
 	"\tdouble pi = 3.14159265358979323846;\n"
-	,
 	"\tif (x > 0) return atan(y / x);\n"
 	"\tif (x < 0) return y >= 0 ? atan(y / x) + pi : atan(y / x) - pi;\n"
 	"\tif (y > 0) return pi / 2;\n"
@@ -1384,12 +1489,12 @@ static const char *builtin_libc[] = {
 	"static int stdio_ready;\n"
 	"\n"
 	"static void (*atexit_fns[32])(void);\n"
+	,
 	"static int natexit;\n"
 	"\n"
 	"static void init_file(FILE *f, int fd, int flags) {\n"
 	"\tf->fd = fd;\n"
 	"\tf->flags = flags;\n"
-	,
 	"\tf->buf = NULL;\n"
 	"\tf->bufsize = 0;\n"
 	"\tf->pos = 0;\n"
@@ -1425,12 +1530,12 @@ static const char *builtin_libc[] = {
 	"int fflush(FILE *f) {\n"
 	"\tif (!f) {\n"
 	"\t\tfor (FILE *g = open_files; g; g = g->next) fflush(g);\n"
+	,
 	"\t\treturn 0;\n"
 	"\t}\n"
 	"\tif ((f->flags & F_WRITE) && f->pos > 0) {\n"
 	"\t\tint r = write_all(f->fd, f->buf, f->pos);\n"
 	"\t\tf->pos = 0;\n"
-	,
 	"\t\tif (r < 0) { f->flags |= F_ERR; return EOF; }\n"
 	"\t}\n"
 	"\treturn 0;\n"
@@ -1466,12 +1571,12 @@ static const char *builtin_libc[] = {
 	"\treturn n;\n"
 	"}\n"
 	"\n"
+	,
 	"int setvbuf(FILE *f, char *buf, int mode, size_t size) {\n"
 	"\t(void)buf;\n"
 	"\t(void)size;\n"
 	"\tif (fflush(f) == EOF) return -1;\n"
 	"\tf->flags &= ~(F_UNBUF | F_LINE);\n"
-	,
 	"\tif (mode == _IONBF) f->flags |= F_UNBUF;\n"
 	"\telse if (mode == _IOLBF) f->flags |= F_LINE;\n"
 	"\telse if (mode != _IOFBF) return -1;\n"
@@ -1507,12 +1612,12 @@ static const char *builtin_libc[] = {
 	"\t\tif (r < 0 && errno == EINTR) continue;\n"
 	"\t\tif (r < 0) { f->flags |= F_ERR; return -1; }\n"
 	"\t\tif (r == 0) { f->flags |= F_EOF; return -1; }\n"
+	,
 	"\t\tf->pos = 0;\n"
 	"\t\tf->len = (int)r;\n"
 	"\t\treturn 0;\n"
 	"\t}\n"
 	"}\n"
-	,
 	"\n"
 	"int fgetc(FILE *f) {\n"
 	"\tif (f->unget >= 0) { int c = f->unget; f->unget = -1; return c; }\n"
@@ -1548,12 +1653,12 @@ static const char *builtin_libc[] = {
 	"\tunsigned char *p = (unsigned char *)buf;\n"
 	"\tif (total == 0) return 0;\n"
 	"\tif (f->unget >= 0) { p[got++] = (unsigned char)f->unget; f->unget = -1; }\n"
+	,
 	"\twhile (got < total) {\n"
 	"\t\tif (f->pos < f->len) {\n"
 	"\t\t\tsize_t k = f->len - f->pos;\n"
 	"\t\t\tif (k > total - got) k = total - got;\n"
 	"\t\t\tmemcpy(p + got, f->buf + f->pos, k);\n"
-	,
 	"\t\t\tf->pos += (int)k;\n"
 	"\t\t\tgot += k;\n"
 	"\t\t\tcontinue;\n"
@@ -1589,12 +1694,12 @@ static const char *builtin_libc[] = {
 	"\tint fd = open(path, flags, 0666);\n"
 	"\tif (fd < 0) return NULL;\n"
 	"\tFILE *f = fdopen(fd, mode);\n"
+	,
 	"\tif (!f) close(fd);\n"
 	"\treturn f;\n"
 	"}\n"
 	"\n"
 	"int fclose(FILE *f) {\n"
-	,
 	"\tint r = fflush(f);\n"
 	"\tif (close(f->fd) < 0) r = EOF;\n"
 	"\tFILE **pp = &open_files;\n"
@@ -1630,12 +1735,12 @@ static const char *builtin_libc[] = {
 	"\n"
 	"typedef struct {\n"
 	"\tFILE *f;\n"
+	,
 	"\tchar *buf;\n"
 	"\tsize_t cap;\n"
 	"\tsize_t n;\n"
 	"} Out;\n"
 	"\n"
-	,
 	"static void out_ch(Out *o, int c) {\n"
 	"\tif (o->f) fputc(c, o->f);\n"
 	"\telse if (o->n + 1 < o->cap) o->buf[o->n] = (char)c;\n"
@@ -1671,12 +1776,12 @@ static const char *builtin_libc[] = {
 	"\t\t\tbig[i] = (unsigned int)t;\n"
 	"\t\t\tcarry = t >> 32;\n"
 	"\t\t}\n"
+	,
 	"\t\tif (carry) big[n++] = (unsigned int)carry;\n"
 	"\t\tcount -= k;\n"
 	"\t}\n"
 	"\tchar rev[1200];\n"
 	"\tint nd = 0;\n"
-	,
 	"\twhile (n > 0) {\n"
 	"\t\tunsigned long rem = 0;\n"
 	"\t\tfor (int i = n - 1; i >= 0; i--) {\n"
@@ -1712,12 +1817,12 @@ static const char *builtin_libc[] = {
 	"\t\twhile (i >= 0 && d[i] == '9') { d[i] = '0'; i--; }\n"
 	"\t\tif (i >= 0) d[i]++;\n"
 	"\t\telse {\n"
+	,
 	"\t\t\tmemmove(d + 1, d, nd);\n"
 	"\t\t\td[0] = '1';\n"
 	"\t\t\tnd++;\n"
 	"\t\t\t*dp = *dp + 1;\n"
 	"\t\t}\n"
-	,
 	"\t}\n"
 	"\treturn nd;\n"
 	"}\n"
@@ -1753,12 +1858,12 @@ static const char *builtin_libc[] = {
 	"\tunsigned long bits;\n"
 	"\tmemcpy(&bits, &v, 8);\n"
 	"\tif (bits >> 63) { buf[n++] = '-'; v = -v; }\n"
+	,
 	"\telse if (plus) buf[n++] = '+';\n"
 	"\telse if (space) buf[n++] = ' ';\n"
 	"\tif (v != v) {\n"
 	"\t\tmemcpy(buf + n, upper ? \"NAN\" : \"nan\", 3);\n"
 	"\t\treturn n + 3;\n"
-	,
 	"\t}\n"
 	"\tif (v - v != 0) {\n"
 	"\t\tmemcpy(buf + n, upper ? \"INF\" : \"inf\", 3);\n"
@@ -1794,12 +1899,12 @@ static const char *builtin_libc[] = {
 	"\treturn n + len;\n"
 	"}\n"
 	"\n"
+	,
 	"static int format(Out *o, const char *fmt, va_list ap) {\n"
 	"\tfor (; *fmt; fmt++) {\n"
 	"\t\tif (*fmt != '%') { out_ch(o, *fmt); continue; }\n"
 	"\t\tfmt++;\n"
 	"\t\tint left = 0, plus = 0, space = 0, alt = 0, zero = 0;\n"
-	,
 	"\t\tfor (;; fmt++) {\n"
 	"\t\t\tif (*fmt == '-') left = 1;\n"
 	"\t\t\telse if (*fmt == '+') plus = 1;\n"
@@ -1835,12 +1940,12 @@ static const char *builtin_libc[] = {
 	"\t\t\tcontinue;\n"
 	"\t\t}\n"
 	"\t\tif (c == 's') {\n"
+	,
 	"\t\t\tconst char *s = va_arg(ap, const char *);\n"
 	"\t\t\tif (!s) s = \"(null)\";\n"
 	"\t\t\tint len = 0;\n"
 	"\t\t\twhile (s[len] && (prec < 0 || len < prec)) len++;\n"
 	"\t\t\tif (!left) out_pad(o, ' ', width - len);\n"
-	,
 	"\t\t\tfor (int i = 0; i < len; i++) out_ch(o, s[i]);\n"
 	"\t\t\tif (left) out_pad(o, ' ', width - len);\n"
 	"\t\t\tcontinue;\n"
@@ -1876,12 +1981,12 @@ static const char *builtin_libc[] = {
 	"\t\t\tif (c == 'p') { v = (unsigned long)va_arg(ap, void *); lng = 1; alt = 1; }\n"
 	"\t\t\telse if (lng == 1) v = va_arg(ap, unsigned long);\n"
 	"\t\t\telse v = va_arg(ap, unsigned int);\n"
+	,
 	"\t\t\tif (lng == -1) v = (unsigned short)v;\n"
 	"\t\t\tif (lng == -2) v = (unsigned char)v;\n"
 	"\t\t\tif (c == 'x' || c == 'p') base = 16;\n"
 	"\t\t\tif (c == 'X') { base = 16; upper = 1; }\n"
 	"\t\t\tif (c == 'o') base = 8;\n"
-	,
 	"\t\t\tif (alt && base == 16 && (v || c == 'p')) prefix = upper ? \"0X\" : \"0x\";\n"
 	"\t\t\tif (alt && base == 8) prefix = \"0\";\n"
 	"\t\t} else {\n"
@@ -1917,12 +2022,12 @@ static const char *builtin_libc[] = {
 	"\n"
 	"int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {\n"
 	"\tOut o;\n"
+	,
 	"\to.f = NULL; o.buf = buf; o.cap = n; o.n = 0;\n"
 	"\tint r = format(&o, fmt, ap);\n"
 	"\tif (n) buf[o.n < n ? o.n : n - 1] = 0;\n"
 	"\treturn r;\n"
 	"}\n"
-	,
 	"\n"
 	"int vsprintf(char *buf, const char *fmt, va_list ap) { return vsnprintf(buf, (size_t)INT_MAX, fmt, ap); }\n"
 	"int vprintf(const char *fmt, va_list ap) { return vfprintf(stdout, fmt, ap); }\n"
@@ -1958,12 +2063,12 @@ static const char *builtin_libc[] = {
 	"\tva_end(ap);\n"
 	"\treturn r;\n"
 	"}\n"
+	,
 	"\n"
 	"void perror(const char *s) {\n"
 	"\tif (s && *s) fprintf(stderr, \"%s: \", s);\n"
 	"\tfprintf(stderr, \"%s\\n\", strerror(errno));\n"
 	"}\n"
-	,
 	"\n"
 	"int atexit(void (*fn)(void)) {\n"
 	"\tif (natexit >= 32) return -1;\n"

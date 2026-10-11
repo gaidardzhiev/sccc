@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Ivan Gaydardzhiev
+ * Licensed under the GPL-3.0-only
+ */
+
 #ifndef _SYS_STAT_H
 #define _SYS_STAT_H
 #include <sys/types.h>

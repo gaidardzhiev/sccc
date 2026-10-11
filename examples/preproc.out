@@ -2,7 +2,7 @@ STR(a + b) = a + b
 XSTR(VERSION) = 2, STR(VERSION) = VERSION
 MAX(x1, x2) = 20, SQUARE(x1 + 1) = 121
 get_answer() = 42
-preproc.c:30: x1=10 x2=20
+preproc.c:35: x1=10 x2=20
 debug: no extra arguments
 debug: with arguments
 RED   = #ff0000

@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Ivan Gaydardzhiev
+ * Licensed under the GPL-3.0-only
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -204,21 +209,21 @@ out:
 
 int main(void) {
 	const char *prog[] = {
-"x = 6 * 7",
-"y = x - 2 * (3 + 4)",
-"x + y",
-"s = \"hello\" + \", \" + \"world\"",
-"s",
-"len(s)",
-"l = list(1, 2, 3, x, list(y, \"z\"))",
-"l",
-"len(l)",
-"sum(list(1, 2, 3, 4, 100))",
-"10 % 4 == 2",
-"3 < 2",
-"-x + 50",
-"undefined_thing + 1",
-"foo(1)",
+		"x = 6 * 7",
+		"y = x - 2 * (3 + 4)",
+		"x + y",
+		"s = \"hello\" + \", \" + \"world\"",
+		"s",
+		"len(s)",
+		"l = list(1, 2, 3, x, list(y, \"z\"))",
+		"l",
+		"len(l)",
+		"sum(list(1, 2, 3, 4, 100))",
+		"10 % 4 == 2",
+		"3 < 2",
+		"-x + 50",
+		"undefined_thing + 1",
+		"foo(1)",
 	};
 	for (int i = 0; i < (int)(sizeof prog / sizeof prog[0]); i++) run_line(prog[i]);
 	Player ps[] = { { "carol", 50 }, { "alice", 90 }, { "bob", 50 }, { "dave", 70 } };

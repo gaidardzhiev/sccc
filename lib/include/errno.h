@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Ivan Gaydardzhiev
+ * Licensed under the GPL-3.0-only
+ */
+
 #ifndef _ERRNO_H
 #define _ERRNO_H
 extern int errno;

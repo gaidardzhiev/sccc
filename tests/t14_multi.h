@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Ivan Gaydardzhiev
+ * Licensed under the GPL-3.0-only
+ */
+
 #ifndef T14_MULTI_H
 #define T14_MULTI_H
 struct point { int x, y; };

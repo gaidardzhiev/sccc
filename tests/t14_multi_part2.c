@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Ivan Gaydardzhiev
+ * Licensed under the GPL-3.0-only
+ */
+
 #include "t14_multi.h"
 static int calls;
 static int helper(int x) { return x + 1; }

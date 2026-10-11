@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Ivan Gaydardzhiev
+ * Licensed under the GPL-3.0-only
+ */
+
 #include <stdio.h>
 
 enum { PUSH, ADD, SUB, MUL, LT, JMP, JZ, LOAD, STORE, PRINT, HALT, DUP, POP, CALL, RET };

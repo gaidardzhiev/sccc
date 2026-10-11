@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Ivan Gaydardzhiev
+# Licensed under the GPL-3.0-only
+
 CC=gcc
 BIN=sccc
 STAGE2=sccc2
@@ -5,7 +8,7 @@ STAGE3=sccc3
 TESTC=test_sccc
 FLAGS=-std=c99 -pedantic -Wall -Wextra -O2
 
-.PHONY: all embed test bootstrap check examples fuzz clean
+.PHONY: all embed test bootstrap check examples baremetal fuzz clean
 
 all: $(BIN)
 
@@ -30,9 +33,13 @@ check: $(BIN) test bootstrap
 	tests/run.sh ./$(STAGE2)
 	examples/run.sh ./$(BIN)
 	examples/run.sh ./$(STAGE2)
+	baremetal/run.sh ./$(BIN)
 
 examples: $(BIN)
 	examples/run.sh ./$(BIN)
+
+baremetal: $(BIN)
+	baremetal/run.sh ./$(BIN)
 
 fuzz: $(BIN)
 	tools/fuzz_expr.py ./$(BIN) 50

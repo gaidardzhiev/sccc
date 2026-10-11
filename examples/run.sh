@@ -1,17 +1,28 @@
 #!/bin/sh
+# Copyright (C) 2026 Ivan Gaydardzhiev
+# Licensed under the GPL-3.0-only
+
 DIR=$(cd "$(dirname "$0")" && pwd)
 CC=${1:-$DIR/../sccc}
+
 case $CC in /*) ;; *) CC=$(pwd)/$CC ;; esac
+
 MODE=check
+
 [ "$2" = "-update" ] && MODE=update
+
 TMP=${TMPDIR:-/tmp}/sccc-examples.$$
+
 mkdir -p "$TMP"
 trap 'rm -rf "$TMP"' EXIT
+
 pass=0
 fail=0
 LIMIT=
 command -v timeout >/dev/null 2>&1 && LIMIT="timeout 10"
+
 cd "$DIR"
+
 for src in *.c; do
 	case $src in *_part*.c) continue ;; esac
 	name=${src%.c}
@@ -46,6 +57,9 @@ for src in *.c; do
 		pass=$((pass + 1))
 	fi
 done
+
 [ $MODE = update ] && exit 0
+
 echo "examples: $pass passed, $fail failed"
+
 [ $fail -eq 0 ]

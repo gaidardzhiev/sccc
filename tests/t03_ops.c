@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Ivan Gaydardzhiev
+ * Licensed under the GPL-3.0-only
+ */
+
 int main() {
 	int a = 13, b = 5;
 	if ((a & b) != 5 || (a | b) != 13 || (a ^ b) != 8) return 1;

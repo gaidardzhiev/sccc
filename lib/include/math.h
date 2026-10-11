@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Ivan Gaydardzhiev
+ * Licensed under the GPL-3.0-only
+ */
+
 #ifndef _MATH_H
 #define _MATH_H
 #define HUGE_VAL (1e300 * 1e300)

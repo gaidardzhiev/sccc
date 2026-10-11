@@ -1,8 +1,13 @@
+/*
+ * Copyright (C) 2026 Ivan Gaydardzhiev
+ * Licensed under the GPL-3.0-only
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 
 static const char *months[] = { "January", "February", "March", "April", "May", "June", "July",
-"August", "September", "October", "November", "December" };
+	"August", "September", "October", "November", "December" };
 
 static int leap(int y) {
 	return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;

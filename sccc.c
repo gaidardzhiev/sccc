@@ -175,6 +175,7 @@ typedef struct {
 	int bol;
 	int space;
 	void *hide;
+	int attrs;
 } Tok;
 
 typedef struct {
@@ -186,13 +187,13 @@ typedef struct {
 } Lex;
 
 static const char *kw_names[] = {
-"int", "return", "if", "else", "while", "break", "continue",
-"char", "short", "long", "signed", "unsigned", "void", "_Bool",
-"struct", "union", "enum", "typedef", "static", "extern",
-"const", "volatile", "inline", "register", "auto", "restrict",
-"sizeof", "for", "do", "switch", "case", "default", "goto",
-"float", "double",
-"__inline", "__restrict", "__const", "__signed__", "__inline__", "__restrict__",
+	"int", "return", "if", "else", "while", "break", "continue",
+	"char", "short", "long", "signed", "unsigned", "void", "_Bool",
+	"struct", "union", "enum", "typedef", "static", "extern",
+	"const", "volatile", "inline", "register", "auto", "restrict",
+	"sizeof", "for", "do", "switch", "case", "default", "goto",
+	"float", "double",
+	"__inline", "__restrict", "__const", "__signed__", "__inline__", "__restrict__",
 	NULL
 };
 static const int kw_kinds[] = {
@@ -478,6 +479,7 @@ struct Type {
 	Type *ptr;
 	int bit_width;
 	int bit_off;
+	int bit_unit;
 	Type *origin;
 };
 
@@ -540,6 +542,7 @@ static Type *bitfield_of(Type *base, int width, int off) {
 	t->ptr = NULL;
 	t->bit_width = width;
 	t->bit_off = off;
+	t->bit_unit = base->size;
 	t->origin = base;
 	return t;
 }
@@ -593,6 +596,7 @@ struct Sym {
 	Sym *global;
 	int is_static;
 	int defined;
+	int interrupt;
 	SecKind sect;
 	long off;
 	long size;
@@ -661,6 +665,7 @@ typedef struct { Buf b; } Code;
 static void code_init(Code *c) { buf_init(&c->b); }
 static size_t Cpos(Code *c) { return c->b.len; }
 static void C8 (Code *c, uint8_t x) { buf_append_byte(&c->b, x); }
+static void C16(Code *c, uint16_t x) { C8(c,(uint8_t)x); C8(c,(uint8_t)(x >> 8)); }
 static void C32(Code *c, uint32_t x) { uint8_t p[4]; le32(p, x); buf_append(&c->b, p, 4); }
 static void C64(Code *c, uint64_t x) { uint8_t p[8]; le64(p, x); buf_append(&c->b, p, 8); }
 
@@ -955,6 +960,15 @@ typedef struct {
 	int nonce, caponce;
 	int in_libc;
 	int nostdlib;
+	int freestanding;
+	int binary;
+	int image;
+	int multiboot;
+	int no_float;
+	int decl_attrs;
+	int has_ttext;
+	uint64_t ttext;
+	Sym *entry_sym;
 	Tok tok;
 	Tok pk;
 	int has_pk;
@@ -981,6 +995,8 @@ static const char *find_builtin_header(const char *name);
 static const char *builtin_libc_src(void);
 
 static char *id_main, *id_syscall, *id_va_start, *id_exit, *id_libc_init, *id_environ;
+enum { ATTR_INTERRUPT = 1, ATTR_PACKED = 2 };
+static char *id_attribute, *id_interrupt, *id_interrupt2, *id_packed, *id_packed2;
 static char *id_defined, *id_file, *id_line, *id_va_args, *id_func, *id_function, *id_static_assert;
 
 static void error_at(Ctx *ctx, const char *fmt, ...) {
@@ -1666,15 +1682,16 @@ static Tok expand_next(Ctx *ctx) {
 
 static void pp_begin_unit(Ctx *ctx) {
 	static const char *predef[] = {
-"__STDC__ 1", "__STDC_VERSION__ 199901L", "__STDC_HOSTED__ 1",
-"__x86_64__ 1", "__x86_64 1", "__amd64__ 1", "__linux__ 1", "__linux 1",
-"__unix__ 1", "__unix 1", "__LP64__ 1", "_LP64 1", "__ELF__ 1",
-"__CHAR_BIT__ 8", "__SIZEOF_INT__ 4", "__SIZEOF_LONG__ 8",
-"__SIZEOF_POINTER__ 8", "__SIZEOF_SHORT__ 2", "__SIZEOF_LONG_LONG__ 8",
-"__attribute__(x)", "__extension__", "__volatile__ volatile", "__asm__(x)",
+		"__STDC__ 1", "__STDC_VERSION__ 199901L", "__STDC_HOSTED__ 1",
+		"__x86_64__ 1", "__x86_64 1", "__amd64__ 1", "__linux__ 1", "__linux 1",
+		"__unix__ 1", "__unix 1", "__LP64__ 1", "_LP64 1", "__ELF__ 1",
+		"__CHAR_BIT__ 8", "__SIZEOF_INT__ 4", "__SIZEOF_LONG__ 8",
+		"__SIZEOF_POINTER__ 8", "__SIZEOF_SHORT__ 2", "__SIZEOF_LONG_LONG__ 8",
+		"__extension__", "__volatile__ volatile", "__asm__(x)",
 		NULL
 	};
 	for (int i = 0; predef[i]; i++) pp_define_str(ctx, predef[i]);
+	if (ctx->freestanding) pp_define_str(ctx, "__STDC_HOSTED__ 0");
 	for (int i = 0; i < ctx->ndefines; i++) {
 		char buf[1024];
 		snprintf(buf, sizeof(buf), "%s", ctx->defines[i]);
@@ -1695,13 +1712,37 @@ static void pp_end_unit(Ctx *ctx) {
 
 static Tok pp_next(Ctx *ctx) { return expand_next(ctx); }
 
+static int skip_attribute(Ctx *ctx) {
+	int attrs = 0, depth = 0;
+	do {
+		Tok t = pp_next(ctx);
+		if (t.kind == T_EOF) error_at(ctx, "unterminated __attribute__");
+		if (depth == 0 && t.kind != T_LP) error_at(ctx, "expected '(' after __attribute__");
+		if (t.kind == T_LP) depth++;
+		else if (t.kind == T_RP) depth--;
+		else if (t.kind == T_IDENT && depth == 2 && (t.str == id_interrupt || t.str == id_interrupt2)) attrs |= ATTR_INTERRUPT;
+		else if (t.kind == T_IDENT && depth == 2 && (t.str == id_packed || t.str == id_packed2)) attrs |= ATTR_PACKED;
+	} while (depth > 0);
+	return attrs;
+}
+
+static Tok parse_next(Ctx *ctx) {
+	int attrs = 0;
+	for (;;) {
+		Tok t = pp_next(ctx);
+		if (t.kind == T_IDENT && t.str == id_attribute) { attrs |= skip_attribute(ctx); continue; }
+		t.attrs = attrs;
+		return t;
+	}
+}
+
 static void next(Ctx *ctx) {
 	if (ctx->has_pk) { ctx->tok = ctx->pk; ctx->has_pk = 0; }
-	else ctx->tok = pp_next(ctx);
+	else ctx->tok = parse_next(ctx);
 }
 
 static Tok *peek(Ctx *ctx) {
-	if (!ctx->has_pk) { ctx->pk = pp_next(ctx); ctx->has_pk = 1; }
+	if (!ctx->has_pk) { ctx->pk = parse_next(ctx); ctx->has_pk = 1; }
 	return &ctx->pk;
 }
 
@@ -1850,8 +1891,26 @@ static void emit_shift_imm(Code *c, int ext, int n) {
 	C8(c,0x48); C8(c,0xC1); C8(c,(uint8_t)(0xC0 | (ext << 3))); C8(c,(uint8_t)n);
 }
 
+static void emit_bf_unit_load(Code *c, int n) {
+	if (n == 1 || n == 2 || n == 4 || n == 8) { emit_load(c, n, 1); return; }
+	C8(c,0x49); C8(c,0x89); C8(c,0xC3);
+	C8(c,0x31); C8(c,0xC0);
+	for (int i = n - 1; i >= 0; i--) {
+		if (i < n - 1) { C8(c,0x48); C8(c,0xC1); C8(c,0xE0); C8(c,0x08); }
+		C8(c,0x41); C8(c,0x8A); C8(c,0x43); C8(c,(uint8_t)i);
+	}
+}
+
+static void emit_bf_unit_store(Code *c, int n) {
+	if (n == 1 || n == 2 || n == 4 || n == 8) { emit_store(c, n); return; }
+	for (int i = 0; i < n; i++) {
+		if (i) { C8(c,0x48); C8(c,0xC1); C8(c,0xE8); C8(c,0x08); }
+		C8(c,0x88); C8(c,0x41); C8(c,(uint8_t)i);
+	}
+}
+
 static void emit_bf_load(Code *c, Type *ty) {
-	emit_load(c, ty->size, 1);
+	emit_bf_unit_load(c, ty->bit_unit);
 	emit_shift_imm(c, 4, 64 - ty->bit_off - ty->bit_width);
 	emit_shift_imm(c, ty->is_unsigned ? 5 : 7, 64 - ty->bit_width);
 }
@@ -1867,10 +1926,10 @@ static void emit_bf_store(Code *c, Type *ty) {
 	}
 	C8(c,0x48); C8(c,0xF7); C8(c,0xD6);
 	emit_mov_reg_reg(c, RAX, RCX);
-	emit_load(c, ty->size, 1);
+	emit_bf_unit_load(c, ty->bit_unit);
 	C8(c,0x48); C8(c,0x21); C8(c,0xF0);
 	C8(c,0x48); C8(c,0x09); C8(c,0xD0);
-	emit_store(c, ty->size);
+	emit_bf_unit_store(c, ty->bit_unit);
 	emit_mov_reg_reg(c, RAX, RDX);
 	emit_shift_imm(c, 4, 64 - ty->bit_off - ty->bit_width);
 	emit_shift_imm(c, ty->is_unsigned ? 5 : 7, 64 - ty->bit_width);
@@ -2011,9 +2070,11 @@ static Type *declspec(Ctx *ctx, int *storage) {
 	int nlong = 0, nshort = 0, nint = 0, nchar = 0, nvoid = 0, nbool = 0, nfloat = 0, ndouble = 0;
 	int is_signed = 0, is_unsigned = 0;
 	Type *user = NULL;
+	int attrs = 0;
 	if (storage) *storage = ST_NONE;
 	for (;;) {
 		int k = ctx->tok.kind;
+		attrs |= ctx->tok.attrs;
 		if (k == T_TYPEDEF || k == T_STATIC || k == T_EXTERN) {
 			if (!storage) error_at(ctx, "storage class specifier not allowed here");
 			*storage = k == T_TYPEDEF ? ST_TYPEDEF : k == T_STATIC ? ST_STATIC : ST_EXTERN;
@@ -2022,6 +2083,7 @@ static Type *declspec(Ctx *ctx, int *storage) {
 		if (is_qualifier(k) || k == T_INLINE || k == T_REGISTER || k == T_AUTO) { next(ctx); continue; }
 		if (k == T_VOID) { nvoid++; next(ctx); continue; }
 		if (k == T_BOOL) { nbool++; next(ctx); continue; }
+		if ((k == T_FLOAT || k == T_DOUBLE) && ctx->no_float) error_at(ctx, "floating point is disabled by -mgeneral-regs-only");
 		if (k == T_FLOAT) { nfloat++; next(ctx); continue; }
 		if (k == T_DOUBLE) { ndouble++; next(ctx); continue; }
 		if (k == T_CHAR) { nchar++; next(ctx); continue; }
@@ -2040,6 +2102,7 @@ static Type *declspec(Ctx *ctx, int *storage) {
 		}
 		break;
 	}
+	ctx->decl_attrs = attrs;
 	if (user) return user;
 	if (nvoid) return ty_void;
 	if (nbool) return ty_bool;
@@ -2127,11 +2190,99 @@ static Type *parse_typename(Ctx *ctx) {
 	return declarator(ctx, b, NULL);
 }
 
+typedef struct {
+	char *name;
+	Type *ty;
+	int width;
+} Field;
+
+static void packed_unit(Ctx *ctx, Member *m) {
+	int pos = 8 * m->off + m->ty->bit_off;
+	int n = (pos % 8 + m->ty->bit_width + 7) / 8;
+	if (n > 8) error_at(ctx, "bit-field '%s' spans more than 8 bytes", m->name);
+	m->off = pos / 8;
+	m->ty->bit_off = pos % 8;
+	m->ty->bit_unit = n;
+}
+
+static void struct_layout(Ctx *ctx, Type *ty, Field *fs, int nf, int packed) {
+	Member head; head.next = NULL;
+	Member *cur = &head;
+	int is_union = ty->is_union;
+	long bits = 0;
+	int size = 0, align = 1;
+	for (int i = 0; i < nf; i++) {
+		Type *mt = fs[i].ty;
+		char *name = fs[i].name;
+		int a = packed ? 1 : mt->align;
+		if (fs[i].width < -1) {
+			int moff = is_union ? 0 : (int)align_up((size_t)((bits + 7) / 8), (size_t)a);
+			for (Member *bm = mt->members; bm; bm = bm->next) {
+				Member *m = (Member *)calloc(1, sizeof(Member));
+				m->name = bm->name; m->ty = bm->ty; m->off = moff + bm->off;
+				if (packed && bm->ty->bit_width) { m->ty = (Type *)malloc(sizeof(Type)); *m->ty = *bm->ty; }
+				cur->next = m; cur = m;
+			}
+			if (a > align) align = a;
+			if (is_union) { if (mt->size > size) size = mt->size; }
+			else bits = (long)(moff + mt->size) * 8;
+			continue;
+		}
+		if (fs[i].width >= 0) {
+			int w = fs[i].width;
+			int unit = mt->size * 8;
+			long pos = is_union ? 0 : bits;
+			if (w == 0) {
+				if (!is_union) bits = (long)align_up((size_t)bits, (size_t)unit);
+			} else {
+				if (!packed && pos / unit != (pos + w - 1) / unit) pos = (long)align_up((size_t)pos, (size_t)unit);
+				if (name) {
+					Member *m = (Member *)calloc(1, sizeof(Member));
+					m->name = name;
+					if (packed) {
+						m->off = (int)(pos / 8);
+						m->ty = bitfield_of(mt, w, (int)(pos % 8));
+					} else {
+						m->off = (int)(pos / unit) * mt->size;
+						m->ty = bitfield_of(mt, w, (int)(pos % unit));
+					}
+					cur->next = m; cur = m;
+					if (a > align) align = a;
+				}
+				if (is_union) { int sz = (w + 7) / 8; if (sz > size) size = sz; }
+				else bits = pos + w;
+			}
+			continue;
+		}
+		Member *m = (Member *)calloc(1, sizeof(Member));
+		m->name = name; m->ty = mt;
+		if (a > align) align = a;
+		if (is_union) {
+			m->off = 0;
+			if (mt->size > size) size = mt->size;
+		} else {
+			int off = (int)align_up((size_t)((bits + 7) / 8), (size_t)a);
+			m->off = off;
+			bits = (long)(off + mt->size) * 8;
+		}
+		cur->next = m; cur = m;
+	}
+	if (!is_union) size = (int)((bits + 7) / 8);
+	ty->members = head.next;
+	ty->align = align;
+	ty->size = (int)align_up((size_t)size, (size_t)align);
+	if (packed)
+		for (Member *m = ty->members; m; m = m->next)
+			if (m->ty->bit_width) packed_unit(ctx, m);
+	ty->complete = 1;
+}
+
 static Type *struct_decl(Ctx *ctx) {
 	int is_union = ctx->tok.kind == T_UNION;
 	next(ctx);
+	int attrs = ctx->tok.attrs;
 	char *tag = NULL;
-	if (ctx->tok.kind == T_IDENT) { tag = ctx->tok.str; next(ctx); }
+	if (ctx->tok.kind == T_IDENT) { tag = ctx->tok.str; next(ctx); attrs |= ctx->tok.attrs; }
 	if (tag && ctx->tok.kind != T_LB) {
 		Tag *t = find_tag(ctx, tag);
 		if (t) return t->ty;
@@ -2151,76 +2302,36 @@ static Type *struct_decl(Ctx *ctx) {
 		if (tag) push_tag(ctx, tag, ty);
 	}
 	expect(ctx, T_LB);
-	Member head; head.next = NULL;
-	Member *cur = &head;
-	long bits = 0;
-	int size = 0, align = 1;
+	Field *fs = NULL;
+	int nf = 0, capf = 0;
 	while (ctx->tok.kind != T_RB) {
 		Type *base = declspec(ctx, NULL);
 		if (ctx->tok.kind == T_SEMI && base->kind == TY_STRUCT) {
-			int a = base->align;
-			int moff = is_union ? 0 : (int)align_up((size_t)((bits + 7) / 8), (size_t)a);
-			for (Member *bm = base->members; bm; bm = bm->next) {
-				Member *m = (Member *)calloc(1, sizeof(Member));
-				m->name = bm->name; m->ty = bm->ty; m->off = moff + bm->off;
-				cur->next = m; cur = m;
-			}
-			if (a > align) align = a;
-			if (is_union) { if (base->size > size) size = base->size; }
-			else bits = (long)(moff + base->size) * 8;
+			if (nf == capf) { capf = capf ? capf * 2 : 16; fs = (Field *)realloc(fs, sizeof(Field) * capf); }
+			fs[nf].name = NULL; fs[nf].ty = base; fs[nf].width = -2; nf++;
 			next(ctx);
 			continue;
 		}
 		for (;;) {
 			char *name = NULL;
 			Type *mt = base;
+			int w = -1;
 			if (ctx->tok.kind != T_COLON) mt = declarator(ctx, base, &name);
 			if (consume(ctx, T_COLON)) {
-				int w = (int)const_expr(ctx);
+				w = (int)const_expr(ctx);
 				if (!is_integer(mt)) error_at(ctx, "bit-field has invalid type");
-				int unit = mt->size * 8;
-				if (w < 0 || w > unit) error_at(ctx, "invalid bit-field width");
-				long pos = is_union ? 0 : bits;
-				if (w == 0) {
-					if (!is_union) bits = (long)align_up((size_t)bits, (size_t)unit);
-				} else {
-					if (pos / unit != (pos + w - 1) / unit) pos = (long)align_up((size_t)pos, (size_t)unit);
-					if (name) {
-						Member *m = (Member *)calloc(1, sizeof(Member));
-						m->name = name;
-						m->off = (int)(pos / unit) * mt->size;
-						m->ty = bitfield_of(mt, w, (int)(pos % unit));
-						cur->next = m; cur = m;
-						if (mt->align > align) align = mt->align;
-					}
-					if (is_union) { int sz = (w + 7) / 8; if (sz > size) size = sz; }
-					else bits = pos + w;
-				}
-				if (!consume(ctx, T_COMMA)) break;
-				continue;
+				if (w < 0 || w > mt->size * 8) error_at(ctx, "invalid bit-field width");
 			}
-			Member *m = (Member *)calloc(1, sizeof(Member));
-			m->name = name; m->ty = mt;
-			if (mt->align > align) align = mt->align;
-			if (is_union) {
-				m->off = 0;
-				if (mt->size > size) size = mt->size;
-			} else {
-				int off = (int)align_up((size_t)((bits + 7) / 8), (size_t)mt->align);
-				m->off = off;
-				bits = (long)(off + mt->size) * 8;
-			}
-			cur->next = m; cur = m;
+			if (nf == capf) { capf = capf ? capf * 2 : 16; fs = (Field *)realloc(fs, sizeof(Field) * capf); }
+			fs[nf].name = name; fs[nf].ty = mt; fs[nf].width = w; nf++;
 			if (!consume(ctx, T_COMMA)) break;
 		}
 		expect(ctx, T_SEMI);
 	}
 	next(ctx);
-	if (!is_union) size = (int)((bits + 7) / 8);
-	ty->members = head.next;
-	ty->align = align;
-	ty->size = (int)align_up((size_t)size, (size_t)align);
-	ty->complete = 1;
+	attrs |= ctx->tok.attrs;
+	struct_layout(ctx, ty, fs, nf, (attrs & ATTR_PACKED) != 0);
+	free(fs);
 	return ty;
 }
 
@@ -2447,6 +2558,66 @@ static Type *parse_builtin_syscall(Ctx *ctx) {
 	return ty_long;
 }
 
+typedef struct {
+	const char *name;
+	int nargs;
+	int regs[3];
+	Type **ret;
+	int len;
+	const char *code;
+} MachBuiltin;
+
+static const MachBuiltin mach_builtins[] = {
+	{ "__outb", 2, { RDX, RAX }, &ty_void, 1, "\xEE" },
+	{ "__outw", 2, { RDX, RAX }, &ty_void, 2, "\x66\xEF" },
+	{ "__outl", 2, { RDX, RAX }, &ty_void, 1, "\xEF" },
+	{ "__inb", 1, { RDX }, &ty_uchar, 4, "\xEC\x0F\xB6\xC0" },
+	{ "__inw", 1, { RDX }, &ty_ushort, 5, "\x66\xED\x0F\xB7\xC0" },
+	{ "__inl", 1, { RDX }, &ty_uint, 1, "\xED" },
+	{ "__cli", 0, { 0 }, &ty_void, 1, "\xFA" },
+	{ "__sti", 0, { 0 }, &ty_void, 1, "\xFB" },
+	{ "__hlt", 0, { 0 }, &ty_void, 1, "\xF4" },
+	{ "__pause", 0, { 0 }, &ty_void, 2, "\xF3\x90" },
+	{ "__lgdt", 1, { RAX }, &ty_void, 3, "\x0F\x01\x10" },
+	{ "__lidt", 1, { RAX }, &ty_void, 3, "\x0F\x01\x18" },
+	{ "__ltr", 1, { RAX }, &ty_void, 3, "\x0F\x00\xD8" },
+	{ "__read_cr0", 0, { 0 }, &ty_ulong, 3, "\x0F\x20\xC0" },
+	{ "__read_cr2", 0, { 0 }, &ty_ulong, 3, "\x0F\x20\xD0" },
+	{ "__read_cr3", 0, { 0 }, &ty_ulong, 3, "\x0F\x20\xD8" },
+	{ "__read_cr4", 0, { 0 }, &ty_ulong, 3, "\x0F\x20\xE0" },
+	{ "__write_cr0", 1, { RAX }, &ty_void, 3, "\x0F\x22\xC0" },
+	{ "__write_cr2", 1, { RAX }, &ty_void, 3, "\x0F\x22\xD0" },
+	{ "__write_cr3", 1, { RAX }, &ty_void, 3, "\x0F\x22\xD8" },
+	{ "__write_cr4", 1, { RAX }, &ty_void, 3, "\x0F\x22\xE0" },
+	{ "__rdmsr", 1, { RCX }, &ty_ulong, 9, "\x0F\x32\x48\xC1\xE2\x20\x48\x09\xD0" },
+	{ "__wrmsr", 2, { RCX, RAX }, &ty_void, 9, "\x48\x89\xC2\x48\xC1\xEA\x20\x0F\x30" },
+	{ "__invlpg", 1, { RAX }, &ty_void, 3, "\x0F\x01\x38" },
+	{ "__cpuid", 3, { RAX, RCX, RDI }, &ty_void, 15, "\x53\x0F\xA2\x89\x07\x89\x5F\x04\x89\x4F\x08\x89\x57\x0C\x5B" },
+	{ "__rdtsc", 0, { 0 }, &ty_ulong, 9, "\x0F\x31\x48\xC1\xE2\x20\x48\x09\xD0" },
+	{ NULL, 0, { 0 }, NULL, 0, NULL }
+};
+static char *mach_ids[sizeof(mach_builtins) / sizeof(mach_builtins[0])];
+
+static Type *parse_builtin_mach(Ctx *ctx, const MachBuiltin *b) {
+	Code *c = &ctx->text;
+	next(ctx);
+	expect(ctx, T_LP);
+	int n = 0;
+	while (ctx->tok.kind != T_RP) {
+		Type *t = rval(ctx, parse_assign(ctx));
+		if (!is_integer(t) && t->kind != TY_PTR) error_at(ctx, "%s takes integer or pointer arguments", b->name);
+		gen_push(ctx);
+		n++;
+		if (!consume(ctx, T_COMMA)) break;
+	}
+	expect(ctx, T_RP);
+	if (n != b->nargs) error_at(ctx, "%s takes %d argument%s", b->name, b->nargs, b->nargs == 1 ? "" : "s");
+	for (int i = n - 1; i >= 0; i--) gen_pop(ctx, b->regs[i]);
+	for (int i = 0; i < b->len; i++) C8(c, (uint8_t)b->code[i]);
+	ctx->lv = 0;
+	return *b->ret;
+}
+
 static Type *parse_builtin_va_start(Ctx *ctx) {
 	Code *c = &ctx->text;
 	next(ctx);
@@ -2537,6 +2708,7 @@ static Type *parse_primary(Ctx *ctx) {
 		return ty;
 	}
 	if (ctx->tok.kind == T_FNUM) {
+		if (ctx->no_float) error_at(ctx, "floating point is disabled by -mgeneral-regs-only");
 		Type *ty = ctx->tok.is_float ? ty_float : ty_double;
 		uint64_t bits = float_bits(ctx->tok.fval, ty);
 		if (bits <= 0xFFFFFFFFULL) emit_mov_rax_imm(c, (long long)bits);
@@ -2565,6 +2737,9 @@ static Type *parse_primary(Ctx *ctx) {
 		char *name = ctx->tok.str;
 		if (name == id_syscall) return parse_builtin_syscall(ctx);
 		if (name == id_va_start) return parse_builtin_va_start(ctx);
+		if (name[0] == '_' && name[1] == '_')
+			for (int i = 0; mach_ids[i]; i++)
+				if (name == mach_ids[i]) return parse_builtin_mach(ctx, &mach_builtins[i]);
 		if ((name == id_func || name == id_function) && ctx->fn) {
 			const char *fname = ctx->fn->sym->name;
 			long off = add_rodata(ctx, fname, strlen(fname) + 1);
@@ -3119,11 +3294,11 @@ static void init_scalar(Ctx *ctx, Type *ty, long off, int global) {
 	} else if (ty->bit_width) {
 		uint64_t mask = ty->bit_width >= 64 ? ~0ULL : (1ULL << ty->bit_width) - 1;
 		uint64_t v = ((uint64_t)const_expr(ctx) & mask) << ty->bit_off;
-		buf_zero_to(&ctx->data, (size_t)(off + ty->size));
+		buf_zero_to(&ctx->data, (size_t)(off + ty->bit_unit));
 		uint64_t cur = 0;
-		for (int i = 0; i < ty->size; i++) cur |= (uint64_t)ctx->data.data[off + i] << (8 * i);
+		for (int i = 0; i < ty->bit_unit; i++) cur |= (uint64_t)ctx->data.data[off + i] << (8 * i);
 		cur = (cur & ~(mask << ty->bit_off)) | v;
-		data_write(ctx, off, (long long)cur, ty->size);
+		data_write(ctx, off, (long long)cur, ty->bit_unit);
 	} else if (!(is_ptr(ty) || ty->size == 8) || !global_addr_init(ctx, off)) {
 		long long v = const_expr(ctx);
 		data_write(ctx, off, const_cast_val(v, ty), ty->size);
@@ -3641,6 +3816,31 @@ static void parse_block(Ctx *ctx) {
 	expect(ctx, T_RB);
 }
 
+static const int irqregs[9] = { RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11 };
+
+static void emit_interrupt_entry(Ctx *ctx, Type *fty) {
+	Code *c = &ctx->text;
+	Param *p = fty->params;
+	int err = fty->nparams == 2;
+	if (!ctx->no_float) error_at(ctx, "interrupt handlers need -mgeneral-regs-only");
+	if (fty->base->kind != TY_VOID || fty->variadic || fty->nparams < 1 || fty->nparams > 2 || p->ty->kind != TY_PTR
+		|| (err && (!is_integer(p->next->ty) || p->next->ty->size != 8)))
+		error_at(ctx, "interrupt handler must be void f(frame *) or void f(frame *, unsigned long)");
+	C8(c,0xFC);
+	for (int i = 0; i < 9; i++) emit_push(c, irqregs[i]);
+	if (err) { C8(c,0x48); C8(c,0x83); C8(c,0xEC); C8(c,0x08); }
+	C8(c,0x48); C8(c,0x8D); C8(c,0x7C); C8(c,0x24); C8(c,(uint8_t)(err ? 0x58 : 0x48));
+	if (err) { C8(c,0x48); C8(c,0x8B); C8(c,0x74); C8(c,0x24); C8(c,0x50); }
+	C8(c,0xE8);
+	size_t call = Cpos(c);
+	C32(c,0);
+	if (err) { C8(c,0x48); C8(c,0x83); C8(c,0xC4); C8(c,0x08); }
+	for (int i = 8; i >= 0; i--) emit_pop(c, irqregs[i]);
+	if (err) { C8(c,0x48); C8(c,0x83); C8(c,0xC4); C8(c,0x08); }
+	C8(c,0x48); C8(c,0xCF);
+	buf_patch32_at(&c->b, call, (uint32_t)(Cpos(c) - call - 4));
+}
+
 static void parse_func_body(Ctx *ctx, Sym *fs, Type *fty) {
 	Code *c = &ctx->text;
 	Func f;
@@ -3652,6 +3852,7 @@ static void parse_func_body(Ctx *ctx, Sym *fs, Type *fty) {
 	fs->off = (long)Cpos(c);
 	fs->sect = SEC_TEXT;
 	fs->defined = 1;
+	if (fs->interrupt) emit_interrupt_entry(ctx, fty);
 
 	emit_push_rbp(c);
 	emit_mov_rbp_rsp(c);
@@ -3715,21 +3916,26 @@ static void parse_toplevel(Ctx *ctx) {
 	int storage;
 	if (parse_static_assert(ctx)) return;
 	Type *base = declspec(ctx, &storage);
+	int attrs = ctx->decl_attrs;
 	if (consume(ctx, T_SEMI)) return;
 	for (;;) {
 		char *name = NULL;
 		Type *ty = declarator(ctx, base, &name);
 		if (!name) error_at(ctx, "expected identifier in declaration");
+		attrs |= ctx->tok.attrs;
+		if ((attrs & ATTR_INTERRUPT) && (ty->kind != TY_FUNC || storage == ST_TYPEDEF)) error_at(ctx, "interrupt attribute applies only to functions");
 		if (storage == ST_TYPEDEF) {
 			push_sym(ctx, name, SYM_TYPEDEF, ty);
 		} else if (ty->kind == TY_FUNC) {
 			Sym *g = get_global(ctx, name, SYM_FUNC, ty, storage == ST_STATIC);
 			bind_global(ctx, g);
+			if (attrs & ATTR_INTERRUPT) g->interrupt = 1;
 			if (ctx->tok.kind == T_LB) {
 				if (g->defined) {
 					if (!ctx->in_libc) error_at(ctx, "redefinition of '%s'", name);
 					g = (Sym *)calloc(1, sizeof(Sym));
 					g->name = name; g->kind = SYM_FUNC; g->is_static = 1;
+					g->interrupt = (attrs & ATTR_INTERRUPT) != 0;
 				}
 				g->ty = ty;
 				parse_func_body(ctx, g, ty);
@@ -3785,18 +3991,237 @@ static void add_elf_sym(Buf *symtab, Buf *strtab, Sym *s, uint64_t *sect_va, int
 	buf_append(symtab, e, 24);
 }
 
+static void write_out(const char *out_path, Buf *file, int mode) {
+	remove(out_path);
+	FILE *out=fopen(out_path,"wb");
+	if (!out) { perror(out_path); exit(1); }
+	if (fwrite(file->data,1,file->len,out)!=file->len) { perror("fwrite"); exit(1); }
+	fclose(out);
+	if (mode) chmod(out_path, mode);
+}
+
+enum { BOOT_ORG = 0x7C00, BOOT_GDT = 0x1C0, BOOT_GDTR = 0x1D8, BOOT_DAP = 0x1E0, BOOT_DRIVE = 0x1F0, BOOT_NSECT = 0x1F2 };
+
+static size_t jfwd(Code *c, uint8_t op) { C8(c,op); C8(c,0); return Cpos(c) - 1; }
+static void jland(Code *c, size_t p) { c->b.data[p] = (uint8_t)(Cpos(c) - p - 1); }
+static void jback(Code *c, uint8_t op, size_t t) { C8(c,op); C8(c,(uint8_t)(t - Cpos(c) - 1)); }
+
+static void boot_sector(Code *c, uint32_t dest, uint32_t size, uint32_t zero, uint32_t entry, uint16_t nsect) {
+	size_t e820, done[3], read, loaded, fail, ptloop;
+	C8(c,0xFA);
+	C8(c,0x31); C8(c,0xC0);
+	C8(c,0x8E); C8(c,0xD8);
+	C8(c,0x8E); C8(c,0xC0);
+	C8(c,0x8E); C8(c,0xD0);
+	C8(c,0xBC); C16(c,BOOT_ORG);
+	C8(c,0xEA); C16(c,(uint16_t)(BOOT_ORG + Cpos(c) + 4)); C16(c,0);
+	C8(c,0xFB);
+	C8(c,0x88); C8(c,0x16); C16(c,BOOT_ORG + BOOT_DRIVE);
+	C8(c,0xBF); C16(c,0x5008);
+	C8(c,0x66); C8(c,0x31); C8(c,0xDB);
+	C8(c,0x31); C8(c,0xED);
+	e820 = Cpos(c);
+	C8(c,0x66); C8(c,0xB8); C32(c,0xE820);
+	C8(c,0x66); C8(c,0xBA); C32(c,0x534D4150);
+	C8(c,0x66); C8(c,0xB9); C32(c,24);
+	C8(c,0x66); C8(c,0xC7); C8(c,0x45); C8(c,0x14); C32(c,1);
+	C8(c,0xCD); C8(c,0x15);
+	done[0] = jfwd(c,0x72);
+	C8(c,0x66); C8(c,0x3D); C32(c,0x534D4150);
+	done[1] = jfwd(c,0x75);
+	C8(c,0x83); C8(c,0xC7); C8(c,0x18);
+	C8(c,0x45);
+	C8(c,0x83); C8(c,0xFD); C8(c,0x40);
+	done[2] = jfwd(c,0x74);
+	C8(c,0x66); C8(c,0x85); C8(c,0xDB);
+	jback(c,0x75,e820);
+	for (int i = 0; i < 3; i++) jland(c, done[i]);
+	C8(c,0x89); C8(c,0x2E); C16(c,0x5000);
+	C8(c,0xC7); C8(c,0x06); C16(c,0x5002); C16(c,0);
+	C8(c,0x66); C8(c,0xC7); C8(c,0x06); C16(c,0x5004); C32(c,0);
+	read = Cpos(c);
+	C8(c,0x8B); C8(c,0x0E); C16(c,BOOT_ORG + BOOT_NSECT);
+	loaded = jfwd(c,0xE3);
+	C8(c,0xB8); C16(c,64);
+	C8(c,0x39); C8(c,0xC1);
+	C8(c,0x73); C8(c,0x02);
+	C8(c,0x89); C8(c,0xC8);
+	C8(c,0xA3); C16(c,BOOT_ORG + BOOT_DAP + 2);
+	C8(c,0x29); C8(c,0x06); C16(c,BOOT_ORG + BOOT_NSECT);
+	C8(c,0xBE); C16(c,BOOT_ORG + BOOT_DAP);
+	C8(c,0x8A); C8(c,0x16); C16(c,BOOT_ORG + BOOT_DRIVE);
+	C8(c,0xB4); C8(c,0x42);
+	C8(c,0xCD); C8(c,0x13);
+	fail = jfwd(c,0x72);
+	C8(c,0xA1); C16(c,BOOT_ORG + BOOT_DAP + 2);
+	C8(c,0x01); C8(c,0x06); C16(c,BOOT_ORG + BOOT_DAP + 8);
+	C8(c,0xC1); C8(c,0xE0); C8(c,0x05);
+	C8(c,0x01); C8(c,0x06); C16(c,BOOT_ORG + BOOT_DAP + 6);
+	jback(c,0xEB,read);
+	jland(c, fail);
+	C8(c,0xB8); C16(c,0x0E45);
+	C8(c,0xCD); C8(c,0x10);
+	C8(c,0xF4); C8(c,0xEB); C8(c,0xFD);
+	jland(c, loaded);
+	C8(c,0xE4); C8(c,0x92);
+	C8(c,0x0C); C8(c,0x02);
+	C8(c,0x24); C8(c,0xFE);
+	C8(c,0xE6); C8(c,0x92);
+	C8(c,0xFA); C8(c,0xFC);
+	C8(c,0xBF); C16(c,0x1000);
+	C8(c,0x66); C8(c,0x31); C8(c,0xC0);
+	C8(c,0xB9); C16(c,0x0C00);
+	C8(c,0xF3); C8(c,0x66); C8(c,0xAB);
+	C8(c,0xC7); C8(c,0x06); C16(c,0x1000); C16(c,0x2003);
+	C8(c,0xC7); C8(c,0x06); C16(c,0x2000); C16(c,0x3003);
+	C8(c,0xBF); C16(c,0x3000);
+	C8(c,0x66); C8(c,0xB8); C32(c,0x83);
+	C8(c,0xB9); C16(c,512);
+	ptloop = Cpos(c);
+	C8(c,0x66); C8(c,0x89); C8(c,0x05);
+	C8(c,0x66); C8(c,0x05); C32(c,0x200000);
+	C8(c,0x83); C8(c,0xC7); C8(c,0x08);
+	jback(c,0xE2,ptloop);
+	C8(c,0x66); C8(c,0xB8); C32(c,0x1000);
+	C8(c,0x0F); C8(c,0x22); C8(c,0xD8);
+	C8(c,0x0F); C8(c,0x20); C8(c,0xE0);
+	C8(c,0x66); C8(c,0x83); C8(c,0xC8); C8(c,0x20);
+	C8(c,0x0F); C8(c,0x22); C8(c,0xE0);
+	C8(c,0x66); C8(c,0xB9); C32(c,0xC0000080);
+	C8(c,0x0F); C8(c,0x32);
+	C8(c,0x66); C8(c,0x0D); C32(c,0x100);
+	C8(c,0x0F); C8(c,0x30);
+	C8(c,0x66); C8(c,0x0F); C8(c,0x01); C8(c,0x16); C16(c,BOOT_ORG + BOOT_GDTR);
+	C8(c,0x0F); C8(c,0x20); C8(c,0xC0);
+	C8(c,0x66); C8(c,0x0D); C32(c,0x80000001);
+	C8(c,0x0F); C8(c,0x22); C8(c,0xC0);
+	C8(c,0xEA); C16(c,(uint16_t)(BOOT_ORG + Cpos(c) + 4)); C16(c,0x08);
+	C8(c,0xB8); C32(c,0x10);
+	C8(c,0x8E); C8(c,0xD8);
+	C8(c,0x8E); C8(c,0xC0);
+	C8(c,0x8E); C8(c,0xD0);
+	C8(c,0xBE); C32(c,0x10000);
+	C8(c,0xBF); C32(c,dest);
+	C8(c,0xB9); C32(c,size);
+	C8(c,0xF3); C8(c,0xA4);
+	C8(c,0xB9); C32(c,zero);
+	C8(c,0x31); C8(c,0xC0);
+	C8(c,0xF3); C8(c,0xAA);
+	C8(c,0xBC); C32(c,0x80000);
+	C8(c,0xBF); C32(c,0x5000);
+	C8(c,0xB8); C32(c,entry);
+	C8(c,0xFF); C8(c,0xD0);
+	C8(c,0xFA); C8(c,0xF4); C8(c,0xEB); C8(c,0xFC);
+	if (Cpos(c) > BOOT_GDT) { fprintf(stderr, "internal: boot sector too large\n"); exit(1); }
+	buf_zero_to(&c->b, BOOT_GDT);
+	C64(c,0); C64(c,0x00209A0000000000ULL); C64(c,0x0000920000000000ULL);
+	C16(c,23); C32(c,BOOT_ORG + BOOT_GDT);
+	buf_zero_to(&c->b, BOOT_DAP);
+	C8(c,16); C8(c,0); C16(c,0); C16(c,0); C16(c,0x1000); C64(c,1);
+	C8(c,0);
+	buf_zero_to(&c->b, BOOT_NSECT);
+	C16(c,nsect);
+	buf_zero_to(&c->b, 510);
+	C8(c,0x55); C8(c,0xAA);
+}
+
+static void write_image(const char *out_path, Buf *file, uint64_t dest, uint64_t end, uint64_t entry) {
+	size_t size = align_up(file->len, 512);
+	if (dest < 0x100000 || end > 0x40000000) { fprintf(stderr, "error: an image must load between 1 MB and 1 GB\n"); exit(1); }
+	if (size > 0x8FC00) { fprintf(stderr, "error: kernel too large for the boot sector (%lu bytes, limit 588800)\n", (unsigned long)size); exit(1); }
+	Code c; code_init(&c);
+	boot_sector(&c, (uint32_t)dest, (uint32_t)size, end > dest + size ? (uint32_t)(end - dest - size) : 0, (uint32_t)entry, (uint16_t)(size / 512));
+	buf_append(&c.b, file->data, file->len);
+	buf_zero_to(&c.b, align_up(c.b.len, 16 * 63 * 512));
+	write_out(out_path, &c.b, 0);
+	free(c.b.data);
+}
+
+static void write_multiboot(const char *out_path, Buf *file, uint64_t text, uint64_t end, uint64_t entry) {
+	uint64_t load = text - 0x1000;
+	uint64_t pt = align_up(end, 0x1000);
+	uint64_t top = pt + 0x7000;
+	size_t loop;
+	if (load < 0x100000 || top > 0x40000000) { fprintf(stderr, "error: a multiboot kernel must load between 1 MB and 1 GB\n"); exit(1); }
+	Code b; code_init(&b);
+	Code *c = &b;
+	C32(c,0x1BADB002); C32(c,0x00010002); C32(c,(uint32_t)-(0x1BADB002 + 0x00010002));
+	C32(c,(uint32_t)load); C32(c,(uint32_t)load); C32(c,(uint32_t)(text + file->len));
+	C32(c,(uint32_t)top); C32(c,(uint32_t)load + 32);
+	C8(c,0xFA);
+	C8(c,0xBC); C32(c,(uint32_t)top);
+	C8(c,0x89); C8(c,0xDD);
+	C8(c,0x89); C8(c,0xC6);
+	C8(c,0xFC);
+	C8(c,0xBF); C32(c,(uint32_t)pt);
+	C8(c,0x31); C8(c,0xC0);
+	C8(c,0xB9); C32(c,0xC00);
+	C8(c,0xF3); C8(c,0xAB);
+	C8(c,0xC7); C8(c,0x05); C32(c,(uint32_t)pt); C32(c,(uint32_t)pt + 0x1003);
+	C8(c,0xC7); C8(c,0x05); C32(c,(uint32_t)pt + 0x1000); C32(c,(uint32_t)pt + 0x2003);
+	C8(c,0xBF); C32(c,(uint32_t)pt + 0x2000);
+	C8(c,0xB8); C32(c,0x83);
+	C8(c,0xB9); C32(c,512);
+	loop = Cpos(c);
+	C8(c,0x89); C8(c,0x07);
+	C8(c,0x05); C32(c,0x200000);
+	C8(c,0x83); C8(c,0xC7); C8(c,0x08);
+	jback(c,0xE2,loop);
+	C8(c,0xB8); C32(c,(uint32_t)pt);
+	C8(c,0x0F); C8(c,0x22); C8(c,0xD8);
+	C8(c,0x0F); C8(c,0x20); C8(c,0xE0);
+	C8(c,0x83); C8(c,0xC8); C8(c,0x20);
+	C8(c,0x0F); C8(c,0x22); C8(c,0xE0);
+	C8(c,0xB9); C32(c,0xC0000080);
+	C8(c,0x0F); C8(c,0x32);
+	C8(c,0x0D); C32(c,0x100);
+	C8(c,0x0F); C8(c,0x30);
+	C8(c,0x0F); C8(c,0x01); C8(c,0x15); C32(c,(uint32_t)load + 0x118);
+	C8(c,0x0F); C8(c,0x20); C8(c,0xC0);
+	C8(c,0x0D); C32(c,0x80000000);
+	C8(c,0x0F); C8(c,0x22); C8(c,0xC0);
+	C8(c,0xEA); C32(c,(uint32_t)(load + Cpos(c) + 6)); C16(c,0x08);
+	C8(c,0xB8); C32(c,0x10);
+	C8(c,0x8E); C8(c,0xD8);
+	C8(c,0x8E); C8(c,0xC0);
+	C8(c,0x8E); C8(c,0xD0);
+	C8(c,0xBC); C32(c,(uint32_t)top);
+	C8(c,0x89); C8(c,0xEF);
+	C8(c,0x89); C8(c,0xF6);
+	C8(c,0xB8); C32(c,(uint32_t)entry);
+	C8(c,0xFF); C8(c,0xD0);
+	C8(c,0xFA); C8(c,0xF4); C8(c,0xEB); C8(c,0xFC);
+	if (Cpos(c) > 0x100) { fprintf(stderr, "internal: multiboot trampoline too large\n"); exit(1); }
+	buf_zero_to(&c->b, 0x100);
+	C64(c,0); C64(c,0x00209A0000000000ULL); C64(c,0x0000920000000000ULL);
+	C16(c,23); C32(c,(uint32_t)load + 0x100);
+	buf_zero_to(&c->b, 0x1000);
+	buf_append(&c->b, file->data, file->len);
+	write_out(out_path, &c->b, 0);
+	free(c->b.data);
+}
+
 static void write_elf(Ctx *ctx, const char *out_path) {
-	const size_t headers = 64 + 2*56;
+	const size_t headers = ctx->binary ? 0 : 64 + 2*56;
 	Code *text = &ctx->text;
-	if (ctx->data.len == 0) buf_zero_to(&ctx->data, 8);
+	if (ctx->data.len == 0 && !ctx->binary) buf_zero_to(&ctx->data, 8);
 
 	size_t text_off = headers;
+	uint64_t base = ctx->binary ? 0 : ELF_BASE;
+	if (ctx->has_ttext) {
+		if (!ctx->binary) {
+			text_off = (size_t)(ctx->ttext & 0xFFF);
+			if (text_off < headers) text_off += 0x1000;
+		}
+		base = ctx->ttext - text_off;
+	}
+	size_t seg_off = ctx->has_ttext ? text_off : 0;
 	size_t ro_off = align_up(text_off + text->b.len, 16);
 	size_t text_end = ro_off + ctx->rodata.len;
-	size_t data_off = align_up(text_end, 0x1000);
-	uint64_t text_va = ELF_BASE + text_off;
-	uint64_t ro_va = ELF_BASE + ro_off;
-	uint64_t data_va = ELF_BASE + data_off;
+	size_t data_off = align_up(text_end, ctx->binary ? 16 : 0x1000);
+	uint64_t text_va = base + text_off;
+	uint64_t ro_va = base + ro_off;
+	uint64_t data_va = base + data_off;
 	uint64_t bss_va = align_up(data_va + ctx->data.len, 16);
 	uint64_t sect_va[4];
 	sect_va[SEC_TEXT] = text_va; sect_va[SEC_RODATA] = ro_va;
@@ -3818,20 +4243,31 @@ static void write_elf(Ctx *ctx, const char *out_path) {
 		}
 	}
 
+	uint64_t entry = text_va;
+	if (ctx->entry_sym) entry = sect_va[SEC_TEXT] + ctx->entry_sym->off;
+
 	Buf file; buf_init(&file);
-	buf_zero_to(&file, headers);
+	buf_zero_to(&file, text_off);
 	buf_append(&file, text->b.data, text->b.len);
 	buf_zero_to(&file, ro_off);
 	buf_append(&file, ctx->rodata.data, ctx->rodata.len);
 	buf_zero_to(&file, data_off);
 	buf_append(&file, ctx->data.data, ctx->data.len);
+	if (ctx->binary) {
+		if (ctx->image) write_image(out_path, &file, text_va, bss_va + (uint64_t)ctx->bss_size, entry);
+		else if (ctx->multiboot) write_multiboot(out_path, &file, text_va, bss_va + (uint64_t)ctx->bss_size, entry);
+		else if (entry != text_va) { fprintf(stderr, "error: entry point '%s' is not at the start of the binary\n", ctx->entry_sym->name); exit(1); }
+		else write_out(out_path, &file, 0);
+		free(file.data);
+		return;
+	}
 
 	Buf symtab, strtab, shstr;
 	buf_init(&symtab); buf_init(&strtab); buf_init(&shstr);
 	buf_append_byte(&strtab, 0);
 	buf_zero_to(&symtab, 24);
 	int nlocal = 1;
-	{
+	if (!ctx->freestanding) {
 		uint8_t e[24];
 		memset(e, 0, 24);
 		le32(e, strtab_add(&strtab, "_start"));
@@ -3881,26 +4317,21 @@ static void write_elf(Ctx *ctx, const char *out_path) {
 	uint8_t *E=file.data;
 	E[0]=0x7F;E[1]='E';E[2]='L';E[3]='F';E[4]=2;E[5]=1;E[6]=1;E[7]=0;
 	le16(E+0x10,2); le16(E+0x12,62); le32(E+0x14,1);
-	le64(E+0x18,text_va);
+	le64(E+0x18,entry);
 	le64(E+0x20,64); le64(E+0x28,sh_off); le32(E+0x30,0);
 	le16(E+0x34,64); le16(E+0x36,56); le16(E+0x38,2);
 	le16(E+0x3A,64); le16(E+0x3C,8); le16(E+0x3E,7);
 
 	uint8_t *P=file.data+64;
 	le32(P+0x00,1); le32(P+0x04,5);
-	le64(P+0x08,0); le64(P+0x10,ELF_BASE); le64(P+0x18,ELF_BASE);
-	le64(P+0x20,text_end); le64(P+0x28,text_end); le64(P+0x30,0x1000);
+	le64(P+0x08,seg_off); le64(P+0x10,base + seg_off); le64(P+0x18,base + seg_off);
+	le64(P+0x20,text_end - seg_off); le64(P+0x28,text_end - seg_off); le64(P+0x30,0x1000);
 	P += 56;
 	le32(P+0x00,1); le32(P+0x04,6);
 	le64(P+0x08,data_off); le64(P+0x10,data_va); le64(P+0x18,data_va);
 	le64(P+0x20,ctx->data.len); le64(P+0x28,(bss_va - data_va) + (uint64_t)ctx->bss_size); le64(P+0x30,0x1000);
 
-	remove(out_path);
-	FILE *out=fopen(out_path,"wb");
-	if (!out) { perror(out_path); exit(1); }
-	if (fwrite(file.data,1,file.len,out)!=file.len) { perror("fwrite"); exit(1); }
-	fclose(out);
-	chmod(out_path, 0755);
+	write_out(out_path, &file, 0755);
 
 	free(file.data); free(symtab.data); free(strtab.data); free(shstr.data);
 }
@@ -3940,6 +4371,7 @@ static void ctx_init(Ctx *ctx) {
 int main(int argc, char **argv) {
 	const char *out = "a.out";
 	const char *inputs[64];
+	const char *entry = NULL;
 	int ninputs = 0;
 	Ctx *ctx = (Ctx *)malloc(sizeof(Ctx));
 	ctx_init(ctx);
@@ -3949,10 +4381,33 @@ int main(int argc, char **argv) {
 		else if (a[0]=='-' && a[1]=='I' && ctx->nincdirs < 64) ctx->incdirs[ctx->nincdirs++] = a[2] ? a+2 : (i+1<argc ? argv[++i] : ".");
 		else if (a[0]=='-' && a[1]=='D' && ctx->ndefines < 64) ctx->defines[ctx->ndefines++] = a[2] ? a+2 : (i+1<argc ? argv[++i] : "");
 		else if (strcmp(a,"-nostdlib")==0) ctx->nostdlib = 1;
+		else if (strcmp(a,"-ffreestanding")==0) ctx->freestanding = ctx->nostdlib = 1;
+		else if (strcmp(a,"-mgeneral-regs-only")==0) ctx->no_float = 1;
+		else if (strcmp(a,"-e")==0&&i+1<argc) entry=argv[++i];
+		else if (strcmp(a,"-Ttext")==0&&i+1<argc) {
+			char *end;
+			a = argv[++i];
+			ctx->ttext = strtoull(a, &end, 0);
+			ctx->has_ttext = 1;
+			if (!*a || *end) { fprintf(stderr,"bad address: %s\n",a); return 1; }
+		}
+		else if (strcmp(a,"-oformat")==0&&i+1<argc) {
+			a = argv[++i];
+			ctx->binary = strcmp(a,"elf") != 0;
+			ctx->image = strcmp(a,"img") == 0;
+			ctx->multiboot = strcmp(a,"multiboot") == 0;
+			if (ctx->binary && !ctx->image && !ctx->multiboot && strcmp(a,"bin") != 0) { fprintf(stderr,"unknown output format: %s\n",a); return 1; }
+		}
 		else if (a[0]=='-') { fprintf(stderr,"unknown arg: %s\n",a); return 1; }
 		else if (ninputs < 64) inputs[ninputs++] = a;
 	}
-	if (ninputs == 0) { fprintf(stderr,"usage: %s <src>... [-o <out>] [-I dir] [-D name[=val]] [-nostdlib]\n",argv[0]); return 1; }
+	if (ctx->image && !ctx->has_ttext) { ctx->ttext = 0x100000; ctx->has_ttext = 1; }
+	if (ctx->multiboot && !ctx->has_ttext) { ctx->ttext = 0x101000; ctx->has_ttext = 1; }
+	if (ctx->multiboot && (ctx->ttext & 0xFFF)) { fprintf(stderr,"-Ttext must be page aligned for multiboot\n"); return 1; }
+	if (ctx->no_float && !ctx->nostdlib) { fprintf(stderr,"-mgeneral-regs-only needs -nostdlib or -ffreestanding\n"); return 1; }
+	if (ninputs == 0) { fprintf(stderr,"usage: %s <src>... [-o <out>] [-I dir] [-D name[=val]] [-nostdlib]\n"
+			"       [-ffreestanding] [-e sym] [-Ttext addr] [-oformat elf|bin|img|multiboot]\n"
+			"       [-mgeneral-regs-only]\n",argv[0]); return 1; }
 
 	keywords_init();
 	types_init();
@@ -3969,10 +4424,16 @@ int main(int argc, char **argv) {
 	id_func = intern("__func__");
 	id_function = intern("__FUNCTION__");
 	id_static_assert = intern("_Static_assert");
+	id_attribute = intern("__attribute__");
+	id_interrupt = intern("interrupt");
+	id_interrupt2 = intern("__interrupt__");
+	id_packed = intern("packed");
+	id_packed2 = intern("__packed__");
+	for (int i = 0; mach_builtins[i].name; i++) mach_ids[i] = intern(mach_builtins[i].name);
 
 	Type *mt = func_type(ty_int);
 	mt->oldstyle = 1;
-	Sym *main_sym = get_global(ctx, id_main, SYM_FUNC, mt, 0);
+	Sym *main_sym = ctx->freestanding ? NULL : get_global(ctx, id_main, SYM_FUNC, mt, 0);
 	Sym *exit_sym = NULL, *init_sym = NULL, *environ_sym = NULL;
 	if (!ctx->nostdlib) {
 		Type *vt = func_type(ty_void);
@@ -3981,7 +4442,7 @@ int main(int argc, char **argv) {
 		init_sym = get_global(ctx, id_libc_init, SYM_FUNC, vt, 0);
 		environ_sym = get_global(ctx, id_environ, SYM_VAR, ptr_to(ptr_to(ty_char)), 0);
 	}
-	emit_start(ctx, main_sym, exit_sym, init_sym, environ_sym);
+	if (main_sym) emit_start(ctx, main_sym, exit_sym, init_sym, environ_sym);
 
 	for (int i = 0; i < ninputs; i++) {
 		char *src = read_file(inputs[i]);
@@ -3992,7 +4453,14 @@ int main(int argc, char **argv) {
 		compile_unit(ctx, builtin_libc_src(), "<libc>", 1);
 		ctx->in_libc = 0;
 	}
-	if (!main_sym->defined) { fprintf(stderr, "error: undefined reference to 'main'\n"); return 1; }
+	if (main_sym && !main_sym->defined) { fprintf(stderr, "error: undefined reference to 'main'\n"); return 1; }
+	if (!entry && ctx->freestanding) entry = "_start";
+	if (entry) {
+		char *id = intern(entry);
+		for (Sym *g = ctx->globals; g; g = g->gnext)
+			if (g->name == id && !g->is_static && g->kind == SYM_FUNC && g->defined) { ctx->entry_sym = g; break; }
+		if (!ctx->entry_sym) { fprintf(stderr, "error: undefined reference to '%s'\n", entry); return 1; }
+	}
 
 	write_elf(ctx, out);
 	return 0;
