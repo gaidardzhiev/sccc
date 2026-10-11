@@ -15,9 +15,7 @@ sccc -ffreestanding [-mgeneral-regs-only] [-e sym] [-Ttext addr]
 
 ## DESCRIPTION
 
-*sccc* compiles C99 programs for x86-64. It writes static Linux executables, and for kernels it writes freestanding ELF files, flat binaries, bootable disk images, and multiboot images. The preprocessor, headers, C library, code generator, and linker are all in *sccc.c*, and *sccc* compiles itself.
-
-Each *file.c* is a translation unit. All units and the built-in library are linked into one file, *a.out* unless *-o* is given.
+*sccc* is a C compiler for x86-64, written entirely in C99 and capable of compiling itself. It takes ordinary C source and writes Linux executables directly, complete with its own C library baked in, so a program goes from source to a running binary in one step. Point it at kernel code instead and it writes a flat binary, a bootable disk image, or a multiboot image you can run in QEMU or Bochs.
 
 ## BUILDING
 
@@ -272,7 +270,7 @@ Code generation uses an accumulator. Every expression leaves its value in `rax`.
 
 A hosted program is a position dependent executable (`ET_EXEC`) loaded at 0x400000, with two loadable segments:
 
-| Segment | Flags | Sections |
+| Segment | Flags | Sections                                    |
 |---------|-------|---------------------------------------------|
 | 1       | R X   | ELF and program headers, .text, .rodata     |
 | 2       | R W   | .data, .bss                                 |
