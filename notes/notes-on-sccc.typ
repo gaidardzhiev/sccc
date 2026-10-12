@@ -495,6 +495,5 @@ SCCC reads C source and writes x86-64 machine code. Its preprocessor supplies to
 
 The source follows the path taken by a C construct from its spelling to the bytes that execute it. A pointer subscript becomes a scaled address; a local declaration becomes a frame offset; a forward function call becomes a relocation; an interrupt function gains a register-save wrapper and an `iretq`; a BIOS image gains the instructions that bring the processor from real mode into long mode. Those operations are the compiler.
 
-#strong[Availability.]The source, library, hosted and bare-metal tests, kernel examples, and bootstrap Makefile are distributed at:\
-`https://github.com/gaidardzhiev/sccc`\
-The compiler and library source carry the GPL-3.0-only license.
+#strong[Availability.]The source code of the compiler, library, hosted and bare-metal tests, kernel examples, and bootstrap Makefile carry the GPL-3.0-only license and are distributed at:\
+`https://github.com/gaidardzhiev/sccc`
