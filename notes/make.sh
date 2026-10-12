@@ -1,3 +1,3 @@
 #!/bin/sh
 
-typst compile notes-on-the-sccc-compiler.typ 
+typst compile notes-on-sccc.typ

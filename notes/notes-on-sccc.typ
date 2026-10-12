@@ -1,4 +1,4 @@
-#set document(title: "Notes on the SCCC Compiler", author: "Ivan Gaydardzhiev")
+#set document(title: "Notes on the Self-Compiling C Compiler (SCCC)", author: "Ivan Gaydardzhiev")
 #set page(paper: "us-letter", margin: (x: 1.35in, y: 1.2in), numbering: "1")
 #set text(font: "New Computer Modern", size: 10.5pt, lang: "en")
 #set par(justify: true, leading: 0.62em, first-line-indent: 0pt, spacing: 0.9em)
@@ -17,7 +17,7 @@
 
 #align(center)[
   #v(0.3em)
-  #text(size: 16pt, weight: "bold")[Notes on Programming in SCCC]
+  #text(size: 16pt, weight: "bold")[Notes on the Self-Compiling C Compiler (SCCC)]
   #v(0.6em)
   #emph[by] \
   Ivan Gaydardzhiev \
@@ -495,6 +495,6 @@ SCCC reads C source and writes x86-64 machine code. Its preprocessor supplies to
 
 The source follows the path taken by a C construct from its spelling to the bytes that execute it. A pointer subscript becomes a scaled address; a local declaration becomes a frame offset; a forward function call becomes a relocation; an interrupt function gains a register-save wrapper and an `iretq`; a BIOS image gains the instructions that bring the processor from real mode into long mode. Those operations are the compiler.
 
-#strong[Availability.] The source, library, hosted and bare-metal tests, kernel examples, and bootstrap Makefile are distributed in the SCCC project at:
-`https://github.com/gaidardzhiev/sccc`
+#strong[Availability.]The source, library, hosted and bare-metal tests, kernel examples, and bootstrap Makefile are distributed at:\
+`https://github.com/gaidardzhiev/sccc`\
 The compiler and library source carry the GPL-3.0-only license.
