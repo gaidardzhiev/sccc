@@ -152,7 +152,7 @@ typedef enum {
 	T_STRUCT, T_UNION, T_ENUM, T_TYPEDEF, T_STATIC, T_EXTERN,
 	T_CONST, T_VOLATILE, T_INLINE, T_REGISTER, T_AUTO, T_RESTRICT,
 	T_SIZEOF, T_FOR, T_DO, T_SWITCH, T_CASE, T_DEFAULT, T_GOTO,
-	T_FLOAT, T_DOUBLE, T_TYPEOF, T_ALIGNOF, T_ALIGNAS, T_NORETURN, T_GENERIC,
+	T_FLOAT, T_DOUBLE, T_TYPEOF, T_ALIGNOF, T_ALIGNAS, T_NORETURN, T_GENERIC, T_THREAD,
 	T_EQ, T_NEQ, T_LEQ, T_GEQ,
 	T_AND,
 	T_OR,
@@ -203,9 +203,9 @@ static const char *kw_names[] = {
 	"struct", "union", "enum", "typedef", "static", "extern",
 	"const", "volatile", "inline", "register", "auto", "restrict",
 	"sizeof", "for", "do", "switch", "case", "default", "goto",
-	"float", "double", "typeof", "_Alignof", "_Alignas", "_Noreturn", "_Generic",
+	"float", "double", "typeof", "_Alignof", "_Alignas", "_Noreturn", "_Generic", "_Thread_local",
 	"__inline", "__restrict", "__const", "__signed__", "__inline__", "__restrict__",
-	"__typeof__", "__typeof", "__alignof__", "__alignof", "__signed", "__volatile",
+	"__typeof__", "__typeof", "__alignof__", "__alignof", "__signed", "__volatile", "__thread",
 	NULL
 };
 static const int kw_kinds[] = {
@@ -214,9 +214,9 @@ static const int kw_kinds[] = {
 	T_STRUCT, T_UNION, T_ENUM, T_TYPEDEF, T_STATIC, T_EXTERN,
 	T_CONST, T_VOLATILE, T_INLINE, T_REGISTER, T_AUTO, T_RESTRICT,
 	T_SIZEOF, T_FOR, T_DO, T_SWITCH, T_CASE, T_DEFAULT, T_GOTO,
-	T_FLOAT, T_DOUBLE, T_TYPEOF, T_ALIGNOF, T_ALIGNAS, T_NORETURN, T_GENERIC,
+	T_FLOAT, T_DOUBLE, T_TYPEOF, T_ALIGNOF, T_ALIGNAS, T_NORETURN, T_GENERIC, T_THREAD,
 	T_INLINE, T_RESTRICT, T_CONST, T_SIGNED, T_INLINE, T_RESTRICT,
-	T_TYPEOF, T_TYPEOF, T_ALIGNOF, T_ALIGNOF, T_SIGNED, T_VOLATILE,
+	T_TYPEOF, T_TYPEOF, T_ALIGNOF, T_ALIGNOF, T_SIGNED, T_VOLATILE, T_THREAD,
 	0
 };
 
@@ -679,11 +679,12 @@ struct Sym {
 	int elf_index;
 	long common;
 	int common_align;
-	long got_off;
+	long got_off, gottp_off;
 	int ref;
 	int tentative;
 	int ld_out;
 	int piece;
+	int tls;
 	Sym *gnext;
 };
 
@@ -984,10 +985,10 @@ static void emit_setcc_al(Code *c, int cc) { C8(c,0x0F); C8(c,(uint8_t)cc); C8(c
 static void emit_setcc_cl(Code *c, int cc) { C8(c,0x0F); C8(c,(uint8_t)cc); C8(c,0xC1); }
 static void emit_movzx_eax_al(Code *c) { C8(c,0x0F); C8(c,0xB6); C8(c,0xC0); }
 
-typedef enum { R_PC32, R_ABS64, R_ABS32, R_ABS32S, R_ABS16, R_ABS8, R_PC16, R_PC8, R_PC64, R_PLT32 } RelKind;
+typedef enum { R_PC32, R_ABS64, R_ABS32, R_ABS32S, R_ABS16, R_ABS8, R_PC16, R_PC8, R_PC64, R_PLT32, R_TPOFF32, R_TPOFF64 } RelKind;
 
-static const int rel_size[] = { 4, 8, 4, 4, 2, 1, 2, 1, 8, 4 };
-static const int rel_elf[] = { 2, 1, 10, 11, 12, 14, 13, 15, 24, 4 };
+static const int rel_size[] = { 4, 8, 4, 4, 2, 1, 2, 1, 8, 4, 4, 8 };
+static const int rel_elf[] = { 2, 1, 10, 11, 12, 14, 13, 15, 24, 4, 23, 18 };
 
 static int rel_pc(int k) { return k == R_PC32 || k == R_PC16 || k == R_PC8 || k == R_PC64 || k == R_PLT32; }
 
@@ -1005,6 +1006,7 @@ typedef struct {
 	char *name;
 	int kind;
 	int align;
+	int tls;
 	Buf b;
 } Sec;
 
@@ -1019,6 +1021,11 @@ typedef struct {
 } Piece;
 
 typedef struct Ld Ld;
+
+typedef struct {
+	size_t pos;
+	int nrel, sp;
+} Mark;
 
 typedef struct Label Label;
 struct Label {
@@ -1097,12 +1104,18 @@ typedef struct {
 	int in_libc;
 	int nostdlib;
 	int freestanding;
+	int nostart, nostdinc, no_common, omagic;
 	int binary;
 	int image;
 	int multiboot;
 	int no_float;
-	int decl_attrs;
+	int decl_attrs, decl_thread;
 	Attr decl_attr;
+	Sym *tls_sym;
+	size_t tls_end;
+	Mark tls_mark;
+	long long tls_tp, tls_lo;
+	int has_tls;
 	int unit;
 	int text_align, data_align, bss_align, rodata_align;
 	int has_ttext;
@@ -1157,6 +1170,7 @@ static char *id_attribute, *id_attribute2, *id_interrupt, *id_packed, *id_aligne
 static char *id_defined, *id_file, *id_line, *id_va_args, *id_func, *id_function, *id_static_assert;
 static char *id_asm, *id_asm2, *id_asm3, *id_naked;
 static char *id_expect, *id_constant_p, *id_types_compatible_p, *id_choose_expr, *id_offsetof, *id_unreachable, *id_trap;
+static char *id_return_address, *id_frame_address;
 
 static void error_at(Ctx *ctx, const char *fmt, ...) {
 	va_list ap;
@@ -1184,7 +1198,7 @@ static const char *tok_desc(Tok *t) {
 	if (t->kind == T_NUM || t->kind == T_FNUM) return "number";
 	if (t->kind == T_STR) return "string";
 	if (t->kind < 256) { buf[0] = (char)t->kind; buf[1] = 0; return buf; }
-	if (t->kind >= T_INT && t->kind <= T_GENERIC) return kw_names[t->kind - T_INT];
+	if (t->kind >= T_INT && t->kind <= T_THREAD) return kw_names[t->kind - T_INT];
 	return "operator";
 }
 
@@ -1499,7 +1513,7 @@ static void pp_include(Ctx *ctx, Src *s, Lex *sub) {
 		push_file(ctx, read_file(path), path, 0);
 		return;
 	}
-	const char *b = find_builtin_header(name);
+	const char *b = ctx->nostdinc && !ctx->in_libc ? NULL : find_builtin_header(name);
 	if (!b) pp_error(ctx, sub, "file not found: ", name);
 	snprintf(path, sizeof(path), "<%s>", name);
 	if (is_once(ctx, path)) return;
@@ -2125,7 +2139,7 @@ static void add_reloc(Ctx *ctx, RelKind kind, size_t pos, Sym *sym, int sect, lo
 	}
 	Reloc *r = &ctx->relocs[ctx->nrelocs++];
 	r->kind = kind; r->pos = pos; r->sym = sym; r->sect = sect; r->addend = addend; r->piece = 0;
-	r->in = kind == R_PC32 || kind == R_PLT32 ? ctx->cur_text : ctx->cur_data;
+	r->in = kind == R_PC32 || kind == R_PLT32 || kind == R_TPOFF32 ? ctx->cur_text : ctx->cur_data;
 }
 
 static int section_index(Ctx *ctx, char *name, int kind) {
@@ -2280,11 +2294,6 @@ static long add_rodata(Ctx *ctx, const void *p, size_t n) {
 
 static void emit_memcpy(Code *c, int n) { emit_mov_ecx_imm(c, (uint32_t)n); emit_rep_movsb(c); }
 
-typedef struct {
-	size_t pos;
-	int nrel, sp;
-} Mark;
-
 static Mark mark_code(Ctx *ctx) {
 	Mark m;
 	m.pos = Cpos(&ctx->text);
@@ -2390,9 +2399,46 @@ static void emit_store_type(Code *c, Type *ty) {
 	else emit_store(c, ty->size);
 }
 
+static void emit_tls_access(Ctx *ctx, Sym *g, int size, int is_unsigned, int store) {
+	Code t, *c = &ctx->text;
+	code_init(&t);
+	if (store) emit_store(&t, size);
+	else emit_load(&t, size, is_unsigned);
+	C8(c,0x64);
+	for (size_t i = 0; i + 1 < t.b.len; i++) C8(c,t.b.data[i]);
+	C8(c,0x04); C8(c,0x25);
+	add_reloc(ctx, R_TPOFF32, Cpos(c), g, SEC_TEXT, 0);
+	C32(c,0);
+	free(t.b.data);
+}
+
+static void emit_tls_addr(Ctx *ctx, Sym *g) {
+	Code *c = &ctx->text;
+	ctx->tls_mark = mark_code(ctx);
+	C8(c,0x64); C8(c,0x48); C8(c,0x8B); C8(c,0x04); C8(c,0x25); C32(c,0);
+	C8(c,0x48); C8(c,0x8D); C8(c,0x80);
+	add_reloc(ctx, R_TPOFF32, Cpos(c), g, SEC_TEXT, 0);
+	C32(c,0);
+	ctx->tls_sym = g;
+	ctx->tls_end = Cpos(c);
+}
+
+static Sym *tls_lvalue(Ctx *ctx, Type *ty) {
+	if (!ctx->lv || !ctx->tls_sym || ctx->tls_end != Cpos(&ctx->text) || !is_scalar(ty) || ty->bit_width) return NULL;
+	Sym *g = ctx->tls_sym;
+	drop_code(ctx, ctx->tls_mark);
+	ctx->tls_sym = NULL;
+	return g;
+}
+
 static Type *rval(Ctx *ctx, Type *ty) {
 	if (ty->kind == TY_ARRAY) { ctx->lv = 0; return ptr_to(ty->base); }
 	if (ty->kind == TY_FUNC) { ctx->lv = 0; return ptr_to(ty); }
+	Sym *tg = tls_lvalue(ctx, ty);
+	if (tg) {
+		emit_tls_access(ctx, tg, ty->size, ty->is_unsigned, 0);
+		ctx->lv = 0;
+	}
 	if (ctx->lv) {
 		if (ty->kind != TY_STRUCT && ty->kind != TY_VOID) emit_load_type(&ctx->text, ty);
 		ctx->lv = 0;
@@ -2499,7 +2545,7 @@ static int is_typename(Ctx *ctx, Tok *t) {
 	case T_VOID: case T_BOOL: case T_FLOAT: case T_DOUBLE:
 	case T_STRUCT: case T_UNION: case T_ENUM: case T_TYPEDEF:
 	case T_STATIC: case T_EXTERN: case T_CONST: case T_VOLATILE: case T_INLINE:
-	case T_REGISTER: case T_AUTO: case T_RESTRICT: case T_TYPEOF: case T_ALIGNAS: case T_NORETURN:
+	case T_REGISTER: case T_AUTO: case T_RESTRICT: case T_TYPEOF: case T_ALIGNAS: case T_NORETURN: case T_THREAD:
 		return 1;
 	case T_IDENT: {
 		Sym *s = lookup(ctx, t->str);
@@ -2539,8 +2585,14 @@ static Type *declspec(Ctx *ctx, int *storage) {
 	Attr da;
 	memset(&da, 0, sizeof(da));
 	if (storage) *storage = ST_NONE;
+	ctx->decl_thread = 0;
 	for (;;) {
 		int k = ctx->tok.kind;
+		if (k == T_THREAD) {
+			if (!storage) error_at(ctx, "storage class specifier not allowed here");
+			ctx->decl_thread = 1;
+			next(ctx); continue;
+		}
 		attrs |= ctx->tok.attrs;
 		attr_merge(&da, ctx->tok.attr);
 		if (k == T_TYPEDEF || k == T_STATIC || k == T_EXTERN) {
@@ -3638,6 +3690,17 @@ static Type *parse_primary(Ctx *ctx) {
 			C8(c,0x0F); C8(c,0x0B);
 			return ty_void;
 		}
+		if (name == id_return_address || name == id_frame_address) {
+			next(ctx);
+			expect(ctx, T_LP);
+			long long n = const_expr(ctx);
+			expect(ctx, T_RP);
+			if (n < 0) error_at(ctx, "the level of %s must not be negative", name);
+			emit_mov_reg_reg(c, RAX, RBP);
+			for (long long i = 0; i < n; i++) emit_load(c, 8, 0);
+			if (name == id_return_address) { C8(c,0x48); C8(c,0x8B); C8(c,0x40); C8(c,0x08); }
+			return ptr_to(ty_void);
+		}
 		if (name[0] == '_' && name[1] == '_')
 			for (int i = 0; mach_ids[i]; i++)
 				if (name == mach_ids[i]) return parse_builtin_mach(ctx, &mach_builtins[i]);
@@ -3672,10 +3735,12 @@ static Type *parse_primary(Ctx *ctx) {
 			ctx->fn_lea_sym = g;
 			return g->ty;
 		}
+		Sym *gs = s->global ? s->global : s;
 		if (s->is_local) emit_lea_rbp(c, RAX, s->stack_off);
-		else emit_lea_sym(ctx, s->global ? s->global : s);
+		else if (gs->tls) emit_tls_addr(ctx, gs);
+		else emit_lea_sym(ctx, gs);
 		ctx->lv_end = Cpos(c);
-		ctx->lv_sym = s->is_local ? NULL : s->global ? s->global : s;
+		ctx->lv_sym = s->is_local || gs->tls ? NULL : gs;
 		ctx->lv_off = s->stack_off;
 		ctx->lv = 1;
 		return s->ty;
@@ -4064,6 +4129,26 @@ static Type *parse_assign(Ctx *ctx) {
 	Code *c = &ctx->text;
 	Type *lt = parse_cond(ctx);
 	int k = ctx->tok.kind;
+	Sym *tg = k == T_ASSIGN || compound_op(k) ? tls_lvalue(ctx, lt) : NULL;
+	if (tg) {
+		int op = compound_op(k);
+		Type *vt = lt->origin ? lt->origin : lt;
+		next(ctx);
+		ctx->lv = 0;
+		if (op) {
+			emit_tls_access(ctx, tg, lt->size, lt->is_unsigned, 0);
+			gen_push(ctx);
+		}
+		Type *rt = rval(ctx, parse_assign(ctx));
+		if (op) {
+			gen_pop(ctx, RCX);
+			rt = gen_binop(ctx, op, vt, rt);
+		}
+		gen_cast(ctx, rt, lt);
+		emit_tls_access(ctx, tg, lt->size, 0, 1);
+		ctx->lv = 0;
+		return vt;
+	}
 	if (k == T_ASSIGN) {
 		if (!ctx->lv) error_at(ctx, "lvalue required as left operand of assignment");
 		if (lt->kind == TY_ARRAY || lt->kind == TY_FUNC) error_at(ctx, "assignment to array or function");
@@ -4464,7 +4549,11 @@ static int var_align(Sym *g, Type *ty, int min) {
 
 static void define_global_var(Ctx *ctx, Sym *g, Type *ty, int has_init) {
 	int sect = SEC_DATA;
-	if (g->section && (has_init || strcmp(g->section, ".bss") != 0))
+	if (g->tls) {
+		if (!has_init && g->defined) return;
+		sect = section_index(ctx, intern(has_init ? ".tdata" : ".tbss"), SK_DATA);
+		ctx->secs[sect - SEC_NAMED].tls = has_init ? 1 : 2;
+	} else if (g->section && (has_init || strcmp(g->section, ".bss") != 0))
 		sect = section_index(ctx, g->section, strncmp(g->section, ".rodata", 7) == 0 ? SK_RO : SK_DATA);
 	if (has_init || sect != SEC_DATA) {
 		if (g->defined && g->sect != SEC_BSS) error_at(ctx, "redefinition of '%s'", g->name);
@@ -4534,8 +4623,9 @@ static int parse_static_assert(Ctx *ctx) {
 static void parse_local_decl(Ctx *ctx) {
 	int storage;
 	Type *base = declspec(ctx, &storage);
-	int battrs = ctx->decl_attrs;
+	int battrs = ctx->decl_attrs, thread = ctx->decl_thread;
 	Attr battr = ctx->decl_attr;
+	if (thread && storage != ST_STATIC && storage != ST_EXTERN) error_at(ctx, "a thread-local variable must be static or extern");
 	if (ctx->tok.kind == T_SEMI) { next(ctx); return; }
 	for (;;) {
 		char *name = NULL;
@@ -4555,9 +4645,11 @@ static void parse_local_decl(Ctx *ctx) {
 			if (label) push_sym(ctx, name, kind, ty)->global = g;
 			else bind_global(ctx, g);
 			decl_attrs(ctx, g, attrs, &da);
+			if (thread) g->tls = 1;
 		} else if (storage == ST_STATIC) {
 			Sym *g = (Sym *)calloc(1, sizeof(Sym));
 			g->name = name; g->kind = SYM_VAR; g->ty = ty; g->is_static = 1;
+			g->tls = thread;
 			g->align = da.align;
 			g->section = da.section;
 			g->gnext = ctx->globals;
@@ -5026,7 +5118,7 @@ static void parse_toplevel(Ctx *ctx) {
 	if (parse_static_assert(ctx)) return;
 	if (is_asm_kw(ctx)) { asm_statement(ctx, 1); return; }
 	Type *base = declspec(ctx, &storage);
-	int attrs = ctx->decl_attrs;
+	int attrs = ctx->decl_attrs, thread = ctx->decl_thread;
 	Attr battr = ctx->decl_attr;
 	if (consume(ctx, T_SEMI)) return;
 	for (;;) {
@@ -5041,6 +5133,7 @@ static void parse_toplevel(Ctx *ctx) {
 		if (storage == ST_TYPEDEF) {
 			push_sym(ctx, name, SYM_TYPEDEF, aligned_type(ty, da.align));
 		} else if (ty->kind == TY_FUNC) {
+			if (thread) error_at(ctx, "function '%s' declared thread-local", name);
 			Sym *g = get_global(ctx, label ? label : name, SYM_FUNC, ty, storage == ST_STATIC);
 			if (label) push_sym(ctx, name, SYM_FUNC, ty)->global = g;
 			else bind_global(ctx, g);
@@ -5070,6 +5163,7 @@ static void parse_toplevel(Ctx *ctx) {
 			if (label) push_sym(ctx, name, SYM_VAR, ty)->global = g;
 			else bind_global(ctx, g);
 			decl_attrs(ctx, g, attrs, &da);
+			if (thread) g->tls = 1;
 			int has_init = consume(ctx, T_ASSIGN);
 			int weak = weak_here(ctx, g, attrs);
 			if (has_init && g->defined && (g->sect != SEC_BSS || g->alias_name)) {
@@ -5204,7 +5298,7 @@ typedef struct {
 	size_t *base;
 	int nbase;
 	long bss_base;
-	int done;
+	int done, final;
 	Lex *lx;
 	int snip;
 	const char *sfile;
@@ -5566,6 +5660,10 @@ static AsVal as_sum(As *A, AsVal a, AsVal b) {
 		for (int j = 0; j < ns; j++)
 			if (adds[i] && adds[i] == subs[j]) { adds[i] = subs[j] = NULL; break; }
 	r.add = r.sub = NULL;
+	int left = 0, later = 0;
+	for (int i = 0; i < na; i++) if (adds[i]) { left++; later |= !as_defined(A, adds[i]); }
+	for (int i = 0; i < ns; i++) if (subs[i]) { left += 4; later |= !as_defined(A, subs[i]); }
+	if ((left & 3) > 1 && later && !A->final) return as_tree(T_PLUS, a, b);
 	for (int i = 0; i < na; i++) if (adds[i]) { if (r.add) error_at(A->ctx, "invalid sum of symbols"); r.add = adds[i]; }
 	for (int i = 0; i < ns; i++) if (subs[i]) { if (r.sub) error_at(A->ctx, "invalid difference of symbols"); r.sub = subs[i]; }
 	as_fold(A, &r);
@@ -6918,6 +7016,7 @@ static void as_undefined_local(As *A, AsSym *s) {
 
 static void as_resolve(As *A) {
 	Ctx *ctx = A->ctx;
+	A->final = 1;
 	for (int i = 0; i < A->nfix; i++) {
 		AsFix *f = &A->fix[i];
 		AsVal v = f->val;
@@ -7653,13 +7752,13 @@ static uint32_t strtab_add(Buf *b, const char *s) {
 	return off;
 }
 
-static void add_elf_sym(Buf *symtab, Buf *strtab, Sym *s, uint64_t *sect_va, int *shndx, int bind) {
+static void add_elf_sym(Buf *symtab, Buf *strtab, Sym *s, uint64_t *sect_va, int *shndx, int bind, long long tls_lo) {
 	uint8_t e[24];
 	memset(e, 0, 24);
 	le32(e, strtab_add(strtab, s->name));
-	e[4] = (uint8_t)((bind << 4) | (s->kind == SYM_FUNC ? 2 : 1));
+	e[4] = (uint8_t)((bind << 4) | (s->tls ? 6 : s->kind == SYM_FUNC ? 2 : 1));
 	le16(e+6, (uint16_t)(s->sect == SEC_ABS ? 0xFFF1 : shndx[s->sect]));
-	le64(e+8, s->sect == SEC_ABS ? (uint64_t)s->off : sect_va[s->sect] + s->off);
+	le64(e+8, (s->sect == SEC_ABS ? (uint64_t)s->off : sect_va[s->sect] + s->off) - (s->tls ? (uint64_t)tls_lo : 0));
 	le64(e+16, (uint64_t)s->size);
 	buf_append(symtab, e, 24);
 }
@@ -7751,7 +7850,7 @@ static int sec_flags(Ctx *ctx, int sect) {
 	if (sect == SEC_RODATA) return 2;
 	if (sect == SEC_DATA || sect == SEC_BSS) return 3;
 	int k = ctx->secs[sect - SEC_NAMED].kind;
-	return k == SK_CODE ? 6 : k == SK_RO ? 2 : 3;
+	return (k == SK_CODE ? 6 : k == SK_RO ? 2 : 3) | (ctx->secs[sect - SEC_NAMED].tls ? 0x400 : 0);
 }
 
 
@@ -8492,8 +8591,9 @@ static void ld_take(Ctx *ctx, Ld *ld, LdStmt *in, int i, int out, int sort) {
 	if ((uint64_t)p->align > o->align) o->align = (uint64_t)p->align;
 	if (p->end > p->start) o->kept = 1;
 	int k = ld_piece_kind(ctx, p);
-	o->flags |= 2 | (k == 0 ? 4 : 0) | (k >= 2 ? 1 : 0) | (k == 3 ? 0 : p->note ? 0x200 : 0x100);
-	if (k != 3) o->nobits = 0;
+	int tls = p->sect >= SEC_NAMED ? ctx->secs[p->sect - SEC_NAMED].tls : 0;
+	o->flags |= 2 | (k == 0 ? 4 : 0) | (k >= 2 ? 1 : 0) | (k == 3 || tls == 2 ? 0 : p->note ? 0x200 : 0x100) | (tls ? 0x400 : 0);
+	if (k != 3 && tls != 2) o->nobits = 0;
 }
 
 static void ld_match_input(Ctx *ctx, Ld *ld, LdStmt *in, int out) {
@@ -8592,7 +8692,7 @@ static void ld_orphans(Ctx *ctx, Ld *ld) {
 			st->kind = LS_SECTION;
 			st->name = (char *)name;
 			st->orphan = 1;
-			st->anchor = ld_named(ld, k);
+			st->anchor = p->sect >= SEC_NAMED && ctx->secs[p->sect - SEC_NAMED].tls ? NULL : ld_named(ld, k);
 			st->byname = st->anchor != NULL;
 			if (!st->anchor) st->anchor = ld_anchor(ld, k, recent, &st->exact);
 			LdStmt **at, *a = st->anchor;
@@ -8875,6 +8975,7 @@ static void ld_section_exec(Ctx *ctx, Ld *ld, LdStmt *st) {
 	o->align = al;
 	ld->cur = NULL;
 	if (!o->size) ld->dot = o->kept ? before : vma;
+	else if ((o->flags & 0x400) && o->nobits) ld->dot = vma;
 	if (st->addr && vma) {
 		uint64_t low = vma & -vma;
 		if (low < o->align) o->align = low;
@@ -8948,7 +9049,7 @@ static void ld_segments(Ld *ld) {
 	LdOut *prev = NULL;
 	for (int k = 0; k < n; k++) {
 		LdOut *o = &ld->outs[ord[k]];
-		if (o->size == 0) continue;
+		if (o->size == 0 || ((o->flags & 0x400) && o->nobits)) continue;
 		int same = 0;
 		if (prev) {
 			uint64_t end = prev->vma + prev->size;
@@ -8971,6 +9072,18 @@ static void ld_segments(Ld *ld) {
 		prev = o;
 	}
 	free(ord);
+	for (int i = 0; i < ld->nouts; i++) {
+		LdOut *o = &ld->outs[i];
+		if (o->discard || !o->kept || !(o->flags & 0x400)) continue;
+		if (ld->nsegs == ld->capsegs) {
+			ld->capsegs = ld->capsegs ? ld->capsegs * 2 : 8;
+			ld->segs = (LdSeg *)realloc(ld->segs, sizeof(LdSeg) * ld->capsegs);
+			if (!ld->segs) { perror("realloc"); exit(1); }
+		}
+		memset(&ld->segs[ld->nsegs], 0, sizeof(LdSeg));
+		ld->segs[ld->nsegs++].type = 7;
+		break;
+	}
 }
 
 static uint64_t ld_signature(Ld *ld) {
@@ -9153,9 +9266,13 @@ static void apply_relocs(Ctx *ctx, uint64_t *sect_va) {
 		int n = rel_size[r->kind];
 		int pc = rel_pc(r->kind);
 		int64_t v = pc ? (int64_t)target - (int64_t)(sect_addr(ctx, sect_va, r->in, (long)r->pos) + n) : (int64_t)target;
+		if (r->kind == R_TPOFF32 || r->kind == R_TPOFF64) {
+			if (!ctx->has_tls) { fprintf(stderr, "error: '%s' is thread-local but there is no TLS section\n", r->sym ? r->sym->name : "?"); exit(1); }
+			v = (int64_t)(target - (uint64_t)ctx->tls_tp);
+		}
 		if (n < 8) {
 			int64_t lo = -((int64_t)1 << (8 * n - 1));
-			int64_t hi = pc || r->kind == R_ABS32S ? ((int64_t)1 << (8 * n - 1)) - 1 : ((int64_t)1 << (8 * n)) - 1;
+			int64_t hi = pc || r->kind == R_ABS32S || r->kind == R_TPOFF32 ? ((int64_t)1 << (8 * n - 1)) - 1 : ((int64_t)1 << (8 * n)) - 1;
 			if (v < lo || v > hi) {
 				if (r->sym && !r->sym->defined) { fprintf(stderr, "error: weak symbol '%s' is undefined and address 0 is out of reach\n", r->sym->name); exit(1); }
 				fprintf(stderr, "error: relocation against '%s' is out of range\n", r->sym ? r->sym->name : "a section");
@@ -9214,6 +9331,27 @@ static void ld_write_elf(Ctx *ctx, Ld *ld, const char *out_path, uint64_t entry)
 		pos = align_up(pos, o->align > 0 ? (size_t)o->align : 1);
 		o->off = pos;
 		if (!o->nobits && !o->st->noload) pos += (size_t)o->size;
+	}
+	for (int i = 0; i < nsegs; i++) {
+		LdSeg *g = &ld->segs[i];
+		if (g->type != 7 || ld->nphdrs) continue;
+		uint64_t lo = UINT64_MAX, hi = 0, fhi = 0, plo = 0, al = 1, off = 0;
+		for (int k = 0; k < n; k++) {
+			LdOut *o = &ld->outs[ord[k]];
+			if (!(o->flags & 0x400)) continue;
+			if (o->vma < lo) { lo = o->vma; plo = o->lma; off = o->off; }
+			if (o->vma + o->size > hi) hi = o->vma + o->size;
+			if (!o->nobits && o->vma + o->size > fhi) fhi = o->vma + o->size;
+			if (o->align > al) al = o->align;
+		}
+		if (lo == UINT64_MAX) continue;
+		g->off = off;
+		g->vaddr = lo;
+		g->paddr = plo;
+		g->filesz = fhi > lo ? fhi - lo : 0;
+		g->memsz = hi - lo;
+		g->align = al;
+		g->flags = 4;
 	}
 	for (int i = 0; i < nsegs && ld->nphdrs; i++) {
 		LdSeg *g = &ld->segs[i];
@@ -9280,9 +9418,9 @@ static void ld_write_elf(Ctx *ctx, Ld *ld, const char *out_path, uint64_t entry)
 			} else if (s->ld_out && ld->outs[s->ld_out - 1].shndx) shn = ld->outs[s->ld_out - 1].shndx;
 			memset(e, 0, 24);
 			le32(e, strtab_add(&strtab, s->name));
-			e[4] = (uint8_t)(((pass == 0 ? 0 : s->weak ? 2 : 1) << 4) | (s->kind == SYM_FUNC ? 2 : s->ld_out || s->sect != SEC_ABS ? 1 : 0));
+			e[4] = (uint8_t)(((pass == 0 ? 0 : s->weak ? 2 : 1) << 4) | (s->tls ? 6 : s->kind == SYM_FUNC ? 2 : s->ld_out || s->sect != SEC_ABS ? 1 : 0));
 			le16(e+6, (uint16_t)shn);
-			le64(e+8, ld_sym_addr(ctx, s));
+			le64(e+8, ld_sym_addr(ctx, s) - (s->tls ? (uint64_t)ctx->tls_lo : 0));
 			le64(e+16, (uint64_t)s->size);
 			buf_append(&symtab, e, 24);
 			if (pass == 0) nlocal++;
@@ -9311,7 +9449,7 @@ static void ld_write_elf(Ctx *ctx, Ld *ld, const char *out_path, uint64_t entry)
 		LdOut *o = &ld->outs[ord[k]];
 		int nob = o->nobits || o->st->noload;
 		int type = nob ? 8 : (o->flags & 0x300) == 0x200 ? 7 : 1;
-		shdr(S + (k + 1) * 64, names[k], type, (uint64_t)((o->flags & 7) | 2), o->vma, o->off, o->size, 0, 0, o->align, 0);
+		shdr(S + (k + 1) * 64, names[k], type, (uint64_t)((o->flags & 0x407) | 2), o->vma, o->off, o->size, 0, 0, o->align, 0);
 	}
 	shdr(S + (n + 1) * 64, n_sym, 2, 0, 0, sym_off, symtab.len, (uint32_t)(n + 2), (uint32_t)nlocal, 8, 24);
 	shdr(S + (n + 2) * 64, n_str, 3, 0, 0, str_off, strtab.len, 0, 0, 1, 0);
@@ -9358,12 +9496,23 @@ static void ld_link(Ctx *ctx, const char *out_path) {
 	ld_match(ctx, ld);
 	ld_layout(ctx, ld);
 	ld_define(ctx, ld);
+	uint64_t tls_lo = UINT64_MAX, tls_hi = 0, tls_a = 1;
+	for (int i = 0; i < ld->nouts; i++) {
+		LdOut *o = &ld->outs[i];
+		if (o->discard || !o->kept || !(o->flags & 0x400)) continue;
+		if (o->vma < tls_lo) tls_lo = o->vma;
+		if (o->vma + o->size > tls_hi) tls_hi = o->vma + o->size;
+		if (o->align > tls_a) tls_a = o->align;
+	}
+	ctx->has_tls = tls_hi > 0;
+	ctx->tls_lo = (long long)tls_lo;
+	if (ctx->has_tls) ctx->tls_tp = (long long)(tls_lo + ld_alignup(tls_hi - tls_lo, tls_a));
 	for (int i = 0; i < ld->nouts; i++) {
 		LdOut *a = &ld->outs[i];
-		if (a->discard || !a->kept || !a->size || a->st->noload) continue;
+		if (a->discard || !a->kept || !a->size || a->st->noload || ((a->flags & 0x400) && a->nobits)) continue;
 		for (int j = i + 1; j < ld->nouts; j++) {
 			LdOut *b = &ld->outs[j];
-			if (b->discard || !b->kept || !b->size || b->st->noload) continue;
+			if (b->discard || !b->kept || !b->size || b->st->noload || ((b->flags & 0x400) && b->nobits)) continue;
 			if (a->vma < b->vma + b->size && b->vma < a->vma + a->size)
 				ld_fail(ld, "section '%s' overlaps section '%s'", a->name, b->name);
 			if (!a->nobits && !b->nobits && a->lma < b->lma + b->size && b->lma < a->lma + a->size)
@@ -9401,7 +9550,10 @@ static void write_elf(Ctx *ctx, const char *out_path) {
 		ld_link(ctx, out_path);
 		return;
 	}
-	const size_t headers = ctx->binary ? 0 : 64 + 2*56;
+	int tls = 0;
+	for (int i = 0; i < ctx->nsecs; i++) if (ctx->secs[i].tls) tls = 1;
+	int nph = (ctx->omagic ? 1 : 2) + tls;
+	const size_t headers = ctx->binary ? 0 : 64 + (size_t)nph * 56;
 	if (ctx->data.len == 0 && !ctx->binary) buf_zero_to(&ctx->data, 8);
 	resolve_alias_syms(ctx);
 	define_bounds(ctx);
@@ -9418,7 +9570,7 @@ static void write_elf(Ctx *ctx, const char *out_path) {
 	order[norder++] = SEC_BSS;
 
 	size_t text_a = ctx->text_align > 16 ? (size_t)ctx->text_align : 16;
-	size_t data_a = ctx->binary ? 16 : 0x1000;
+	size_t data_a = ctx->binary || ctx->omagic ? 16 : 0x1000;
 	if ((size_t)ctx->data_align > data_a) data_a = (size_t)ctx->data_align;
 	size_t bss_a = ctx->bss_align > 16 ? (size_t)ctx->bss_align : 16;
 	size_t text_off = align_up(headers, text_a);
@@ -9454,6 +9606,18 @@ static void write_elf(Ctx *ctx, const char *out_path) {
 	uint64_t data_va = sect_va[SEC_DATA];
 	uint64_t bss_va = sect_va[SEC_BSS];
 	size_t data_off = (size_t)(data_va - base);
+
+	uint64_t tls_lo = UINT64_MAX, tls_hi = 0, tls_a = 1;
+	for (int i = 0; i < ctx->nsecs; i++) {
+		if (!ctx->secs[i].tls) continue;
+		uint64_t v = sect_va[SEC_NAMED + i];
+		if (v < tls_lo) tls_lo = v;
+		if (v + ctx->secs[i].b.len > tls_hi) tls_hi = v + ctx->secs[i].b.len;
+		if ((uint64_t)ctx->secs[i].align > tls_a) tls_a = (uint64_t)ctx->secs[i].align;
+	}
+	ctx->has_tls = tls;
+	ctx->tls_lo = (long long)tls_lo;
+	if (tls) ctx->tls_tp = (long long)(tls_lo + align_up((size_t)(tls_hi - tls_lo), (size_t)tls_a));
 
 	apply_relocs(ctx, sect_va);
 
@@ -9494,7 +9658,7 @@ static void write_elf(Ctx *ctx, const char *out_path) {
 		for (Sym *s = ctx->globals; s; s = s->gnext) {
 			if (!s->defined || (s->kind != SYM_FUNC && s->kind != SYM_VAR) || is_noalloc(ctx, s->sect)) continue;
 			if (s->is_static != (pass == 0)) continue;
-			add_elf_sym(&symtab, &strtab, s, sect_va, shndx, pass == 0 ? 0 : s->weak ? 2 : 1);
+			add_elf_sym(&symtab, &strtab, s, sect_va, shndx, pass == 0 ? 0 : s->weak ? 2 : 1, ctx->tls_lo);
 			if (pass == 0) nlocal++;
 		}
 	}
@@ -9537,17 +9701,29 @@ static void write_elf(Ctx *ctx, const char *out_path) {
 	le16(E+0x10,2); le16(E+0x12,62); le32(E+0x14,1);
 	le64(E+0x18,entry);
 	le64(E+0x20,64); le64(E+0x28,sh_off); le32(E+0x30,0);
-	le16(E+0x34,64); le16(E+0x36,56); le16(E+0x38,2);
+	le16(E+0x34,64); le16(E+0x36,56); le16(E+0x38,(uint16_t)nph);
 	le16(E+0x3A,64); le16(E+0x3C,(uint16_t)nsh); le16(E+0x3E,(uint16_t)(nsh - 1));
 
 	uint8_t *P=file.data+64;
-	le32(P+0x00,1); le32(P+0x04,5);
-	le64(P+0x08,seg_off); le64(P+0x10,base + seg_off); le64(P+0x18,base + seg_off);
-	le64(P+0x20,text_end - seg_off); le64(P+0x28,text_end - seg_off); le64(P+0x30,0x1000);
-	P += 56;
-	le32(P+0x00,1); le32(P+0x04,6);
-	le64(P+0x08,data_off); le64(P+0x10,data_va); le64(P+0x18,data_va);
-	le64(P+0x20,data_end - data_off); le64(P+0x28,(bss_va - data_va) + (uint64_t)ctx->bss_size); le64(P+0x30,0x1000);
+	if (ctx->omagic) {
+		le32(P+0x00,1); le32(P+0x04,7);
+		le64(P+0x08,seg_off); le64(P+0x10,base + seg_off); le64(P+0x18,base + seg_off);
+		le64(P+0x20,data_end - seg_off); le64(P+0x28,(bss_va + (uint64_t)ctx->bss_size) - (base + seg_off)); le64(P+0x30,0x1000);
+	} else {
+		le32(P+0x00,1); le32(P+0x04,5);
+		le64(P+0x08,seg_off); le64(P+0x10,base + seg_off); le64(P+0x18,base + seg_off);
+		le64(P+0x20,text_end - seg_off); le64(P+0x28,text_end - seg_off); le64(P+0x30,0x1000);
+		P += 56;
+		le32(P+0x00,1); le32(P+0x04,6);
+		le64(P+0x08,data_off); le64(P+0x10,data_va); le64(P+0x18,data_va);
+		le64(P+0x20,data_end - data_off); le64(P+0x28,(bss_va - data_va) + (uint64_t)ctx->bss_size); le64(P+0x30,0x1000);
+	}
+	if (tls) {
+		P += 56;
+		le32(P+0x00,7); le32(P+0x04,4);
+		le64(P+0x08,tls_lo - base); le64(P+0x10,tls_lo); le64(P+0x18,tls_lo);
+		le64(P+0x20,tls_hi - tls_lo); le64(P+0x28,tls_hi - tls_lo); le64(P+0x30,tls_a);
+	}
 
 	write_out(out_path, &file, 0755);
 
@@ -9666,8 +9842,8 @@ static void write_object(Ctx *ctx, const char *out_path) {
 			if (!s->defined && (pass == 0 || !s->ref)) continue;
 			memset(e, 0, 24);
 			le32(e, strtab_add(&strtab, s->name));
-			e[4] = (uint8_t)(((pass == 0 ? 0 : s->weak ? 2 : 1) << 4) | (!s->defined ? 0 : s->kind == SYM_FUNC ? 2 : 1));
-			if (s->defined && s->tentative && s->sect == SEC_BSS) {
+			e[4] = (uint8_t)(((pass == 0 ? 0 : s->weak ? 2 : 1) << 4) | (s->tls ? 6 : !s->defined ? 0 : s->kind == SYM_FUNC ? 2 : 1));
+			if (s->defined && s->tentative && s->sect == SEC_BSS && !ctx->no_common) {
 				le16(e+6, 0xFFF2);
 				int al = s->ty && s->ty->align > 0 ? s->ty->align : 8;
 				le64(e+8, (uint64_t)(s->align > al ? s->align : al));
@@ -9721,6 +9897,7 @@ static void write_object(Ctx *ctx, const char *out_path) {
 		offs[shndx[x]] = file.len;
 		if (x >= ns) sizes[shndx[x]] = (size_t)bs.size[x - ns];
 		else if (x == SEC_BSS) sizes[shndx[x]] = (size_t)ctx->bss_size;
+		else if (x >= SEC_NAMED && ctx->secs[x - SEC_NAMED].tls == 2) sizes[shndx[x]] = ctx->secs[x - SEC_NAMED].b.len;
 		else {
 			Buf *b = sec_buf(ctx, x);
 			buf_append(&file, b->data, b->len);
@@ -9776,7 +9953,8 @@ static void write_object(Ctx *ctx, const char *out_path) {
 			x == SEC_BSS ? (ctx->bss_align > 8 ? ctx->bss_align : 8) :
 			(ctx->secs[x - SEC_NAMED].align > 1 ? ctx->secs[x - SEC_NAMED].align : 1);
 		int i = shndx[x];
-		int type = x == SEC_BSS || x >= ns ? 8 : x >= SEC_NAMED && !strncmp(ctx->secs[x - SEC_NAMED].name, ".note", 5) ? 7 : 1;
+		int type = x == SEC_BSS || x >= ns || (x >= SEC_NAMED && ctx->secs[x - SEC_NAMED].tls == 2) ? 8 :
+			x >= SEC_NAMED && !strncmp(ctx->secs[x - SEC_NAMED].name, ".note", 5) ? 7 : 1;
 		shdr(S + i * 64, names[i], type, (uint64_t)(x >= ns ? 3 : sec_flags(ctx, x)), 0, offs[i], sizes[i], 0, 0, (uint64_t)a, 0);
 		if (rela[x]) {
 			i = rela[x];
@@ -9817,17 +9995,18 @@ static Sym *link_global(Ctx *ctx, char *name, int *created) {
 	return g;
 }
 
-static long link_got(Ctx *ctx, Sym *y) {
-	if (y->got_off) return y->got_off - 1;
+static long link_got(Ctx *ctx, Sym *y, int tp) {
+	long *slot = tp ? &y->gottp_off : &y->got_off;
+	if (*slot) return *slot - 1;
 	int g = section_index(ctx, intern(".got"), SK_DATA);
 	Buf *b = sec_buf(ctx, g);
 	raise_align(ctx, g, 8);
 	buf_zero_to(b, align_up(b->len, 8));
-	y->got_off = (long)b->len + 1;
+	*slot = (long)b->len + 1;
 	buf_zero_to(b, b->len + 8);
-	add_reloc(ctx, R_ABS64, (size_t)(y->got_off - 1), y, 0, 0);
+	add_reloc(ctx, tp ? R_TPOFF64 : R_ABS64, (size_t)(*slot - 1), y, 0, 0);
 	ctx->relocs[ctx->nrelocs - 1].in = g;
-	return y->got_off - 1;
+	return *slot - 1;
 }
 
 static int elf_ok(const uint8_t *d, size_t n) {
@@ -9857,10 +10036,12 @@ static void load_object(Ctx *ctx, const uint8_t *d, size_t n, const char *name) 
 		if (type == 2) symsh = i;
 		if (i == 0 || !(flags & 2) || (type == 7 && !ctx->ld) || !strcmp(nm, ".eh_frame")) continue;
 		if (type != 1 && type != 7 && type != 8 && type != 14 && type != 15 && type != 16) continue;
-		if (flags & 0x400) link_error(name, "thread-local storage is not supported (section %s)", nm);
 		if (type != 8 && off + size > n) link_error(name, "section %s lies outside the file", nm);
 		int sect;
-		if (type == 8) sect = SEC_BSS;
+		if (flags & 0x400) {
+			sect = section_index(ctx, intern(nm), SK_DATA);
+			ctx->secs[sect - SEC_NAMED].tls = type == 8 ? 2 : 1;
+		} else if (type == 8) sect = SEC_BSS;
 		else if (!strcmp(nm, ".text")) sect = SEC_TEXT;
 		else if (!strcmp(nm, ".rodata")) sect = SEC_RODATA;
 		else if (!strcmp(nm, ".data")) sect = SEC_DATA;
@@ -9875,7 +10056,8 @@ static void load_object(Ctx *ctx, const uint8_t *d, size_t n, const char *name) 
 			Buf *b = sec_buf(ctx, sect);
 			buf_zero_to(b, align_up(b->len, (size_t)align));
 			base[i] = (long)b->len;
-			buf_append(b, d + off, (size_t)size);
+			if (type == 8) buf_zero_to(b, b->len + (size_t)size);
+			else buf_append(b, d + off, (size_t)size);
 		}
 		add_piece(ctx, sect, base[i], base[i] + (long)size, intern(nm), name, (int)align);
 		if (ctx->track) ctx->pieces[ctx->npieces - 1].note = type == 7;
@@ -9897,7 +10079,6 @@ static void load_object(Ctx *ctx, const uint8_t *d, size_t n, const char *name) 
 		int created;
 		if (type == 4) continue;
 		if (type == 3) { ssec[k] = shn; continue; }
-		if (type == 6) link_error(name, "thread-local symbol '%s' is not supported", nm);
 		if (shn != 0 && shn < 0xFF00 && (shn >= shnum || map[shn] == -3)) continue;
 		if (bind == 0) {
 			if (!shn || !*nm) continue;
@@ -9911,6 +10092,7 @@ static void load_object(Ctx *ctx, const uint8_t *d, size_t n, const char *name) 
 			y->off = shn == 0xFFF1 ? (long)val : base[shn] + (long)val;
 			y->piece = shn == 0xFFF1 ? 0 : pidx[shn];
 			y->size = (long)sz;
+			y->tls = type == 6;
 			y->gnext = ctx->globals;
 			ctx->globals = y;
 			syms[k] = y;
@@ -9918,6 +10100,7 @@ static void load_object(Ctx *ctx, const uint8_t *d, size_t n, const char *name) 
 		}
 		Sym *g = link_global(ctx, intern(nm), &created);
 		syms[k] = g;
+		if (type == 6) g->tls = 1;
 		if (!shn) { if (bind == 2 && created) g->weak = 1; continue; }
 		if (shn == 0xFFF2) {
 			if (!g->defined) {
@@ -9975,14 +10158,16 @@ static void load_object(Ctx *ctx, const uint8_t *d, size_t n, const char *name) 
 			case 14: kind = R_ABS8; break;
 			case 15: kind = R_PC8; a += 1; break;
 			case 24: kind = R_PC64; a += 8; break;
-			case 9: case 41: case 42:
+			case 9: case 41: case 42: case 22:
 				if (!y) link_error(name, "GOT relocation against a section");
 				kind = R_PC32;
 				sect = section_index(ctx, intern(".got"), SK_DATA);
-				a += link_got(ctx, y) + 4;
+				a += link_got(ctx, y, type == 22) + 4;
 				y = NULL;
 				piece = 0;
 				break;
+			case 23: kind = R_TPOFF32; break;
+			case 18: kind = R_TPOFF64; break;
 			default:
 				link_error(name, "unsupported relocation type %d", type);
 				kind = R_ABS64;
@@ -10118,6 +10303,32 @@ static int input_kind(const char *path) {
 	return 'c';
 }
 
+static void load_binary(Ctx *ctx, const char *path) {
+	size_t n;
+	uint8_t *d = read_binary(path, &n);
+	char base[512], name[600];
+	int k = 0;
+	for (const char *p = path; *p && k < 511; p++) base[k++] = isalnum((unsigned char)*p) ? *p : '_';
+	base[k] = 0;
+	piece_begin(ctx);
+	long off = (long)ctx->data.len;
+	buf_append(&ctx->data, d, n);
+	add_piece(ctx, SEC_DATA, off, off + (long)n, intern(".data"), path, 1);
+	static const char *suffix[] = { "start", "end", "size" };
+	for (int i = 0; i < 3; i++) {
+		int created;
+		snprintf(name, sizeof(name), "_binary_%s_%s", base, suffix[i]);
+		Sym *g = link_global(ctx, intern(name), &created);
+		if (g->defined) link_error(path, "multiple definition of '%s'", name);
+		g->defined = 1;
+		g->sect = i == 2 ? SEC_ABS : SEC_DATA;
+		g->off = i == 0 ? off : i == 1 ? off + (long)n : (long)n;
+		g->piece = i == 2 || !ctx->track ? 0 : ctx->npieces;
+	}
+	piece_end(ctx, path);
+	free(d);
+}
+
 static void compile_input(Ctx *ctx, const char *path) {
 	int k = input_kind(path);
 	if (k == 'o' || k == 'a') {
@@ -10170,9 +10381,22 @@ static void ctx_init(Ctx *ctx) {
 	ctx->cur_data = SEC_DATA;
 }
 
+static int ignored_flag(const char *a) {
+	static const char *names[] = { "-fno-pic", "-fno-PIC", "-fno-pie", "-fno-PIE", "-static", "-fno-builtin",
+		"-fno-strict-aliasing", "-fno-omit-frame-pointer", "-fno-stack-protector", "-mno-red-zone",
+		"-mtls-direct-seg-refs", "-mcmodel=kernel", "-mcmodel=small", "-m64", "-MD", "-MMD", "-pipe",
+		"-Wa,-divide", "-Wa,--divide", NULL };
+	for (int i = 0; names[i]; i++) if (!strcmp(a, names[i])) return 1;
+	if (a[1] == 'O' && (!a[2] || (strchr("0123s", a[2]) && !a[3]))) return 1;
+	if (a[1] == 'g') return 1;
+	if (a[1] == 'W' && a[2] && a[2] != ',' && a[3] != ',') return 1;
+	return 0;
+}
+
 int main(int argc, char **argv) {
 	const char *out = "a.out";
 	const char *inputs[64];
+	int binary_in[64], as_binary = 0;
 	const char *entry = NULL, *script = NULL;
 	int ninputs = 0, compile_only = 0, out_given = 0, oformat_given = 0;
 	Ctx *ctx = (Ctx *)malloc(sizeof(Ctx));
@@ -10185,6 +10409,16 @@ int main(int argc, char **argv) {
 		else if (a[0]=='-' && a[1]=='D' && ctx->ndefines < 64) ctx->defines[ctx->ndefines++] = a[2] ? a+2 : (i+1<argc ? argv[++i] : "");
 		else if (strcmp(a,"-nostdlib")==0) ctx->nostdlib = 1;
 		else if (strcmp(a,"-ffreestanding")==0) ctx->freestanding = ctx->nostdlib = 1;
+		else if (strcmp(a,"-nodefaultlibs")==0) ctx->nostart = ctx->nostdlib = 1;
+		else if (strcmp(a,"-nostdinc")==0) ctx->nostdinc = 1;
+		else if (strcmp(a,"-fno-common")==0) ctx->no_common = 1;
+		else if (strcmp(a,"-fcommon")==0) ctx->no_common = 0;
+		else if (strcmp(a,"-N")==0) ctx->omagic = 1;
+		else if ((strcmp(a,"-m")==0&&i+1<argc) || strncmp(a,"-melf",5)==0) {
+			const char *m = a[2] ? a+2 : argv[++i];
+			if (strcmp(m,"elf_x86_64")) { fprintf(stderr,"unsupported emulation: %s\n",m); return 1; }
+		}
+		else if (a[0]=='-' && ignored_flag(a)) {}
 		else if (strcmp(a,"-mgeneral-regs-only")==0) ctx->no_float = 1;
 		else if (strcmp(a,"-e")==0&&i+1<argc) entry=argv[++i];
 		else if (strcmp(a,"-T")==0&&i+1<argc) script=argv[++i];
@@ -10203,8 +10437,13 @@ int main(int argc, char **argv) {
 			ctx->multiboot = strcmp(a,"multiboot") == 0;
 			if (ctx->binary && !ctx->image && !ctx->multiboot && strcmp(a,"bin") != 0) { fprintf(stderr,"unknown output format: %s\n",a); return 1; }
 		}
+		else if (strcmp(a,"-b")==0&&i+1<argc) {
+			a = argv[++i];
+			if (strcmp(a,"binary") && strcmp(a,"elf64-x86-64") && strcmp(a,"default")) { fprintf(stderr,"unknown input format: %s\n",a); return 1; }
+			as_binary = strcmp(a,"binary") == 0;
+		}
 		else if (a[0]=='-') { fprintf(stderr,"unknown arg: %s\n",a); return 1; }
-		else if (ninputs < 64) inputs[ninputs++] = a;
+		else if (ninputs < 64) { binary_in[ninputs] = as_binary; inputs[ninputs++] = a; }
 	}
 	if (script) {
 		if (compile_only) { fprintf(stderr,"-T needs a link, not -c\n"); return 1; }
@@ -10245,6 +10484,8 @@ int main(int argc, char **argv) {
 	id_offsetof = intern("__builtin_offsetof");
 	id_unreachable = intern("__builtin_unreachable");
 	id_trap = intern("__builtin_trap");
+	id_return_address = intern("__builtin_return_address");
+	id_frame_address = intern("__builtin_frame_address");
 	id_attribute = intern("__attribute__");
 	id_attribute2 = intern("__attribute");
 	id_interrupt = intern("interrupt");
@@ -10261,6 +10502,7 @@ int main(int argc, char **argv) {
 
 	if (compile_only) {
 		if (out_given && ninputs > 1) { fprintf(stderr,"-o with -c needs a single input file\n"); return 1; }
+		if (as_binary) { fprintf(stderr,"-b binary needs a link, not -c\n"); return 1; }
 		for (int i = 0; i < ninputs; i++) {
 			int k = input_kind(inputs[i]);
 			if (k == 'o' || k == 'a') { fprintf(stderr,"%s: error: -c needs a C or assembly file\n", inputs[i]); return 1; }
@@ -10272,6 +10514,8 @@ int main(int argc, char **argv) {
 			u->ndefines = ctx->ndefines;
 			u->nostdlib = ctx->nostdlib;
 			u->freestanding = ctx->freestanding;
+			u->nostdinc = ctx->nostdinc;
+			u->no_common = ctx->no_common;
 			u->no_float = ctx->no_float;
 			u->track = 1;
 			compile_input(u, inputs[i]);
@@ -10292,6 +10536,7 @@ int main(int argc, char **argv) {
 
 	Type *mt = func_type(ty_int);
 	mt->oldstyle = 1;
+	if (ctx->nostart) ctx->freestanding = 1;
 	Sym *main_sym = ctx->freestanding ? NULL : get_global(ctx, id_main, SYM_FUNC, mt, 0);
 	Sym *exit_sym = NULL, *init_sym = NULL, *environ_sym = NULL;
 	if (!ctx->nostdlib) {
@@ -10305,9 +10550,14 @@ int main(int argc, char **argv) {
 	if (main_sym) emit_start(ctx, main_sym, exit_sym, init_sym, environ_sym);
 	piece_end(ctx, "<start>");
 
-	for (int i = 0; i < ninputs; i++) compile_input(ctx, inputs[i]);
+	for (int i = 0; i < ninputs; i++) {
+		if (binary_in[i]) load_binary(ctx, inputs[i]);
+		else compile_input(ctx, inputs[i]);
+	}
 	if (!ctx->nostdlib) {
 		ctx->in_libc = 1;
+		for (int i = 0; i < ctx->nsecs; i++)
+			if (ctx->secs[i].tls && ctx->ndefines < 64) { ctx->defines[ctx->ndefines++] = "__SCCC_TLS__"; break; }
 		piece_begin(ctx);
 		compile_unit(ctx, builtin_libc_src(), "<libc>", 1);
 		piece_end(ctx, "<libc>");

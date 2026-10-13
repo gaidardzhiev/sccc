@@ -892,7 +892,41 @@ static void stdio_init(void) {
 	if (isatty(1)) file_stdout.flags |= F_LINE;
 }
 
+#ifdef __SCCC_TLS__
+void __libc_init(int argc, char **argv, char **envp) {
+	char **e = envp;
+	unsigned long *aux;
+	unsigned char *phdr = 0;
+	unsigned long phnum = 0, phent = 56;
+	(void)argc; (void)argv;
+	while (*e) e++;
+	for (aux = (unsigned long *)(e + 1); aux[0]; aux += 2) {
+		if (aux[0] == 3) phdr = (unsigned char *)aux[1];
+		if (aux[0] == 4) phent = aux[1];
+		if (aux[0] == 5) phnum = aux[1];
+	}
+	for (unsigned long i = 0; phdr && i < phnum; i++) {
+		unsigned char *p = phdr + i * phent, *blk, *tp;
+		unsigned long filesz, memsz, align, size;
+		if (*(unsigned int *)p != 7) continue;
+		filesz = *(unsigned long *)(p + 32);
+		memsz = *(unsigned long *)(p + 40);
+		align = *(unsigned long *)(p + 48);
+		if (align < 1) align = 1;
+		size = (memsz + align - 1) / align * align;
+		if (align < 16) align = 16;
+		blk = malloc(size + align + 16);
+		tp = (unsigned char *)(((unsigned long)blk + size + align - 1) / align * align);
+		memset(tp - size, 0, size);
+		memcpy(tp - size, (void *)*(unsigned long *)(p + 16), filesz);
+		*(unsigned char **)tp = tp;
+		__syscall(158, 0x1002, tp);
+	}
+	stdio_init();
+}
+#else
 void __libc_init(void) { stdio_init(); }
+#endif
 
 static int write_all(int fd, const unsigned char *p, size_t n) {
 	while (n > 0) {

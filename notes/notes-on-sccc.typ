@@ -28,7 +28,7 @@
 #align(center)[#text(weight: "bold", size: 10pt)[ABSTRACT]]
 #pad(x: 2.2em)[
   #text(size: 9.8pt)[
-  SCCC is a self-compiling C compiler for x86-64. It preprocesses and compiles C source, emits machine instructions, resolves addresses, and writes the executable itself. For Linux programs it supplies its own headers and C library and produces ELF64 files. For kernels it produces flat binaries, BIOS disk images, and Multiboot images, including the boot code needed to enter 64-bit mode. These notes describe the language, code generation, runtime conventions, hardware instructions, boot loaders, and the bootstrap in which the compiler compiles itself.
+  SCCC is a self-compiling C compiler and toolchain for x86-64. It compiles C and assembles x86 source, produces relocatable ELF objects, reads objects and archives, resolves symbols and relocations, and writes executable files. Its linker accepts GNU-style linker scripts. Hosted programs use an embedded C library; kernels can be built as ELF executables, flat binaries, BIOS disk images, or Multiboot images. The compiler follows the System V x86-64 calling convention. These notes describe the C implementation, assembler, linker, runtime, boot code, and self-compilation, including the build of xv6-x86_64 and its user programs.
   ]
 ]
 
@@ -36,30 +36,27 @@
 
 = Introduction
 
-The compiler accepts one or more C files and produces x86-64 machine code. For Linux programs it writes an ELF executable; for freestanding programs it can write a flat binary, a BIOS-bootable disk image, or a Multiboot image. No assembler or linker is invoked. Instruction encodings are appended to a byte buffer, and the final writer places the code and data at their runtime addresses.
+SCCC accepts C files, assembly source, ELF relocatable objects, and archives. It generates x86-64 machine instructions and writes ELF executables, relocatable objects, flat binaries, BIOS disk images, and Multiboot images. Its assembler and linker are part of the same program. A GNU-style linker script can give sections their addresses in memory and in the output file.
 
-A hosted compilation reads the program on the command line, its included files, the embedded headers, and the embedded implementation of the C library. The library source is compiled after the user files. With `-ffreestanding`, the compiler reads kernel source without inserting a C library or process startup. In both cases a single compilation context holds the text, data, symbols, and unresolved address references.
+A hosted compilation reads the input files, the embedded headers, and the embedded C library. With `-ffreestanding`, it omits the hosted startup and library. With `-c`, it emits ELF objects for later linking. The compiler also reads `.s` source as assembly and preprocesses `.S` before assembling it. References between files are resolved during the final link.
 
-The implementation uses recursive descent for expressions, declarations, and statements. Types are constructed as declarations are parsed. Expression parsing also generates instructions, so the compiler does not retain a program-wide syntax tree. A local expression normally leaves either an address or a value in `RAX`. A one-bit state, `lv`, distinguishes the two. The code generator reads it when an expression is assigned to, dereferenced, or passed to another operator.
+The C front end uses recursive descent for expressions, declarations, and statements. It constructs types while parsing and emits instructions while reading expressions. A normal expression returns a value or an address in `RAX`; the `lv` state distinguishes the two. The C emitter and the assembler share the machine-code encoder. They feed section buffers and relocation records to the output stage.
 
-The current source compiles under C99 with GCC. Once that executable exists, it compiles `sccc.c` into a second compiler. The second compiler compiles `sccc.c` into a third. The build checks the two resulting binaries with `cmp`. The test suite then uses both the host-built and the self-compiled binaries to compile and run programs.
+The compiler is itself written in C99. GCC builds the first executable, which compiles `sccc.c` into a second compiler. The second produces a third. The last two executables are compared byte for byte. The resulting toolchain also builds xv6-x86_64: C kernel files, assembly start-up files, and user programs are compiled and linked by SCCC, and the operating system boots to its shell.
 
 = Structure
 
-The compiler is one C program. The large divisions in `sccc.c` are buffers and utility functions, tokenization, types, machine-code output, preprocessing, parsing, initialization, statements and functions, output-file construction, and the command-line driver. The source order roughly follows that sequence, with small forward declarations where the parser is mutually recursive.
+The compiler is one C program. The principal parts of `sccc.c` are tokenization and preprocessing, types and declarations, C expressions and statements, x86 instruction encoding, assembly parsing, ELF object input and output, symbol and archive handling, linker-script evaluation, section layout, and executable output. The code that produces BIOS and Multiboot images uses boot assembly from `lib/boot`.
 
-The central compilation state is `Ctx`. It contains the current source stack and token, include paths and command-line definitions, macro state, lexical scopes, the function being compiled, the text and data buffers, and a list of relocations. One `Ctx` is used for all source files on the command line. At the end of a translation unit, the preprocessor state and local scopes are cleared; the global definitions and output buffers remain.
+`Ctx` carries the current tokens, sources, macros, scopes, types, symbol definitions, section buffers, and relocations. A single invocation can read several C and assembly translation units, followed by objects and archives. The driver also has a compile-only path. It writes one relocatable object per source input instead of running the executable linker when `-c` is given.
 
-```c
-compile_unit(ctx, src, filename, 0);
-/* ... the other input files ... */
-compile_unit(ctx, builtin_libc_src(), "<libc>", 1);
-write_elf(ctx, output);
+```sh
+./sccc -c part.c
+./sccc -c entry.S
+./sccc main.c part.o entry.o -o program
 ```
 
-These calls show the order of the main operation. The actual `main` routine creates the context, installs types and keywords, and, for a hosted program, emits `_start` before compiling C source. `-nostdlib` omits the embedded library; `-ffreestanding` also omits the hosted startup and lets the selected kernel entry point serve as the executable entry.
-
-The compiler does not produce `.o` files. Symbol references remain in the compilation context until `write_elf` assigns section addresses and patches the recorded locations. That function then writes one of the supported output formats. The name `write_elf` comes from the original Linux output path; it now handles flat and bootable files as well.
+In an ordinary hosted link, startup and the embedded library are added after the user inputs. In freestanding mode neither is inserted. The linker allocates common symbols, selects needed archive members, decides section addresses, resolves relocations, and writes the selected output format. The same section and symbol records are used by the compiler and the assembler. GNU ld scripts may replace the default section layout.
 
 == Buffers and allocation
 
@@ -264,19 +261,21 @@ A conditional branch can be emitted before its target has a position in the text
 
 = Functions and calls
 
-A function begins with `push rbp`, establishes `rbp` as its frame pointer, and reserves a frame whose size is patched after the body has been parsed. Parameters in registers are copied into slots near the top of the frame. Locals and compiler-generated temporaries are assigned negative offsets from `rbp`. The final epilogue uses `leave` and `ret`, restoring the stack to its state at entry.
+A generated function saves `rbp`, establishes a frame pointer, and reserves stack space after the size of its locals and temporaries is known. Parameters received in registers are copied into frame locations. An epilogue restores the stack and returns. The code generator counts temporary pushes so calls are made with the stack aligned to 16 bytes.
 
-== Argument placement
+== System V argument classification
 
-Generated ordinary calls use six general-purpose argument registers, in the order `RDI`, `RSI`, `RDX`, `RCX`, `R8`, and `R9`. Further argument slots are passed on the stack. Arguments are evaluated and saved, then copied to their calling locations. Padding is inserted as needed for 16-byte stack alignment. A direct call uses a relative `call` instruction and a symbol relocation. A call through a function pointer loads its address and uses an indirect call through `R11`.
+Calls use the System V x86-64 convention. Each scalar integer or pointer uses an INTEGER argument location. A `float` or `double` uses an SSE location. The six INTEGER registers are `RDI`, `RSI`, `RDX`, `RCX`, `R8`, and `R9`, and the eight SSE registers are `XMM0` through `XMM7`. The two register lists are allocated independently. Arguments left over after their registers are exhausted go on the stack.
 
-The compiler's generated convention handles scalar arguments in eight-byte slots, including floating-point bit patterns. Arithmetic inside a function still uses SSE; its calls pass the bits through the general-purpose slots. Structure parameters are copied into the callee's local frame from addresses supplied by the caller. A structure return passes a hidden destination address in `RDI`, leaving five ordinary register positions. These rules are shared by the compiled program and the bundled libc. They are not the full System V x86-64 aggregate and SSE argument classification used by separately compiled system libraries.
+Structures and unions of up to sixteen bytes are classified one eight-byte unit at a time. The class of each unit depends on its members, with INTEGER taking precedence when integer and floating fields occupy the same unit. Large or unaligned aggregates are passed in memory. A register-returned aggregate uses the appropriate combination of `RAX`, `RDX`, `XMM0`, and `XMM1`. When a return value needs memory, the caller passes its address in `RDI`; the callee returns the address in `RAX`.
+
+The compiler keeps the bit patterns of scalar floating-point values in `RAX` during ordinary expression evaluation. For a call or return it transfers the bits into or out of the prescribed SSE register. That movement is part of the calling convention. It permits an SCCC object to call a function from a GCC object and permits a GCC object to call one compiled by SCCC. The test suite exercises both directions.
 
 == Variadic functions and system calls
 
-A variadic function saves the six register argument slots in its frame. The built-in operation `__builtin_va_start` initializes a `va_list`-like record with the position of the next register argument, the beginning of stack arguments, and the register-save area. The library's `__va_arg_ptr` obtains the next value from that record. This supports functions such as `printf`, which read values according to their format strings.
+For a call to a variadic function, `AL` specifies the number of vector registers used. A variadic callee saves its incoming integer and SSE registers and initializes the System V `va_list` state, including offsets into its register-save area and the position of overflow arguments on the stack. `__builtin_va_start` and `__builtin_va_arg` implement the traversal. The calling convention applies to variadic functions compiled in separate object files as well as to the embedded `printf` implementation.
 
-Linux system calls do not use the ordinary function-call register list. The compiler recognizes `__syscall` and places the call number in `RAX`, with syscall arguments in `RDI`, `RSI`, `RDX`, `R10`, `R8`, and `R9`. It then emits the two-byte `syscall` instruction. The distinction appears directly in the implementation: `parse_call` generates C calls, while `parse_builtin_syscall` generates the Linux entry sequence.
+A Linux system call uses a different register arrangement. The built-in `__syscall` puts the call number in `RAX` and arguments in `RDI`, `RSI`, `RDX`, `R10`, `R8`, and `R9`, then emits `syscall`. That path does not use the ordinary C argument classifier.
 
 = The embedded C library
 
@@ -292,27 +291,25 @@ A program can also be compiled with `-nostdlib`. In this mode, no library functi
 
 = The ELF executable
 
-For a default hosted build, `write_elf` gives final locations to text, read-only constants, initialized data, and BSS. The executable begins at the virtual base address `0x400000`. The ELF header is 64 bytes, followed by two 56-byte program headers. The generated code begins after these 176 bytes. `.rodata` follows the text at a 16-byte boundary; `.data` begins at a page boundary; `.bss` follows initialized data in memory.
+Without a linker script, the hosted executable is an ELF64 `ET_EXEC` file loaded at `0x400000`. The output writer places the ELF and program headers with the compiled text, read-only objects, writable data, and zero-initialized data. Named sections from C attributes or assembly directives are also laid out. The file includes symbol and section-string tables so tools such as `readelf`, `objdump`, and `gdb` can examine it.
 
-The first loadable segment is readable and executable and covers the headers, machine code, and read-only data. The second is readable and writable and contains initialized data followed by the zero-filled BSS region. ELF program headers tell Linux how to map those areas when the process starts. Section headers are also written for `.text`, `.rodata`, `.data`, `.bss`, every section named with the `section` attribute, `.symtab`, `.strtab`, and `.shstrtab`. The symbol table contains `_start` and defined C symbols, with local, global, and weak bindings.
+The linker places loadable code and read-only data in executable or read-only mappings, and initialized and uninitialized data in writable mappings. When thread-local objects exist, `.tdata` and `.tbss` are described by a `PT_TLS` segment. With a script, sections may have distinct virtual and load addresses, and the script can specify program headers explicitly.
 
-== Resolving addresses
+== Relocations and symbol resolution
 
-Relocations have two forms. `R_PC32` holds a signed 32-bit displacement relative to the end of an instruction, used for calls and RIP-relative addresses. `R_ABS64` holds an eight-byte absolute address, used for initialized pointers. Each relocation stores its position, the section whose buffer holds that position, the target symbol or section, and an addend. `add_reloc` takes the holding section from `cur_text` for a displacement and from `cur_data` for an absolute address. Both name the built-in sections except while a function or variable is being placed in a section of its own.
+Code emitted while parsing may refer to an undefined function, global variable, assembly label, or section. Each occurrence leaves a relocation with its section, offset, symbol, type, and addend. A PC-relative relocation patches an instruction displacement; an absolute relocation patches an address. At the executable link, the writer looks up the final address and checks that the patched value fits its field.
 
-For a relative call the calculation is:
+For a four-byte RIP-relative field, the displacement is measured from the following instruction:
 
 ```c
-rel = target_address - (instruction_address + 4);
+rel = target_address - (displacement_address + 4);
 ```
 
-Here `instruction_address` means the address of the four-byte displacement field. The extra four advances to the following instruction. The writer checks that the result fits in a signed 32-bit value, then patches those bytes. For an absolute relocation, it writes the full 64-bit target address into the section that holds the field. An unresolved symbol produces an error before the file is finished, unless it is weak; an undefined weak symbol resolves to address 0.
+Relocatable ELF files keep such references in `.rela` sections for a later link. The supported x86-64 relocation kinds include `R_X86_64_PC32`, `R_X86_64_PLT32`, `R_X86_64_64`, `R_X86_64_32`, and `R_X86_64_32S`, with smaller forms from assembly and special forms for TLS and the global offset table. Weak definitions yield to strong ones, common definitions are merged, and undefined weak references have address zero. An unresolved strong reference is an error.
 
 == Process startup
 
-In a hosted executable the first emitted instructions belong to `_start`, not to `main`. They read `argc`, `argv`, and the environment address from the initial process stack, align the stack, and, when the library is present, initialize `environ` and call `__libc_init`. They then call `main`. Its integer result becomes the exit status passed to `exit`, or, without that library function, to the `exit_group` syscall.
-
-The Linux ELF output is written with mode `0755`. Its binary bytes are fully determined by the input, emitted encodings, symbol layout, and section placement. There is no timestamp inserted into the ELF image by the writer.
+For a hosted executable, `_start` gets `argc`, `argv`, and the environment from the initial Linux stack, aligns the stack, calls the embedded runtime initializer when present, and calls `main`. If the program has thread-local storage, the runtime establishes the thread pointer before user code needs it. The value returned by `main` becomes the process exit status. With `-ffreestanding`, startup belongs to the kernel source and the specified entry symbol instead.
 
 = Freestanding compilation
 
@@ -333,7 +330,7 @@ Three options determine kernel placement. `-oformat` chooses `elf`, `bin`, `img`
 
 == Section layout
 
-The layout code in `write_elf` is shared by all four output formats. `.text` contains emitted instructions, `.rodata` contains strings and other read-only constants, `.data` holds initialized objects, and `.bss` reserves zero-filled memory. A section named in a `section` attribute follows the built-in section of its kind. The writer first builds the order: `.text` and the code sections, `.rodata` and the read-only sections, `.data` and the data sections, then `.bss`. It then gives each one an address aligned to the largest alignment requested inside it. References between these sections are resolved before the output bytes are written. In the flat format the sections other than `.bss` appear consecutively with alignment padding. `.bss` occupies no file bytes; its extent is included in the address calculations used by the boot loaders.
+The ordinary output writer and the linker-script path both assign addresses for the supported output formats. `.text` contains emitted instructions, `.rodata` contains strings and other read-only constants, `.data` holds initialized objects, and `.bss` reserves zero-filled memory. A section named in a `section` attribute follows the built-in section of its kind. The writer first builds the order: `.text` and the code sections, `.rodata` and the read-only sections, `.data` and the data sections, then `.bss`. It then gives each one an address aligned to the largest alignment requested inside it. References between these sections are resolved before the output bytes are written. In the flat format the sections other than `.bss` appear consecutively with alignment padding. `.bss` occupies no file bytes; its extent is included in the address calculations used by the boot loaders.
 
 ```sh
 ./sccc -ffreestanding -oformat bin -Ttext 0x100000 \
@@ -344,7 +341,7 @@ Here `kernel.c` defines `_start` as its first function. In the flat case `-Ttext
 
 == The BIOS disk image
 
-`write_image` prepends a 512-byte boot sector to the kernel image. `boot_sector` constructs that sector from x86 instruction bytes with calls to `C8`, `C16`, `C32`, and `C64`, just as the compiler's main emitter constructs 64-bit instructions. Its execution begins at `0x7c00` in the mode established by the PC BIOS. The final two bytes of the sector are `0x55` and `0xaa`, the BIOS boot signature. The kernel itself starts at the next disk sector.
+`write_image` prepends a 512-byte boot sector to the kernel image. The boot sector is assembled from `lib/boot/img.s` using the compiler's own assembler, with kernel placement values supplied at image construction time. Its execution begins at `0x7c00` in the mode established by the PC BIOS. The final two bytes of the sector are `0x55` and `0xaa`, the BIOS boot signature. The kernel itself starts at the next disk sector.
 
 Before loading the kernel, the boot sector requests the BIOS E820 memory map with `int 0x15`. It stores the entry count at physical address `0x5000`, followed by 24-byte entries beginning at `0x5008`. Each entry gives a base address, a length, a type, and extended attributes. This table is passed to C code later; the `memory` kernel reads it to decide which physical page frames are available.
 
@@ -358,7 +355,7 @@ The image is padded to a cylinder-sized multiple of 516096 bytes, using 16 heads
 
 == The Multiboot image
 
-The Multiboot output has a different first page. `write_multiboot` writes the Multiboot 1 magic value `0x1badb002`, flags, checksum, and explicit load addresses, followed by a trampoline that starts in 32-bit protected mode. The next page begins the x86-64 kernel at the text address, normally `0x101000`. The text address must be page aligned. The image can be loaded by GRUB or by QEMU's `-kernel` option.
+The Multiboot output has a different first page. `write_multiboot` assembles the trampoline from `lib/boot/multiboot.s` and writes the Multiboot 1 magic value `0x1badb002`, flags, checksum, and explicit load addresses, followed by a trampoline that starts in 32-bit protected mode. The next page begins the x86-64 kernel at the text address, normally `0x101000`. The text address must be page aligned. The image can be loaded by GRUB or by QEMU's `-kernel` option.
 
 The Multiboot trampoline receives the bootloader's registers and saves them while it constructs identity-mapped page tables. Its page tables and a 16 KB stack occupy space after the kernel's BSS. It sets `cr3`, `cr4`, `EFER`, and `cr0`, loads a small GDT, and jumps into long mode. It then passes the address of the Multiboot information structure in `rdi` and the magic value `0x2badb002` in `rsi`, and calls the C entry. The BIOS image and the Multiboot image reach the same kind of 64-bit kernel function by different boot paths.
 
@@ -368,7 +365,7 @@ The Multiboot trampoline receives the bootloader's registers and saves them whil
 qemu-system-x86_64 -kernel hello.mb -serial stdio
 ```
 
-The Multiboot header and the transition instructions are emitted by SCCC. There is no separate assembly source for either boot path and no post-processing step that converts a host executable into a kernel image.
+The Multiboot header and long-mode trampoline are assembled by SCCC from the boot sources embedded with the compiler. No external assembler or linker is run when these images are constructed.
 
 = Machine instructions and interrupts
 
@@ -440,20 +437,126 @@ make baremetal
 make check
 ```
 
-The boot sector, Multiboot trampoline, hardware built-ins, and interrupt wrappers are all generated by the compiler itself. The kernel source uses C declarations and statements for its work after the processor reaches 64-bit mode.
+The boot sector and Multiboot trampoline come from assembly source embedded with the compiler and assembled by SCCC. The hardware built-ins and interrupt wrappers are generated from C. Both paths use the same x86 instruction encoder.
+
+= Compiling xv6
+
+The xv6-x86_64 tree is built with SCCC as its C compiler, assembler, and linker. Its Makefile invokes the same executable for all three operations. Kernel C files compile to relocatable objects; the assembly sources provide entry code and low-level processor operations. The final kernel link uses `kernel64.ld` to assign the kernel sections and produce the ELF image loaded by QEMU. The user programs are also compiled and linked, and their binaries are put in the xv6 file-system image.
+
+```sh
+make xv6run
+```
+
+`tools/xv6run.sh` obtains the tested xv6 revision when needed and builds `out/kernel.elf` and `fs.img` through xv6's Makefile, passing the SCCC path as `CC`, `AS`, and `LD`. QEMU starts with two CPUs and the prepared file-system disk. On a terminal the kernel starts its processors, runs `init`, and presents the xv6 shell. From that shell, `ls`, `cat`, `grep`, and the other installed user programs execute as xv6 processes.
+
+```text
+xv6...
+cpu0: starting xv6
+cpu1: starting
+init: starting sh
+$ ls
+.              1 1 512
+..             1 1 512
+README         2 2 1588
+cat            2 3 15664
+sh             2 13 26512
+```
+
+The console excerpt is from the xv6 run built with SCCC. Reaching the shell requires successful compilation and linking of the kernel's process scheduler, virtual-memory code, interrupt paths, file system, and system-call interface. It also requires the separate user programs and their syscall stubs to have the correct entry points and calling conventions. A compiler that merely produces a bootable kernel would not satisfy those dependencies.
+
+The `make xv6` test performs a longer check. `tools/xv6.sh` builds xv6 with SCCC and builds a GCC/GNU-toolchain reference, boots both with QEMU, runs xv6 `usertests`, and compares normalized serial output. `make xv6run` is the interactive route; `make xv6` is the automated operating-system test. The xv6 source is kept separately from the compiler sources. The observed shell boot and the test driver use the same compilation and linking paths.
 
 = Multiple source files
 
-SCCC accepts multiple C files on one command line. Each file has its own preprocessing run and file-scope names, while definitions destined for the executable share the same context. A function defined in one input can satisfy a call emitted for a declaration in another. The compiler resolves these references after compiling all inputs and the embedded library.
+Each C file has its own preprocessing run and file-scope names. Definitions that need external linkage become global symbols in the output. Assembly labels declared with `.globl` participate in that same symbol namespace. SCCC can therefore compile several C and assembly files at once or compile them separately and link the results later.
 
 ```sh
-./sccc examples/modules.c examples/modules_part2.c -o modules
-./modules
+./sccc -c main.c
+./sccc -c part.c
+./sccc main.o part.o -o program
 ```
 
-The `modules` example exercises a declaration in a header and definitions in separate source files. The multi-file language test also checks globals, private functions, common library names, and file I/O. The library is compiled after user sources, allowing user definitions to take precedence where the implementation's global-symbol rules permit it.
+The linker accepts relocatable `.o` files and static `.a` archives from other tools as well as from SCCC. An archive is scanned for members that define currently unresolved symbols. Extraction repeats until the archive has no further needed members. The order of archives on the command line affects which definitions are seen. The embedded runtime library is processed after the user inputs unless `-nostdlib` is specified.
 
-There is no separate object-file interface and no archive search. Supplying all sources in one invocation is the compilation model. The `-o` option chooses the executable name; `-I` adds header directories; `-D` supplies command-line macro definitions; `-nostdlib` omits the built-in library. Without `-o`, the output is `a.out`. The command line accepts up to 64 source inputs, with fixed-size arrays for include directories and `-D` definitions.
+The same ABI permits a GCC-compiled object to be linked into an SCCC executable and an SCCC-compiled object to be linked by GCC. External objects that refer to unsupported libraries or runtime facilities still require those implementations to be supplied. Here the object boundary is real: individual C and assembly sources need not be recompiled when another file changes.
+
+= Assembling x86 source
+
+The assembler reads GNU AT&T syntax. Register operands start with `%`, immediates with `$`, and a memory operand has the form `displacement(base, index, scale)`. The source operand precedes the destination. `.s` files are assembled directly; `.S` files pass through the C preprocessor with `__ASSEMBLER__` defined. A preprocessed assembly header can therefore hide C declarations behind a conditional directive.
+
+```asm
+.globl increment
+increment:
+    leal 1(%rdi), %eax
+    ret
+```
+
+Instructions are encoded through the same routines the C generator uses: prefixes, opcode bytes, ModRM and SIB fields, displacements, and immediates. `.code16`, `.code32`, and `.code64` change the instruction mode, which matters to boot code that passes from real mode through protected mode into long mode. Numeric labels such as `1f` and `1b` are resolved within an assembly unit; named local labels and global labels have separate visibility rules.
+
+== Sections, directives, and branch sizes
+
+Directives select `.text`, `.rodata`, `.data`, `.bss`, or a named section. Data directives write bytes and words, string directives append text, `.zero` reserves space, and alignment directives pad the current section. Symbol directives define globals, weak names, types, sizes, and aliases. The assembler also accepts conditional assembly and inclusion directives used by the kernel and xv6 sources.
+
+An assembly unit is read in passes. A forward branch initially may not know whether its target fits an eight-bit displacement. If it does not fit, the next pass uses the longer branch form. The passes repeat until no further branch grows. Unresolved cross-section and external references become relocations for the linker. Assembly and C are thus joined at the section and symbol level, not by textual inclusion.
+
+The source test `tools/ascorpus.py` compares instruction encodings with an external assembler over a generated corpus. The mechanism being tested is the shared encoder, so this also exercises instruction forms used by the C compiler.
+
+= Inline assembly
+
+Basic `asm` inserts assembly source at the point of the C statement. Extended assembly supplies inputs, outputs, and clobbers. A template may refer to operands by position or by a name in brackets. The parser assigns general registers, constants, or memory locations according to constraints, expands the template, and passes it to the internal assembler.
+
+```c
+static unsigned long read_flags(void) {
+    unsigned long flags;
+    __asm__ volatile("pushfq; popq %0" : "=r"(flags));
+    return flags;
+}
+```
+
+The constraint `=r` means that the output receives a general-purpose register. Input constraints may require particular registers or permit immediate and memory operands. A matching constraint reuses an output location; an early-clobber constraint keeps an output separate from inputs. Clobbered callee-saved registers are preserved around the statement. A `memory` clobber is recognized, and an `asm goto` template may transfer control to a C label.
+
+The compiler also accepts a register name on a local declaration with `asm("r10")`, which is used for operands such as the fourth argument of the Linux `syscall` instruction. Inline assembly and external `.s` files go through the same parser and encoder, with different handling of their source locations and C operands.
+
+= Relocatable ELF objects and archives
+
+The `-c` path writes `ET_REL` ELF64 objects. Alongside section contents, each file contains `.symtab`, `.strtab`, `.shstrtab`, relocation sections of type `SHT_RELA`, and a `.note.GNU-stack` section. The writer records section-relative values rather than final virtual addresses. Calls normally use `R_X86_64_PLT32`; other RIP-relative references use `R_X86_64_PC32`. Pointer initializers use absolute relocations of the appropriate width.
+
+For ordinary links, the object loader reads section headers, copies loadable contents to internal sections, imports symbols, and records the relocations. Static symbols are scoped to their object. Global symbols enter the linker's name table. Common symbols from tentative definitions are merged, while weak definitions can be replaced by strong definitions. The loader recognizes the relocation forms used by the compiler, assembler, and the supported GCC object cases.
+
+Archives have a different rule. The whole archive is not copied into the link. Its members are inspected and extracted when they define an outstanding reference. The process repeats within an archive because one extracted member may introduce another reference. This is why file order matters for archives and why a `-c` build needs no startup code or embedded libc until the final executable is linked.
+
+== Global offset table and thread-local relocations
+
+The ELF reader also handles GOT-relative references from supported position-independent input objects. A `.got` section receives slots for the symbols that need them, and the linker fills those slots with the final addresses. The output remains a statically linked, position-dependent executable, but the input object may use GOT addressing.
+
+Thread-local objects require another layout. Initial thread data goes in `.tdata`; zero-initialized thread data goes in `.tbss`. The linker computes offsets from the thread pointer and resolves local-exec relocations such as `R_X86_64_TPOFF32`. Their runtime address is obtained through the FS segment rather than an ordinary global address. Hosted startup initializes that segment from the ELF thread-local storage description; freestanding programs establish it themselves.
+
+= Linker scripts
+
+The `-T` option reads the GNU ld script used to lay out the output. It can name the entry point, define symbols, place input sections in output sections, set alignments, and give sections different virtual and load addresses. A bare-metal kernel commonly needs all of those operations.
+
+```ld
+ENTRY(boot32)
+KERNEL_VMA = 0xffffffff80000000;
+SECTIONS
+{
+  . = 1M;
+  .boot : { KEEP(*(.multiboot)) *(.boot.text) }
+  . += KERNEL_VMA;
+  .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_VMA)
+       { *(.text .text.*) }
+  .data : { *(.data) }
+  .bss  : { *(.bss) *(COMMON) }
+}
+```
+
+The example follows the kernel script in `baremetal/higher`. The boot code is loaded at a low physical address. The kernel text is linked at a high virtual address, with `AT` computing its physical load address. The script's location counter, `.`, advances independently of the bytes written to the file. The linker uses those values when resolving references between the boot code, text, and data.
+
+`SECTIONS` contains output-section declarations and assignments. Wildcard patterns select input sections by name or input file. `KEEP` preserves selected input; `/DISCARD/` drops selected sections. The implementation supports `SORT` forms, common linker-expression operators, `ALIGN`, `ADDR`, `LOADADDR`, `SIZEOF`, `DEFINED`, `PROVIDE`, and `ASSERT`, as well as program-header descriptions through `PHDRS`. The script may request ELF or binary output.
+
+Section placement is iterative where an expression refers to an address not yet known. Each input section is assigned to its first matching output-section rule. Unmatched sections are placed as orphans according to their kind. The final program headers group sections with compatible load mappings. For binary output the writer emits the loadable bytes starting at the lowest load address, omitting uninitialized storage. The image writers can then add the appropriate BIOS or Multiboot prefix.
+
+The tests in `tests/ldscript/` exercise executable, flat, higher-half, and orphan-section layouts. `tools/ldfuzz.py` compares additional generated script cases. This parser is part of SCCC's executable linker; it does not invoke GNU ld to interpret the script.
 
 = GNU C and C11 extensions
 
@@ -520,9 +623,25 @@ extern int (*const __start_initcalls[])(void), (*const __stop_initcalls[])(void)
 
 Before relocations are resolved, `define_bounds` gives each undefined `__start_name` or `__stop_name` the address of the start or end of section `name`, as GNU ld does. Tables built in several files therefore need no registration code at run time. The `initcall` kernel boots this way.
 
+= Thread-local storage
+
+`__thread` and `_Thread_local` declarations place objects in per-thread storage. The compiler separates initialized data from zero-filled storage into `.tdata` and `.tbss`. These are not normal globals at fixed process-wide addresses. The same identifier refers to a different copy when another thread uses it.
+
+```c
+__thread int counter = 1;
+
+int next_counter(void) {
+    return ++counter;
+}
+```
+
+SCCC uses the local-exec x86-64 TLS model. Loads and stores can address a TLS object relative to the FS segment, with an `R_X86_64_TPOFF32` relocation carrying its offset. For a variable's address the code uses the thread pointer and that same offset. The linker collects the TLS sections and describes their initialized bytes and total extent in a `PT_TLS` program header.
+
+In a hosted executable, `__libc_init` reads the auxiliary vector and ELF TLS header, allocates a thread control block, copies initialized TLS values, clears the remaining bytes, and sets the FS base with `arch_prctl`. A freestanding kernel controls its own per-thread or per-CPU FS setup. This is also why TLS code in an independently compiled object can link correctly: the relocation is resolved against the linker's TLS layout rather than against an ordinary data address.
+
 = Self compilation and testing
 
-The bootstrap rule is short enough to give in full:
+The bootstrap rule builds two self-compiled generations and compares the bytes:
 
 ```sh
 ./sccc sccc.c -o sccc2
@@ -530,37 +649,44 @@ The bootstrap rule is short enough to give in full:
 cmp sccc2 sccc3
 ```
 
-The host compiler builds the first `sccc` from the repository source. The second generation is produced by that executable. The third is produced by the second. The comparison checks that the last two generations emit exactly the same executable bytes for the same compiler source. The Makefile prints `bootstrap verified: sccc2 == sccc3` when the comparison succeeds.
+For the source accompanying these notes the comparison succeeds. In the inspected build the host-built compiler occupies 436448 bytes and the second and third generations each occupy 858576 bytes. The latter two files are byte-identical. The first executable was built by GCC from the same C source, but the others were generated entirely by SCCC.
 
-The hosted compiler has two main kinds of tests. `test_sccc.c` writes small C programs to temporary files, compiles them, runs the results, and compares exit statuses or expected compilation failures. The feature tests in `tests/` compile complete programs and compare their printed output against checked-in `.out` files when such files exist. They cover functions, pointer operations, arithmetic, statements, structures, globals, I/O, the preprocessor, scopes, floating-point arithmetic, initialization, bit-fields, and multiple translation units.
+`make check` tests the language and the toolchain from several directions. The C driver compiles and runs small programs and checks diagnostics. The feature and example suites compile source directly and also through intermediate object files. `tests/link/` covers symbol resolution, weak and common definitions, TLS, and object linking. `tests/ldscript/` checks scripted section placement. The ABI fuzzer compiles calling-convention cases across SCCC and GCC. The assembler corpus checks instruction encodings, and the linker fuzzer exercises generated link scripts. Bare-metal tests boot the kernel examples in QEMU and Bochs.
 
-The `examples/` directory holds larger programs. Among them are a parser for Lisp-like input, SHA-256, sorting, a maze, a small language interpreter, numerical calculations, and terminal games. `examples/run.sh` compiles each program, runs it with the supplied inputs and arguments, and compares its output with the stored result. `make check` runs the C driver, feature suite, and examples against both `sccc` and `sccc2`, and invokes `baremetal/run.sh` for the kernel tests. `make baremetal` runs the kernel suite separately. `make fuzz` runs a generated-expression test separately.
+The operating-system test is separate:
 
-For the archive used in these notes, `make check` completed with 112 passing C-driver cases, 18 passing feature programs, and 47 passing examples for #strong[each] compiler generation. The two bootstrap files also compared equal. The scripts report zero failures in all three groups. The complete output can be reproduced from the Makefile rather than from a separately maintained list of claimed successes.
+```sh
+make xv6       # rebuild xv6, run its tests, compare with GCC
+make xv6run    # build xv6 and enter its shell in QEMU
+```
 
-There are two different properties under test. Byte identity checks reproduction of the compiler binary. Running programs checks the behavior of generated executables. A compiler can reproduce an error consistently, so the second group of tests remains part of the bootstrap procedure. Both generations are asked to translate other source code, not only their own.
+The xv6 build uses the compiler for kernel C, assembly, object linking, and the user-space programs. The observed boot reaches `init: starting sh` and accepts commands at the `$` prompt. The automated xv6 script runs `usertests` and compares its output against a GCC-built reference. The project carries the test scripts and the selected upstream xv6 revision, so the commands identify the experiment rather than relying on hand-built binaries.
+
+Byte identity demonstrates that the compiler reproduces its own output. The language, ABI, assembler, linker, bare-metal, and xv6 tests exercise different properties. Self-hosting checks a fixed point in the compiler build; compiling the operating system checks a larger body of C and assembly under a different runtime.
 
 = Source size and executable size
 
-The compiler source contains 5300 lines of C. The embedded library is written in 1468 lines in `lib/libc.c`; its public declarations live in the separate header files. The C test driver is another 492 lines. `builtin.h` is generated from the library and headers, so its size is a consequence of the embedding process, not an independently maintained implementation.
+The compiler now contains 10599 lines in `sccc.c`; the C test driver contains 773 lines. `builtin.h` contains 2373 lines of generated embedded headers and library text, together with the embedded boot sources used by the image writers. Those sources are compiled or assembled by SCCC when a build needs them.
 
-In the bootstrap run described above, the host-built `sccc` executable occupied 261848 bytes. Both self-compiled stages occupied 465040 bytes. The host compiler was invoked with `-O2`; SCCC emits its own code directly, without a global optimization pass. Those sizes include different machine-code sequences for the same compiler source. The equal sizes of `sccc2` and `sccc3` are accompanied by their byte-for-byte equality, checked by `cmp`.
+The compiler source contains an AT&T syntax assembler, relocatable ELF object writer and reader, static-archive extraction, ABI argument classification, inline assembly, linker-script interpretation, TLS layout, and the final executable linker. Separate compilation produces an object representation; mixed-source links require global symbol resolution; scripts can place a higher-half kernel at a virtual address distinct from its physical load address.
 
-The work done by the compiler is concentrated in two places. Most source constructs cause machine instructions to be emitted as soon as the parser recognizes them. After all input has been translated, `write_elf` walks the relocation list, fixes addresses, and copies the sections into the selected output file. `write_image` and `write_multiboot` add their generated bootstrap code to the flat kernel bytes. The implementation has no object-file readback pass or separate loader program.
+The host-compiled SCCC and self-compiled stages have different executable sizes because GCC and SCCC emit different instruction sequences. The bootstrap requires identity only between `sccc2` and `sccc3`. The new test commands measure assembler, linker, ABI, and operating-system behavior in addition to compiler reproduction.
 
 = Implementation notes
 
-A few details determine the shape of this compiler. First, expression code is generated during parsing. Constant expressions are handled by separate evaluators because they need values before run time. Second, name resolution occurs at two different moments: lexical scopes are resolved as tokens arrive, while global addresses are resolved after section layout. Third, the calling rules are implemented on both sides of every generated call, including calls made from the embedded library.
+C expression instructions are emitted as the recursive-descent parser reads their operators. The lvalue state determines whether `RAX` contains a value or an address. Floating-point expression values are carried as bit patterns and transferred to SSE registers for arithmetic and for ABI calls. Type classification is used by both `parse_call` and `parse_func_body`, so separately compiled functions agree on the positions of their arguments and results.
 
-These details also explain where to look in the source. The `Type` and `Member` definitions give the target's data layout. `declspec` and `declarator` show how source declarations become those types. `parse_binary`, `parse_assign`, and `parse_stmt` show C expressions and statements becoming machine instructions. `parse_func_body` and `parse_call` give the function convention. `write_elf` completes all section layouts and fixes unresolved addresses; `boot_sector`, `write_image`, and `write_multiboot` construct bootable output. `mach_builtins` contains the hardware instruction encodings, and `emit_interrupt_entry` shows the register-save and interrupt-return sequence.
+The assembler is a second front end for the same instruction encoder. `assemble_unit` processes a source file; `assemble_snippet` is used by inline assembly. The code writer has to retain relocations when the output is an object, and it has to resolve them when the output is an executable. `write_object` implements the former path; `load_object` reads external ELF objects. Archive extraction determines which of those objects participate in a link.
 
-The test directories give concrete programs for the compiler's behavior. They cover bit-field initialization, variadic calls, multi-file definitions, floating-point formatting, interrupt handlers, peripheral I/O, exception frames, timers, and physical memory. The bare-metal cases exercise emitted boot code and kernel entry in addition to the language features exercised by the hosted suite.
+The script parser and layout engine appear in the `ld_` functions. The parser records assignments, input-section patterns, and output-section rules. The matching and layout passes assign file offsets, virtual addresses, and load addresses; `ld_write_elf` writes the resulting ELF file. `write_elf` remains the driver for the original output formats and for links without a script. Image construction uses the assembly sources under `lib/boot` and the same encoder.
+
+The xv6 build traverses nearly the whole system: C compilation, preprocessed assembly, separate object emission, archive and symbol handling, the System V ABI, scripted kernel layout, and executable writing. The bare-metal kernels exercise early boot and device operations; xv6 adds process creation, a file system, and separately linked user programs. Together they give a concrete description of what SCCC produces.
 
 = Conclusion
 
-SCCC reads C source and writes x86-64 machine code. Its preprocessor supplies tokens to a recursive-descent parser; the parser constructs types and emits instructions; the output pass assigns addresses, resolves relocations, and writes an ELF file, flat binary, BIOS disk image, or Multiboot image. Hosted executables use its embedded headers and C library. Freestanding kernels enter through generated boot code, use machine built-ins for hardware access, and handle interrupts through generated wrappers. The second and third compiler generations reproduce identical executable bytes.
+SCCC is a self-compiling x86-64 C toolchain. Its C parser emits machine instructions directly; its assembler reads `.s`, `.S`, and inline assembly; its object writer emits relocatable ELF files; and its linker reads objects, selects archive members, processes linker scripts, resolves relocations, and constructs final executables. The generated functions use the System V calling convention. The same toolchain writes hosted Linux executables and freestanding boot images.
 
-The source follows the path taken by a C construct from its spelling to the bytes that execute it. A pointer subscript becomes a scaled address; a local declaration becomes a frame offset; a forward function call becomes a relocation; an interrupt function gains a register-save wrapper and an `iretq`; a BIOS image gains the instructions that bring the processor from real mode into long mode. Those operations are the compiler.
+The compiler compiles itself to identical second- and third-stage executables. It also compiles and links xv6-x86_64, including the kernel and its user programs, and the operating system boots to a shell under QEMU. The source traces the operations from C declarations and assembly operands to relocations, section addresses, and the bytes the processor executes.
 
 #strong[Availability.]The source code of the compiler, library, hosted and bare-metal tests, kernel examples, and bootstrap Makefile carry the GPL-3.0-only license and are distributed at:\
 `https://github.com/gaidardzhiev/sccc`

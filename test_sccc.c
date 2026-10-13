@@ -182,6 +182,30 @@ static void check_script_err(const char *desc, const char *src, const char *scri
 	else { printf("  FAIL  [%s]  (expected an error but succeeded)\n", desc); g_fail++; }
 }
 
+static int run_args(const char **args) {
+	char *argv[40];
+	int n = 0;
+	argv[n++] = (char*)g_compiler;
+	for (int i = 0; args[i] && n < 39; i++) argv[n++] = (char*)args[i];
+	argv[n] = NULL;
+	int st = run(argv);
+	return !WIFEXITED(st) || WEXITSTATUS(st);
+}
+
+static void check_args(const char *desc, const char *src, const char **args, int want) {
+	write_src(src);
+	if (run_args(args)) { printf("  FAIL  [%s]  compile or link failed\n", desc); g_fail++; return; }
+	int got = run_bin();
+	if (got == want) { printf("  PASS  [%s]  exit=%d\n", desc, got); g_pass++; }
+	else { printf("  FAIL  [%s]  expected=%d got=%d\n", desc, want, got); g_fail++; }
+}
+
+static void check_args_err(const char *desc, const char *src, const char **args) {
+	write_src(src);
+	if (run_args(args)) { printf("  PASS  [%s]  (error as expected)\n", desc); g_pass++; }
+	else { printf("  FAIL  [%s]  (expected an error but succeeded)\n", desc); g_fail++; }
+}
+
 static void section(const char *title) {
 	printf("\n=== %s ===\n", title);
 }
@@ -683,6 +707,52 @@ int main(int argc, char **argv) {
 		"int f(void); int main(){ return f(); }",
 		"\t.set X, 3\n\t.globl f\nf:\n.if X - 3\n\tmov $1, %eax\n.elseif X\n.ifdef f\n\tmov $42, %eax\n.else\n\tmov $2, %eax\n.endif\n.else\n\tmov $3, %eax\n.endif\n\tret\n", 0, 42);
 	check_asm_err("missing .endif", ".if 1\n\tnop\n");
+
+	section("gcc and ld options, thread-local storage");
+	{
+		static const char *gccflags[] = { "-fno-pic", "-static", "-fno-builtin", "-fno-strict-aliasing", "-Wall", "-MD", "-ggdb",
+			"-fno-omit-frame-pointer", "-fno-common", "-gdwarf-2", "-m64", "-mcmodel=kernel", "-mtls-direct-seg-refs",
+			"-mno-red-zone", "-O0", "-O2", "-fno-stack-protector", "-Wa,-divide", TMP_SRC, "-o", TMP_BIN, NULL };
+		check_args("harmless gcc options", "int main(){ return 42; }", gccflags, 42);
+		static const char *nostdinc[] = { "-nostdinc", TMP_SRC, "-o", TMP_BIN, NULL };
+		check_args_err("-nostdinc hides the built-in headers", "#include <stdio.h>\nint main(){ return 0; }", nostdinc);
+		static const char *omagic[] = { "-N", TMP_SRC, "-o", TMP_BIN, NULL };
+		check_args("-N puts everything in one segment", "int x = 40; int main(){ static char b[100]; b[99] = 2; return x + b[99]; }", omagic, 42);
+		static const char *emul[] = { "-m", "elf_x86_64", TMP_SRC, "-o", TMP_BIN, NULL };
+		check_args("-m elf_x86_64", "int main(){ return 42; }", emul, 42);
+		static const char *bademul[] = { "-m", "elf_i386", TMP_SRC, "-o", TMP_BIN, NULL };
+		check_args_err("other emulations are refused", "int main(){ return 0; }", bademul);
+		write_file("/tmp/tc_blob.bin", "0123456789abcdefghijklmnopqrstuvwxyz0123456");
+		static const char *bin[] = { TMP_SRC, "-b", "binary", "/tmp/tc_blob.bin", "-o", TMP_BIN, NULL };
+		check_args("-b binary", "extern char _binary__tmp_tc_blob_bin_start[], _binary__tmp_tc_blob_bin_end[], _binary__tmp_tc_blob_bin_size[];"
+			"int main(){ return (_binary__tmp_tc_blob_bin_end - _binary__tmp_tc_blob_bin_start == (long)_binary__tmp_tc_blob_bin_size)"
+			" * (_binary__tmp_tc_blob_bin_start[1] - '0' + 41); }", bin, 42);
+		write_file("/tmp/tc_a.c", "int n; int g(void){ return n; }");
+		write_file("/tmp/tc_b.c", "int n; int main(){ n = 42; return 0; }");
+		static const char *c1[] = { "-c", "-fno-common", "/tmp/tc_a.c", "-o", "/tmp/tc_a.o", NULL };
+		static const char *c2[] = { "-c", "-fno-common", "/tmp/tc_b.c", "-o", "/tmp/tc_b.o", NULL };
+		static const char *ln[] = { "/tmp/tc_a.o", "/tmp/tc_b.o", "-o", TMP_BIN, NULL };
+		int ok = !run_args(c1) && !run_args(c2) && run_args(ln);
+		printf("  %s  [-fno-common makes tentative definitions clash]\n", ok ? "PASS" : "FAIL");
+		if (ok) g_pass++; else g_fail++;
+		write_file("/tmp/tc_a.c", "void start(void){ __syscall(60, 42); }");
+		static const char *c3[] = { "-c", "/tmp/tc_a.c", "-o", "/tmp/tc_a.o", NULL };
+		static const char *ln2[] = { "-nodefaultlibs", "-e", "start", "/tmp/tc_a.o", "-o", TMP_BIN, NULL };
+		ok = !run_args(c3) && !run_args(ln2) && run_bin() == 42;
+		printf("  %s  [-nodefaultlibs links no library and no startup code]\n", ok ? "PASS" : "FAIL");
+		if (ok) g_pass++; else g_fail++;
+	}
+	check("__builtin_return_address and frame_address",
+		"__attribute__((noinline)) void *ra(void){ return __builtin_return_address(0); }"
+		"void *fa(void){ return __builtin_frame_address(1); }"
+		"int main(){ void *r = ra(); void *f = __builtin_frame_address(0); return (r != 0) + 40 * (fa() == f) + (f != 0); }", 42);
+	check("thread-local variables",
+		"__thread int a = 40; static __thread long b; int main(){ b += 2; a++; return a + (int)b - 1; }", 42);
+	check_compile_err("thread-local automatic variable", "int main(){ __thread int x = 1; return x; }");
+	check_compile_err("thread-local function", "__thread int f(void); int main(){ return 0; }");
+	check_asm("sum with a forward difference",
+		"long target = 30; extern long v[]; int main(){ return (int)(v[0] - (long)&target); }",
+		"\t.data\n\t.globl v\nv:\t.quad end - start + target\nstart:\t.skip 42\nend:\n", 0, 42);
 
 	section("expected compile errors");
 	check_compile_err("undeclared var", "int main(){ return x; }");

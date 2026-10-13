@@ -16,7 +16,7 @@ TMP=${TMPDIR:-/tmp}/sccc-link.$$
 mkdir -p "$TMP"
 trap 'rm -rf "$TMP"' EXIT
 GCC="gcc -std=c99 -O1 -fno-pic -fno-stack-protector -fcf-protection=none -nostdinc -I$INC"
-FILES="main tab1 tab2 common1 common2 weak strong la lb lc"
+FILES="main tab1 tab2 common1 common2 weak strong la lb lc tls"
 pass=0
 fail=0
 
@@ -36,7 +36,7 @@ build() {
 	done
 	$GCC -fPIC -c "$DIR/pic.c" -o "$B/pic.o"
 	ar rcs "$B/libx.a" "$B/la.o" "$B/lb.o" "$B/lc.o"
-	objs="$B/main.o $B/tab1.o $B/tab2.o $B/common1.o $B/common2.o $B/weak.o $B/strong.o $B/pic.o $B/libx.a"
+	objs="$B/main.o $B/tab1.o $B/tab2.o $B/common1.o $B/common2.o $B/weak.o $B/strong.o $B/pic.o $B/tls.o $B/libx.a"
 	if [ "$linker" = gcc ]; then gcc -no-pie $objs -o "$B/prog" 2> "$B/err"
 	else "$CC" $objs -o "$B/prog" 2> "$B/err"
 	fi || { echo "FAIL $name: link"; sed 's/^/	/' "$B/err"; fail=$((fail + 1)); return; }
@@ -51,14 +51,14 @@ build() {
 	fi
 }
 
-build gcc-only gcc gcc gcc gcc gcc gcc gcc gcc gcc gcc gcc
-build sccc-objects sccc sccc sccc sccc sccc sccc sccc sccc sccc sccc sccc
-build mixed1 sccc sccc gcc sccc gcc gcc gcc sccc gcc sccc gcc
-build mixed2 sccc gcc sccc gcc sccc sccc sccc gcc sccc gcc sccc
-build gcc-objects sccc gcc gcc gcc gcc gcc gcc gcc gcc gcc gcc
-build mixed1-ld gcc sccc gcc sccc gcc gcc gcc sccc gcc sccc gcc
-build mixed2-ld gcc gcc sccc gcc sccc sccc sccc gcc sccc gcc sccc
-build sccc-ld gcc sccc sccc sccc sccc sccc sccc sccc sccc sccc sccc
+build gcc-only gcc gcc gcc gcc gcc gcc gcc gcc gcc gcc gcc gcc
+build sccc-objects sccc sccc sccc sccc sccc sccc sccc sccc sccc sccc sccc sccc
+build mixed1 sccc sccc gcc sccc gcc gcc gcc sccc gcc sccc gcc sccc
+build mixed2 sccc gcc sccc gcc sccc sccc sccc gcc sccc gcc sccc gcc
+build gcc-objects sccc gcc gcc gcc gcc gcc gcc gcc gcc gcc gcc gcc
+build mixed1-ld gcc sccc gcc sccc gcc gcc gcc sccc gcc sccc gcc sccc
+build mixed2-ld gcc gcc sccc gcc sccc sccc sccc gcc sccc gcc sccc gcc
+build sccc-ld gcc sccc sccc sccc sccc sccc sccc sccc sccc sccc sccc sccc
 
 echo "link: $pass passed, $fail failed"
 [ $fail -eq 0 ]

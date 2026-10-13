@@ -20,7 +20,7 @@ sccc -ffreestanding [-mgeneral-regs-only] [-e sym] [-Ttext addr | -T script]
 
 A file whose name ends in *.s* is assembly, and one ending in *.S* is assembly that goes through the preprocessor first. A file ending in *.o* is a relocatable object and one ending in *.a* an archive of them, which are linked in. Every other file is C. *sccc* assembles AT&T syntax itself, in 16-bit, 32-bit, and 64-bit code, and C and assembly files on one command line share their symbols.
 
-With *-c* each C or assembly file becomes an object file instead, which *sccc* or another linker can link later. *sccc* follows the System V calling convention, so its objects and gcc's call each other in both directions. See OBJECT FILES AND LINKING. *-T* takes a linker script in the GNU ld language to control the layout of the output, as kernels need. See LINKER SCRIPTS.
+With *-c* each C or assembly file becomes an object file instead, which *sccc* or another linker can link later. *sccc* follows the System V calling convention, so its objects and gcc's call each other in both directions. See OBJECT FILES AND LINKING. A GNU ld script given with *-T* controls the layout of the output, as kernels need. See LINKER SCRIPTS.
 
 ## BUILDING
 
@@ -89,7 +89,21 @@ There is no install target and nothing else to install.
                  Make float and double an error, so the program
                  uses only the general registers.  Use it with
                  -nostdlib or -ffreestanding.
+-nostdinc        Do not search the built-in headers.
+-fno-common      In an object, define a file scope variable without
+                 an initializer in .bss rather than as a common
+                 symbol, so two such definitions clash at link time.
+-nodefaultlibs   Link without the built-in library and without the
+                 startup code, as for a kernel or a program with
+                 its own entry point.
+-N               Link text and data into one writable and executable
+                 segment, without page alignment between them.
+-b format        Read the following inputs as binary (raw bytes)
+                 or as elf64-x86-64 (or default), as GNU ld does.
+-m elf_x86_64    The only emulation, accepted for GNU ld.
 ```
+
+These gcc options are accepted and change nothing, because *sccc* already behaves that way or has nothing to change: `-fno-pic`, `-fno-PIC`, `-fno-pie`, `-fno-PIE`, `-static`, `-fno-builtin`, `-fno-strict-aliasing`, `-fno-omit-frame-pointer`, `-fno-stack-protector`, `-fcommon`, `-mno-red-zone`, `-mtls-direct-seg-refs`, `-mcmodel=kernel`, `-mcmodel=small`, `-m64`, `-O`, `-O0` to `-O3`, `-Os`, every `-g` option, every `-W` warning option, `-MD`, `-MMD`, `-pipe`, and `-Wa,-divide` (`/` is always division). `-MD` writes no dependency file.
 
 Any other argument beginning with a minus sign is an error.
 
@@ -123,7 +137,7 @@ gcc -no-pie main.c part.o -o prog
 
 ## LINKER SCRIPTS
 
-*-T script* reads a linker script in the GNU ld language. The inputs are compiled or loaded as usual, and the script decides where each of their sections goes. Every input section is placed whole: the `.text` of one C file, one section of an object, or a run of a named `@nobits` section in an assembly file. The supported subset:
+*-T script* reads a GNU ld script. The inputs are compiled or loaded as usual, and the script decides where each of their sections goes. Every input section is placed whole: the `.text` of one C file, one section of an object, or a run of a named `@nobits` section in an assembly file. The supported subset:
 
 ```
 SECTIONS { ... }    output sections, assignments, and the commands below
@@ -208,7 +222,7 @@ error: undefined reference to 'main'
 
 *sccc* accepts C99 except for the items listed under BUGS. This includes all integer types, `_Bool`, `float`, `double`, pointers, arrays, structures, unions, enumerations, typedefs, bit fields, function pointers, anonymous structure and union members, and flexible array members. Constants may be decimal, octal, hexadecimal, character, or floating, and floating constants may be hexadecimal. Initializers may be nested and may use designators such as `.f`, `[i]` and `[2].x`, brace elision, string literals, and compound literals. Static data may hold address constants. All statements are accepted, including `goto` and `switch` cases inside loops. Variadic functions use `<stdarg.h>`. `__func__`, `_Static_assert`, `inline`, and `restrict` are accepted.
 
-From C11 come `_Generic`, `_Alignas`, `_Alignof`, and `_Noreturn`, with *stdalign.h* and *stdnoreturn.h*. `signed char` and `long long` are types of their own, distinct from `char` and `long`, as `_Generic` requires.
+From C11 come `_Generic`, `_Alignas`, `_Alignof`, `_Noreturn`, and `_Thread_local`, with *stdalign.h* and *stdnoreturn.h*. `signed char` and `long long` are types of their own, distinct from `char` and `long`, as `_Generic` requires.
 
 From GNU C come
 
@@ -219,7 +233,10 @@ From GNU C come
 - labels as values: `&&label` is the address of a label as `void *`, `goto *p;` jumps to it, and static arrays may hold label addresses, as in a threaded interpreter,
 - zero-length arrays,
 - inline assembly, as described under INLINE ASSEMBLY,
+- thread-local variables, `__thread`, as described below,
 - the spellings `__attribute`, `__signed`, and `__volatile`.
+
+A variable declared `__thread` or `_Thread_local` at file scope, or `static` or `extern` in a function, has one copy per thread, in `.tdata` when it is initialized and `.tbss` otherwise. *sccc* uses the local-exec model of the x86-64 ABI: a load or store is one `%fs`-relative instruction with an `R_X86_64_TPOFF32` relocation, as gcc writes with `-mtls-direct-seg-refs`, and the address of such a variable is `%fs:0` plus its offset, which needs the thread control block to point to itself as the ABI requires. The linker places the thread-local sections in a `PT_TLS` segment and computes each offset from the aligned end of the block. In a hosted program that has them, `__libc_init` reads the `PT_TLS` header from the auxiliary vector, copies `.tdata` into a new block, and sets `%fs` with `arch_prctl`. A kernel sets `%fs` itself.
 
 These GNU builtins are recognized, in constant expressions too where the result is constant:
 
@@ -235,6 +252,9 @@ __builtin_offsetof(type, member)  the offset of a member designator
                                   such as a.b[3].c; offsetof uses it
 __builtin_unreachable()           compile to ud2
 __builtin_trap()                  compile to ud2
+__builtin_return_address(n)       the return address of the function n
+                                  frames up, through the rbp chain
+__builtin_frame_address(n)        the frame pointer n frames up
 ```
 
 The builtin `__syscall(nr, ...)` makes Linux system call `nr` with up to six arguments and yields the raw result.
@@ -522,6 +542,14 @@ The kernel loads between 1 MB and 1 GB and is at most 588800 bytes. The image is
 
 **multiboot** is a Multiboot 1 kernel for GRUB and for `qemu -kernel`. Its first page holds the Multiboot header, with load addresses, and a trampoline from 32-bit protected mode to long mode. The kernel follows at the *-Ttext* address, 0x101000 by default, which must be page aligned. The header holds physical addresses. The trampoline identity maps the first 1 GB, also at 0xffffffff80000000 for a higher-half kernel, and calls the entry point with `rdi` = the address of the Multiboot information structure, `rsi` = 0x2BADB002, and a 16 KB stack. The page tables and the stack lie after `.bss`.
 
+## RUNNING XV6
+
+```
+make xv6run
+```
+
+or `tools/xv6run.sh [command]` fetches xv6-x86_64 with git into *xv6/* in this directory, once, at the commit that was tested (`XV6_URL` and `XV6_REV` choose another), builds the kernel and the file system image with *sccc* through xv6's own Makefile, with `CC`, `AS`, and `LD` set to *sccc*, and boots it in QEMU with `-kernel`. On a terminal the xv6 shell appears there, and Ctrl-a x quits QEMU. Otherwise it boots without a terminal, types *command* (`ls` by default) at the first prompt, prints what the console showed, and exits. The build log is *xv6/build.log*. *xv6/* is listed in *.gitignore*.
+
 ## RUNNING A KERNEL
 
 Build a kernel from *baremetal/* as a disk image:
@@ -609,16 +637,22 @@ make check
 
 runs `make bootstrap`, each suite below with both *sccc* and *sccc2*, and the bare metal tests with *sccc*.
 
-*test_sccc.c* is a harness of 169 cases. It writes each program to */tmp/tc_src.c*, and the assembly cases also to */tmp/tc_asm.s* or */tmp/tc_asm.S*, compiles them, runs the program, and checks the exit status. The object cases compile two files with *-c* and link them, and the script cases link a program through */tmp/tc_script.ld*. Eighteen of the C cases must fail to compile, nine of the assembly cases must fail to assemble, two of the object cases must fail to link, and seven of the script cases must fail. Run it by hand with
+*test_sccc.c* is a harness of 182 cases. It writes each program to */tmp/tc_src.c*, and the assembly cases also to */tmp/tc_asm.s* or */tmp/tc_asm.S*, compiles them, runs the program, and checks the exit status. The object cases compile two files with *-c* and link them, the script cases link a program through */tmp/tc_script.ld*, and the option cases run *sccc* with gcc and ld options. Twenty of the C cases must fail to compile, nine of the assembly cases must fail to assemble, two of the object cases must fail to link, seven of the script cases and three of the option cases must fail. Run it by hand with
 
 ```
 make test
 ./test_sccc ./sccc
 ```
 
-*tests/run.sh* compiles and runs each program in *tests/*, together with its *NAME_partN.c*, *.S*, or *.s* files. A test passes if it exits 0 and, when *NAME.out* exists, its standard output and standard error match that file. Tests without an output file check their own results and report through the exit status. There are 21 tests. *t17_gnu* covers the C11 and GNU language extensions, *t18_attr* the attributes and sections, across two files, and *t19_asm* calls between C and an assembly file: a jump table in `.rodata`, local labels, `.comm`, weak symbols, and a call to `printf` from assembly. *t20_inline* covers inline assembly: every constraint and modifier, `asm goto` forward and back, `naked`, file scope asm, asm labels, register variables and a raw system call, and *t21_atomic* the atomic operations a kernel writes with `lock`. The *.out* files were produced by gcc. *tests/gcccheck.sh* builds the same tests with gcc to check the tests themselves. `tests/run.sh compiler objects` compiles each file with *-c* and links the objects instead.
+*tests/run.sh* compiles and runs each program in *tests/*, together with its *NAME_partN.c*, *.S*, or *.s* files. A test passes if it exits 0 and, when *NAME.out* exists, its standard output and standard error match that file. Tests without an output file check their own results and report through the exit status. There are 22 tests. *t17_gnu* covers the C11 and GNU language extensions, *t18_attr* the attributes and sections, across two files, and *t19_asm* calls between C and an assembly file: a jump table in `.rodata`, local labels, `.comm`, weak symbols, and a call to `printf` from assembly. *t20_inline* covers inline assembly: every constraint and modifier, `asm goto` forward and back, `naked`, file scope asm, asm labels, register variables and a raw system call, *t21_atomic* the atomic operations a kernel writes with `lock`, and *t22_tls* thread-local variables across two files: initialized and zero, a structure, an array, a static local, increments, compound assignments, and taken addresses. The *.out* files were produced by gcc. *tests/gcccheck.sh* builds the same tests with gcc to check the tests themselves. `tests/run.sh compiler objects` compiles each file with *-c* and links the objects instead.
 
-*tests/link/run.sh* builds one program from ten files and an archive in eight ways: every file by gcc or by *sccc*, or a mixture, linked by *sccc* or by gcc. The program walks a section table that gcc and *sccc* objects fill, uses common symbols, a weak function overridden in another file, an archive whose unused member refers to a missing symbol, and a *-fPIC* object, and its output must match *link.out*, from gcc.
+*tests/link/run.sh* builds one program from eleven files and an archive in eight ways: every file by gcc or by *sccc*, or a mixture, linked by *sccc* or by gcc. The program walks a section table that gcc and *sccc* objects fill, uses common symbols, a weak function overridden in another file, an archive whose unused member refers to a missing symbol, a *-fPIC* object, and thread-local variables that gcc reaches through `R_X86_64_GOTTPOFF` and *sccc* through `%fs` directly, and its output must match *link.out*, from gcc.
+
+```
+make xv6
+```
+
+or `tools/xv6.sh [xv6-dir] [compiler]` builds xv6-x86_64, by default from *xv6/*, which *tools/xv6run.sh* fetches, with its own Makefile and `CC`, `AS`, and `LD` set to *sccc*, and once more with gcc and GNU ld as a reference. Each kernel boots with `qemu -kernel` through its multiboot header, under the same limits as the bare metal tests, and runs `usertests`; the run passes when *sccc*'s build prints `ALL TESTS PASSED` and its serial output matches gcc's, apart from the CPU number and user address of the faults that `usertests` provokes on purpose. It is not part of `make check`, since the source is not in this tree and a run takes about two minutes.
 
 *tests/ldscript/run.sh* links the same objects with GNU ld and with *sccc* through each of its scripts and compares the results: a flat binary byte for byte, an ELF file by its allocated sections, symbols, and section contents. The objects of a kernel-like program come from *sccc*, from gcc and as, and from both, with one of them in an archive, and the scripts use most of the commands: a flat image with section tables and data commands, a higher-half layout with `AT` and `NOLOAD`, `PHDRS`, and orphans. Twenty more scripts place a few sections of *orphans.s* and leave the rest to the orphan rules. Last, a Linux program is linked through *hosted.ld* in one step, from an object of *sccc*, and from one of gcc, and must print *hosted.out*. `make ldscript` runs it.
 
@@ -722,6 +756,9 @@ tools/fuzz_expr.py  random expression tester
 tools/ascorpus.py   compares the assembler with GNU as
 tools/abifuzz.py    compares calls between gcc and sccc objects
 tools/ldfuzz.py     compares linker scripts with GNU ld
+tools/xv6run.sh     fetches xv6-x86_64, builds it with sccc, boots it
+tools/xv6.sh        runs usertests on xv6 built by sccc and by gcc
+xv6/                xv6-x86_64, fetched by tools/xv6run.sh
 test_sccc.c         exit status test harness
 tests/              language tests and expected output
 tests/link/         linking with gcc objects and archives
@@ -776,6 +813,10 @@ Input files after the 64th are ignored without a message. A 65th *-I* or *-D* is
 `long double` is passed as `double`, unlike gcc, which uses the x87 format in memory.
 
 The linker does not run `.init_array`, `.fini_array`, or constructors, and does not support thread-local storage, shared libraries, or COMDAT groups. Symbols referenced only by files after an archive do not pull members from it, as with GNU ld.
+
+Thread-local storage uses the local-exec model only; the assembler has no `@tpoff` or other TLS operators, and dynamic TLS models are not supported. gcc's initial-exec references (`R_X86_64_GOTTPOFF`) link through a slot in `.got`. A hosted program needs its program headers in a loaded segment for `__libc_init` to find `PT_TLS`.
+
+There is no 32-bit code generation; `-m32` is an error.
 
 Linker scripts have no `MEMORY` regions, `OVERLAY`, `INCLUDE`, `INPUT`, `GROUP`, `INSERT`, `SUBALIGN`, `ONLY_IF_RO` or `ONLY_IF_RW`, and `KEEP` changes nothing because no sections are collected. A `FILL` applies to the whole of each later gap; the `FILEHDR` and `PHDRS` keywords of `PHDRS` are accepted but the headers are not loaded. GNU ld places an empty output section that has an address, and the orphans around its own internal sections (`.got`, `.iplt`), in ways that depend on the statements around them; *sccc* skips an empty section, and keeps the difference between address and load address across sections GNU ld would restart. Without a section of their kind in the script, read-only orphans next to a section that mixes code and data may land elsewhere than with GNU ld. The output has no `PT_GNU_STACK` and no headers in a loaded segment.
 
