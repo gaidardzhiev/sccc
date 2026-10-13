@@ -7,9 +7,10 @@ CC=${1:-$DIR/../sccc}
 
 case $CC in /*) ;; *) CC=$(pwd)/$CC ;; esac
 
-MODE=check
+MODE=direct
 
 [ "$2" = "-update" ] && MODE=update
+[ "$2" = "objects" ] && MODE=objects
 
 TMP=${TMPDIR:-/tmp}/sccc-examples.$$
 
@@ -37,7 +38,19 @@ for src in *.c; do
 		echo "updated $name.out"
 		continue
 	fi
-	if ! "$CC" "$src" $parts -o "$TMP/$name" 2> "$TMP/err"; then
+	: > "$TMP/err"
+	if [ $MODE = objects ]; then
+		ok=1; objs=
+		for f in $src $parts; do
+			"$CC" -c "$f" -o "$TMP/${f%.c}.o" 2>> "$TMP/err" || ok=0
+			objs="$objs $TMP/${f%.c}.o"
+		done
+		[ $ok = 1 ] && "$CC" $objs -o "$TMP/$name" 2>> "$TMP/err" || ok=0
+	else
+		ok=1
+		"$CC" "$src" $parts -o "$TMP/$name" 2> "$TMP/err" || ok=0
+	fi
+	if [ $ok = 0 ]; then
 		echo "FAIL $name: compile error"
 		sed 's/^/	/' "$TMP/err"
 		fail=$((fail + 1))
@@ -60,6 +73,6 @@ done
 
 [ $MODE = update ] && exit 0
 
-echo "examples: $pass passed, $fail failed"
+echo "examples ($MODE): $pass passed, $fail failed"
 
 [ $fail -eq 0 ]

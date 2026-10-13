@@ -8,7 +8,7 @@ for t in "$DIR"/*.c; do
 	n=$(basename "$t" .c)
 	case "$n" in *_part*) continue;; esac
 	extra=""
-	for x in "$DIR/${n}"_part*.c; do [ -f "$x" ] && extra="$extra $x"; done
+	for x in "$DIR/${n}"_part*.c "$DIR/${n}"_part*.S "$DIR/${n}"_part*.s; do [ -f "$x" ] && extra="$extra $x"; done
 	gcc -w -fno-builtin -o "$TMP/$n" "$t" $extra -I"$DIR" -lm || { echo "GCC-COMPILE-FAIL $n"; continue; }
 	"$TMP/$n" > "$TMP/$n.stdout" 2>&1 || echo "GCC-FAIL $n exit $?"
 	if [ -f "$DIR/$n.out" ] && ! cmp -s "$TMP/$n.stdout" "$DIR/$n.out"; then echo "GCC-OUTPUT-DIFF $n"; fi

@@ -1,0 +1,15 @@
+add3 321
+copy assembled
+sum 15 count 5 ptr 3
+classify -1 -1
+classify 0 10
+classify 1 11
+classify 2 12
+classify 3 13
+classify 4 -1
+call_back 57
+hello from asm 7
+fill xxxxxxxxxxxxxxxx 16
+bits 701 a00
+far 0 1
+override 2 hook 42 1

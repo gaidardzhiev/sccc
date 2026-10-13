@@ -12,12 +12,14 @@ static const char *builtin_names[] = {
 	"inttypes.h",
 	"limits.h",
 	"math.h",
+	"stdalign.h",
 	"stdarg.h",
 	"stdbool.h",
 	"stddef.h",
 	"stdint.h",
 	"stdio.h",
 	"stdlib.h",
+	"stdnoreturn.h",
 	"string.h",
 	"sys/mman.h",
 	"sys/stat.h",
@@ -257,8 +259,28 @@ static const char *builtin_srcs[] = {
 	" * Licensed under the GPL-3.0-only\n"
 	" */\n"
 	"\n"
+	"#ifndef _STDALIGN_H\n"
+	"#define _STDALIGN_H\n"
+	"#define alignas _Alignas\n"
+	"#define alignof _Alignof\n"
+	"#define __alignas_is_defined 1\n"
+	"#define __alignof_is_defined 1\n"
+	"#endif\n"
+	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _STDARG_H\n"
 	"#define _STDARG_H\n"
+	"#ifdef __GNUC__\n"
+	"typedef __builtin_va_list va_list;\n"
+	"#define va_start(ap, last) __builtin_va_start(ap, last)\n"
+	"#define va_arg(ap, type) __builtin_va_arg(ap, type)\n"
+	"#define va_end(ap) __builtin_va_end(ap)\n"
+	"#define va_copy(dst, src) __builtin_va_copy(dst, src)\n"
+	"#else\n"
 	"typedef struct {\n"
 	"\tunsigned int gp_offset;\n"
 	"\tunsigned int fp_offset;\n"
@@ -266,11 +288,11 @@ static const char *builtin_srcs[] = {
 	"\tvoid *reg_save_area;\n"
 	"} __va_elem;\n"
 	"typedef __va_elem va_list[1];\n"
-	"void *__va_arg_ptr(__va_elem *ap, unsigned long size);\n"
 	"#define va_start(ap, last) __builtin_va_start(ap)\n"
-	"#define va_arg(ap, type) (*(type *)__va_arg_ptr(ap, sizeof(type)))\n"
+	"#define va_arg(ap, type) __builtin_va_arg(ap, type)\n"
 	"#define va_end(ap) ((void)0)\n"
 	"#define va_copy(dst, src) ((dst)[0] = (src)[0])\n"
+	"#endif\n"
 	"#endif\n"
 	,
 	"/*\n"
@@ -299,7 +321,7 @@ static const char *builtin_srcs[] = {
 	"#ifndef NULL\n"
 	"#define NULL ((void *)0)\n"
 	"#endif\n"
-	"#define offsetof(type, member) ((size_t)&((type *)0)->member)\n"
+	"#define offsetof(type, member) __builtin_offsetof(type, member)\n"
 	"#endif\n"
 	,
 	"/*\n"
@@ -449,6 +471,16 @@ static const char *builtin_srcs[] = {
 	" * Licensed under the GPL-3.0-only\n"
 	" */\n"
 	"\n"
+	"#ifndef _STDNORETURN_H\n"
+	"#define _STDNORETURN_H\n"
+	"#define noreturn _Noreturn\n"
+	"#endif\n"
+	,
+	"/*\n"
+	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	" * Licensed under the GPL-3.0-only\n"
+	" */\n"
+	"\n"
 	"#ifndef _STRING_H\n"
 	"#define _STRING_H\n"
 	"#include <stddef.h>\n"
@@ -587,6 +619,227 @@ static const char *builtin_srcs[] = {
 	,
 	NULL
 };
+static const char *builtin_boot_names[] = {
+	"img.s",
+	"multiboot.s",
+	NULL
+};
+static const char *builtin_boot_srcs[] = {
+	"# Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	"# Licensed under the GPL-3.0-only\n"
+	"\n"
+	"\t.set ORG, 0x7c00\n"
+	"\t.set GDT, 0x1c0\n"
+	"\t.set GDTR, 0x1d8\n"
+	"\t.set DAP, 0x1e0\n"
+	"\t.set DRIVE, 0x1f0\n"
+	"\t.set NSECTS, 0x1f2\n"
+	"\n"
+	"\t.code16\n"
+	"start:\n"
+	"\tcli\n"
+	"\txor %ax, %ax\n"
+	"\tmov %ax, %ds\n"
+	"\tmov %ax, %es\n"
+	"\tmov %ax, %ss\n"
+	"\tmov $ORG, %sp\n"
+	"\tljmp $0, $ORG + 1f - start\n"
+	"1:\tsti\n"
+	"\tmov %dl, ORG + DRIVE\n"
+	"\tmov $0x5008, %di\n"
+	"\txor %ebx, %ebx\n"
+	"\txor %bp, %bp\n"
+	"e820:\n"
+	"\tmov $0xe820, %eax\n"
+	"\tmov $0x534d4150, %edx\n"
+	"\tmov $24, %ecx\n"
+	"\tmovl $1, 20(%di)\n"
+	"\tint $0x15\n"
+	"\tjc 2f\n"
+	"\tcmp $0x534d4150, %eax\n"
+	"\tjne 2f\n"
+	"\tadd $24, %di\n"
+	"\tinc %bp\n"
+	"\tcmp $64, %bp\n"
+	"\tje 2f\n"
+	"\ttest %ebx, %ebx\n"
+	"\tjnz e820\n"
+	"2:\tmov %bp, 0x5000\n"
+	"\tmovw $0, 0x5002\n"
+	"\tmovl $0, 0x5004\n"
+	"read:\n"
+	"\tmov ORG + NSECTS, %cx\n"
+	"\tjcxz loaded\n"
+	"\tmov $64, %ax\n"
+	"\tcmp %ax, %cx\n"
+	"\tjae 3f\n"
+	"\tmov %cx, %ax\n"
+	"3:\tmov %ax, ORG + DAP + 2\n"
+	"\tsub %ax, ORG + NSECTS\n"
+	"\tmov $ORG + DAP, %si\n"
+	"\tmov ORG + DRIVE, %dl\n"
+	"\tmov $0x42, %ah\n"
+	"\tint $0x13\n"
+	"\tjc fail\n"
+	"\tmov ORG + DAP + 2, %ax\n"
+	"\tadd %ax, ORG + DAP + 8\n"
+	"\tshl $5, %ax\n"
+	"\tadd %ax, ORG + DAP + 6\n"
+	"\tjmp read\n"
+	"fail:\n"
+	"\tmov $0x0e45, %ax\n"
+	"\tint $0x10\n"
+	"4:\thlt\n"
+	"\tjmp 4b\n"
+	"loaded:\n"
+	"\tin $0x92, %al\n"
+	"\tor $2, %al\n"
+	"\tand $0xfe, %al\n"
+	"\tout %al, $0x92\n"
+	"\tcli\n"
+	"\tcld\n"
+	"\tmov $0x1000, %di\n"
+	"\txor %eax, %eax\n"
+	"\tmov $0xc00, %cx\n"
+	"\trep; stosl\n"
+	"\tmovw $0x2003, 0x1000\n"
+	"\tmovw $0x3003, 0x2000\n"
+	"\t.if HIGH\n"
+	"\tmovw $0x2003, 0x1ff8\n"
+	"\tmovw $0x3003, 0x2ff0\n"
+	"\t.endif\n"
+	"\tmov $0x3000, %di\n"
+	"\tmov $0x83, %eax\n"
+	"\tmov $512, %cx\n"
+	"5:\tmov %eax, (%di)\n"
+	"\tadd $0x200000, %eax\n"
+	"\tadd $8, %di\n"
+	"\tloop 5b\n"
+	"\tmov $0x1000, %eax\n"
+	"\tmov %eax, %cr3\n"
+	"\tmov %cr4, %eax\n"
+	"\tor $0x20, %eax\n"
+	"\tmov %eax, %cr4\n"
+	"\tmov $0xc0000080, %ecx\n"
+	"\trdmsr\n"
+	"\tor $0x100, %eax\n"
+	"\twrmsr\n"
+	"\tlgdtl ORG + GDTR\n"
+	"\tmov %cr0, %eax\n"
+	"\tor $0x80000001, %eax\n"
+	"\tmov %eax, %cr0\n"
+	"\tljmp $0x08, $ORG + 6f - start\n"
+	"\n"
+	"\t.code64\n"
+	"6:\tmov $0x10, %eax\n"
+	"\tmov %eax, %ds\n"
+	"\tmov %eax, %es\n"
+	"\tmov %eax, %ss\n"
+	"\tmov $0x10000, %esi\n"
+	"\tmov $DEST, %edi\n"
+	"\tmov $SIZE, %ecx\n"
+	"\trep movsb\n"
+	"\tmov $ZERO, %ecx\n"
+	"\txor %eax, %eax\n"
+	"\trep stosb\n"
+	"\tmov $0x80000, %esp\n"
+	"\tmov $0x5000, %edi\n"
+	"\t.if HIGH\n"
+	"\tmov $ENTRY, %rax\n"
+	"\t.else\n"
+	"\tmov $ENTRY, %eax\n"
+	"\t.endif\n"
+	"\tcall *%rax\n"
+	"7:\tcli\n"
+	"\thlt\n"
+	"\tjmp 7b\n"
+	"\n"
+	"\t.org GDT\n"
+	"\t.quad 0, 0x00209a0000000000, 0x0000920000000000\n"
+	"\t.word 23\n"
+	"\t.long ORG + GDT\n"
+	"\t.org DAP\n"
+	"\t.byte 16, 0\n"
+	"\t.word 0, 0, 0x1000\n"
+	"\t.quad 1\n"
+	"\t.byte 0\n"
+	"\t.org NSECTS\n"
+	"\t.word NSECT\n"
+	"\t.org 510\n"
+	"\t.word 0xaa55\n"
+	,
+	"# Copyright (C) 2026 Ivan Gaydardzhiev\n"
+	"# Licensed under the GPL-3.0-only\n"
+	"\n"
+	"\t.code32\n"
+	"header:\n"
+	"\t.long 0x1badb002, 0x00010002, -(0x1badb002 + 0x00010002)\n"
+	"\t.long LOAD, LOAD, END, TOP, LOAD + start - header\n"
+	"start:\n"
+	"\tcli\n"
+	"\tmov $TOP, %esp\n"
+	"\tmov %ebx, %ebp\n"
+	"\tmov %eax, %esi\n"
+	"\tcld\n"
+	"\tmov $PT, %edi\n"
+	"\txor %eax, %eax\n"
+	"\tmov $0xc00, %ecx\n"
+	"\trep stosl\n"
+	"\tmovl $PT + 0x1003, PT\n"
+	"\tmovl $PT + 0x2003, PT + 0x1000\n"
+	"\t.if HIGH\n"
+	"\tmovl $PT + 0x1003, PT + 0xff8\n"
+	"\tmovl $PT + 0x2003, PT + 0x1ff0\n"
+	"\t.endif\n"
+	"\tmov $PT + 0x2000, %edi\n"
+	"\tmov $0x83, %eax\n"
+	"\tmov $512, %ecx\n"
+	"1:\tmov %eax, (%edi)\n"
+	"\tadd $0x200000, %eax\n"
+	"\tadd $8, %edi\n"
+	"\tloop 1b\n"
+	"\tmov $PT, %eax\n"
+	"\tmov %eax, %cr3\n"
+	"\tmov %cr4, %eax\n"
+	"\tor $0x20, %eax\n"
+	"\tmov %eax, %cr4\n"
+	"\tmov $0xc0000080, %ecx\n"
+	"\trdmsr\n"
+	"\tor $0x100, %eax\n"
+	"\twrmsr\n"
+	"\tlgdt LOAD + gdt + 24 - header\n"
+	"\tmov %cr0, %eax\n"
+	"\tor $0x80000000, %eax\n"
+	"\tmov %eax, %cr0\n"
+	"\tljmp $0x08, $LOAD + 2f - header\n"
+	"\n"
+	"\t.code64\n"
+	"2:\tmov $0x10, %eax\n"
+	"\tmov %eax, %ds\n"
+	"\tmov %eax, %es\n"
+	"\tmov %eax, %ss\n"
+	"\tmov $TOP, %esp\n"
+	"\tmov %ebp, %edi\n"
+	"\tmov %esi, %esi\n"
+	"\t.if HIGH\n"
+	"\tmov $ENTRY, %rax\n"
+	"\t.else\n"
+	"\tmov $ENTRY, %eax\n"
+	"\t.endif\n"
+	"\tcall *%rax\n"
+	"3:\tcli\n"
+	"\thlt\n"
+	"\tjmp 3b\n"
+	"\n"
+	"\t.org 0x100\n"
+	"gdt:\n"
+	"\t.quad 0, 0x00209a0000000000, 0x0000920000000000\n"
+	"\t.word 23\n"
+	"\t.long LOAD + gdt - header\n"
+	"\t.org 0x1000\n"
+	,
+	NULL
+};
 static const char *builtin_libc[] = {
 	"/*\n"
 	" * Copyright (C) 2026 Ivan Gaydardzhiev\n"
@@ -678,18 +931,6 @@ static const char *builtin_libc[] = {
 	"\treturn (int)sys_ret(__syscall(SYS_open, path, flags, mode));\n"
 	"}\n"
 	"\n"
-	"void *__va_arg_ptr(__va_elem *ap, unsigned long size) {\n"
-	"\tvoid *p;\n"
-	"\tif (size <= 8 && ap->gp_offset < 48) {\n"
-	"\t\tp = (char *)ap->reg_save_area + ap->gp_offset;\n"
-	"\t\tap->gp_offset += 8;\n"
-	"\t\treturn p;\n"
-	"\t}\n"
-	"\tp = ap->overflow_arg_area;\n"
-	"\tap->overflow_arg_area = (char *)p + ((size + 7) & ~7UL);\n"
-	"\treturn p;\n"
-	"}\n"
-	"\n"
 	"#define NCLASS 21\n"
 	"#define CHUNK (4L << 20)\n"
 	"\n"
@@ -710,7 +951,6 @@ static const char *builtin_libc[] = {
 	"\tif (r < 0 && r > -4096) return NULL;\n"
 	"\treturn (void *)r;\n"
 	"}\n"
-	,
 	"\n"
 	"void *malloc(size_t n) {\n"
 	"\tif (n == 0) n = 1;\n"
@@ -723,6 +963,7 @@ static const char *builtin_libc[] = {
 	"\t\tb = (Block *)sys_mmap(len);\n"
 	"\t\tif (!b) { errno = ENOMEM; return NULL; }\n"
 	"\t\tb->cls = NCLASS;\n"
+	,
 	"\t\tb->size = len - sizeof(Block);\n"
 	"\t\treturn b + 1;\n"
 	"\t}\n"
@@ -751,7 +992,6 @@ static const char *builtin_libc[] = {
 	"\tif (b->cls >= NCLASS) {\n"
 	"\t\t__syscall(SYS_munmap, b, b->size + sizeof(Block));\n"
 	"\t\treturn;\n"
-	,
 	"\t}\n"
 	"\tb->next = free_lists[b->cls];\n"
 	"\tfree_lists[b->cls] = b;\n"
@@ -764,6 +1004,7 @@ static const char *builtin_libc[] = {
 	"\tif (p) memset(p, 0, total);\n"
 	"\treturn p;\n"
 	"}\n"
+	,
 	"\n"
 	"void *realloc(void *p, size_t n) {\n"
 	"\tif (!p) return malloc(n);\n"
@@ -792,7 +1033,6 @@ static const char *builtin_libc[] = {
 	"\td += n; s += n;\n"
 	"\twhile (n--) *--d = *--s;\n"
 	"\treturn dst;\n"
-	,
 	"}\n"
 	"\n"
 	"void *memset(void *s, int c, size_t n) {\n"
@@ -805,6 +1045,7 @@ static const char *builtin_libc[] = {
 	"\tconst unsigned char *p = (const unsigned char *)a;\n"
 	"\tconst unsigned char *q = (const unsigned char *)b;\n"
 	"\tfor (; n; n--, p++, q++)\n"
+	,
 	"\t\tif (*p != *q) return *p - *q;\n"
 	"\treturn 0;\n"
 	"}\n"
@@ -833,7 +1074,6 @@ static const char *builtin_libc[] = {
 	"\twhile ((*d++ = *src++)) ;\n"
 	"\treturn dst;\n"
 	"}\n"
-	,
 	"\n"
 	"char *strncpy(char *dst, const char *src, size_t n) {\n"
 	"\tsize_t i = 0;\n"
@@ -846,6 +1086,7 @@ static const char *builtin_libc[] = {
 	"\tstrcpy(dst + strlen(dst), src);\n"
 	"\treturn dst;\n"
 	"}\n"
+	,
 	"\n"
 	"char *strncat(char *dst, const char *src, size_t n) {\n"
 	"\tchar *d = dst + strlen(dst);\n"
@@ -874,7 +1115,6 @@ static const char *builtin_libc[] = {
 	"\t}\n"
 	"}\n"
 	"\n"
-	,
 	"char *strrchr(const char *s, int c) {\n"
 	"\tconst char *r = NULL;\n"
 	"\tfor (;; s++) {\n"
@@ -887,6 +1127,7 @@ static const char *builtin_libc[] = {
 	"\tsize_t ln = strlen(n);\n"
 	"\tif (!ln) return (char *)h;\n"
 	"\tfor (; *h; h++)\n"
+	,
 	"\t\tif (*h == *n && strncmp(h, n, ln) == 0) return (char *)h;\n"
 	"\treturn NULL;\n"
 	"}\n"
@@ -915,7 +1156,6 @@ static const char *builtin_libc[] = {
 	"\ts += strspn(s, delim);\n"
 	"\tif (!*s) { save = NULL; return NULL; }\n"
 	"\tchar *e = s + strcspn(s, delim);\n"
-	,
 	"\tif (*e) { *e = 0; save = e + 1; } else save = NULL;\n"
 	"\treturn s;\n"
 	"}\n"
@@ -928,6 +1168,7 @@ static const char *builtin_libc[] = {
 	"}\n"
 	"\n"
 	"char *strndup(const char *s, size_t n) {\n"
+	,
 	"\tsize_t l = strnlen(s, n);\n"
 	"\tchar *p = (char *)malloc(l + 1);\n"
 	"\tif (!p) return NULL;\n"
@@ -956,7 +1197,6 @@ static const char *builtin_libc[] = {
 	"\tcase EMFILE: return \"Too many open files\";\n"
 	"\tcase ENOTTY: return \"Inappropriate ioctl for device\";\n"
 	"\tcase ENOSPC: return \"No space left on device\";\n"
-	,
 	"\tcase ESPIPE: return \"Illegal seek\";\n"
 	"\tcase EROFS: return \"Read-only file system\";\n"
 	"\tcase EPIPE: return \"Broken pipe\";\n"
@@ -969,6 +1209,7 @@ static const char *builtin_libc[] = {
 	"}\n"
 	"\n"
 	"int isdigit(int c) { return c >= '0' && c <= '9'; }\n"
+	,
 	"int islower(int c) { return c >= 'a' && c <= 'z'; }\n"
 	"int isupper(int c) { return c >= 'A' && c <= 'Z'; }\n"
 	"int isalpha(int c) { return islower(c) || isupper(c); }\n"
@@ -997,7 +1238,6 @@ static const char *builtin_libc[] = {
 	"\tfor (;; p++) {\n"
 	"\t\tint d;\n"
 	"\t\tif (isdigit(*p)) d = *p - '0';\n"
-	,
 	"\t\telse if (islower(*p)) d = *p - 'a' + 10;\n"
 	"\t\telse if (isupper(*p)) d = *p - 'A' + 10;\n"
 	"\t\telse break;\n"
@@ -1010,6 +1250,7 @@ static const char *builtin_libc[] = {
 	"}\n"
 	"\n"
 	"unsigned long strtoul(const char *s, char **end, int base) { return strtoull(s, end, base); }\n"
+	,
 	"long long strtoll(const char *s, char **end, int base) { return (long long)strtoull(s, end, base); }\n"
 	"long strtol(const char *s, char **end, int base) { return (long)strtoull(s, end, base); }\n"
 	"int atoi(const char *s) { return (int)strtol(s, NULL, 10); }\n"
@@ -1038,7 +1279,6 @@ static const char *builtin_libc[] = {
 	"\tif (carry && b->n < BIGN) b->d[b->n++] = (unsigned int)carry;\n"
 	"}\n"
 	"\n"
-	,
 	"static void big_mul_pow10(Big *b, int k) {\n"
 	"\twhile (k >= 9) { big_mul_add(b, 1000000000u, 0); k -= 9; }\n"
 	"\twhile (k-- > 0) big_mul_add(b, 10, 0);\n"
@@ -1051,6 +1291,7 @@ static const char *builtin_libc[] = {
 	"\twhile (top) { bits++; top >>= 1; }\n"
 	"\treturn (b->n - 1) * 32 + bits;\n"
 	"}\n"
+	,
 	"\n"
 	"static int big_bit(Big *b, int i) {\n"
 	"\tif (i < 0 || i / 32 >= b->n) return 0;\n"
@@ -1079,7 +1320,6 @@ static const char *builtin_libc[] = {
 	"}\n"
 	"\n"
 	"static void big_sub(Big *a, Big *b) {\n"
-	,
 	"\tlong borrow = 0;\n"
 	"\tfor (int i = 0; i < a->n; i++) {\n"
 	"\t\tlong t = (long)a->d[i] - (i < b->n ? (long)b->d[i] : 0) - borrow;\n"
@@ -1092,6 +1332,7 @@ static const char *builtin_libc[] = {
 	"static double make_double(unsigned long q, int e2, int sticky) {\n"
 	"\tif (q == 0) return 0.0;\n"
 	"\twhile (!(q >> 63)) { q <<= 1; e2--; }\n"
+	,
 	"\tint lead = 63 + e2;\n"
 	"\tint kept = 53;\n"
 	"\tif (lead < -1022) kept = 53 - (-1022 - lead);\n"
@@ -1120,7 +1361,6 @@ static const char *builtin_libc[] = {
 	"\treturn v;\n"
 	"}\n"
 	"\n"
-	,
 	"static double decimal_to_double(Big *digits, int e10, int sticky_in) {\n"
 	"\tBig n, p, t;\n"
 	"\tif (digits->n == 0) return 0.0;\n"
@@ -1133,6 +1373,7 @@ static const char *builtin_libc[] = {
 	"\t\tif (len <= 64) {\n"
 	"\t\t\tunsigned long q = 0;\n"
 	"\t\t\tfor (int i = 0; i < n.n; i++) q |= (unsigned long)n.d[i] << (32 * i);\n"
+	,
 	"\t\t\treturn make_double(q, 0, sticky_in);\n"
 	"\t\t}\n"
 	"\t\tunsigned long q = 0;\n"
@@ -1161,7 +1402,6 @@ static const char *builtin_libc[] = {
 	"}\n"
 	"\n"
 	"static int strncasecmp_ascii(const char *a, const char *b, int n) {\n"
-	,
 	"\tfor (int i = 0; i < n; i++) {\n"
 	"\t\tint x = a[i] | 32, y = b[i];\n"
 	"\t\tif (!a[i] || x != y) return 1;\n"
@@ -1174,6 +1414,7 @@ static const char *builtin_libc[] = {
 	"\tint neg = 0;\n"
 	"\twhile (isspace(*p)) p++;\n"
 	"\tif (*p == '+') p++;\n"
+	,
 	"\telse if (*p == '-') { neg = 1; p++; }\n"
 	"\tif ((p[0] == 'i' || p[0] == 'I') && (p[1] == 'n' || p[1] == 'N') && (p[2] == 'f' || p[2] == 'F')) {\n"
 	"\t\tp += 3;\n"
@@ -1202,7 +1443,6 @@ static const char *builtin_libc[] = {
 	"\t\t\tif (q >> 60) {\n"
 	"\t\t\t\tif (dv) sticky = 1;\n"
 	"\t\t\t\tif (!frac) e2 += 4;\n"
-	,
 	"\t\t\t} else {\n"
 	"\t\t\t\tq = q << 4 | (unsigned long)dv;\n"
 	"\t\t\t\tif (frac) e2 -= 4;\n"
@@ -1215,6 +1455,7 @@ static const char *builtin_libc[] = {
 	"\t\t\telse if (*r == '-') { eneg = 1; r++; }\n"
 	"\t\t\tif (isdigit(*r)) {\n"
 	"\t\t\t\twhile (isdigit(*r)) { if (e < 100000) e = e * 10 + (*r - '0'); r++; }\n"
+	,
 	"\t\t\t\te2 += eneg ? -e : e;\n"
 	"\t\t\t\tp = r;\n"
 	"\t\t\t}\n"
@@ -1243,7 +1484,6 @@ static const char *builtin_libc[] = {
 	"\t\t\tif (!frac) exp10++;\n"
 	"\t\t}\n"
 	"\t}\n"
-	,
 	"\tif (!any) { if (end) *end = (char *)s; return 0.0; }\n"
 	"\tif (*p == 'e' || *p == 'E') {\n"
 	"\t\tconst char *q = p + 1;\n"
@@ -1256,6 +1496,7 @@ static const char *builtin_libc[] = {
 	"\t\t\tp = q;\n"
 	"\t\t}\n"
 	"\t}\n"
+	,
 	"\tif (end) *end = (char *)p;\n"
 	"\tdouble v;\n"
 	"\tif (ndig <= 15 && !sticky && exp10 >= -22 && exp10 <= 22) {\n"
@@ -1284,7 +1525,6 @@ static const char *builtin_libc[] = {
 	"\tsize_t n = strlen(name);\n"
 	"\tif (!environ) return NULL;\n"
 	"\tfor (char **e = environ; *e; e++)\n"
-	,
 	"\t\tif (strncmp(*e, name, n) == 0 && (*e)[n] == '=') return *e + n + 1;\n"
 	"\treturn NULL;\n"
 	"}\n"
@@ -1297,6 +1537,7 @@ static const char *builtin_libc[] = {
 	"\tsize_t root = start;\n"
 	"\twhile (root * 2 + 1 < end) {\n"
 	"\t\tsize_t child = root * 2 + 1;\n"
+	,
 	"\t\tif (child + 1 < end && cmp(base + child * size, base + (child + 1) * size) < 0) child++;\n"
 	"\t\tif (cmp(base + root * size, base + child * size) >= 0) return;\n"
 	"\t\tswap_bytes(base + root * size, base + child * size, size);\n"
@@ -1325,7 +1566,6 @@ static const char *builtin_libc[] = {
 	"\t}\n"
 	"\treturn NULL;\n"
 	"}\n"
-	,
 	"\n"
 	"double fabs(double x) { return x < 0 ? -x : x; }\n"
 	"float fabsf(float x) { return x < 0 ? -x : x; }\n"
@@ -1338,6 +1578,7 @@ static const char *builtin_libc[] = {
 	"double floor(double x) {\n"
 	"\tdouble t = trunc(x);\n"
 	"\treturn t > x ? t - 1.0 : t;\n"
+	,
 	"}\n"
 	"\n"
 	"double ceil(double x) {\n"
@@ -1366,7 +1607,6 @@ static const char *builtin_libc[] = {
 	"\n"
 	"double ldexp(double x, int e) {\n"
 	"\twhile (e > 0) { x = x * 2.0; e--; }\n"
-	,
 	"\twhile (e < 0) { x = x * 0.5; e++; }\n"
 	"\treturn x;\n"
 	"}\n"
@@ -1379,6 +1619,7 @@ static const char *builtin_libc[] = {
 	"\twhile (a < 0.5) { a = a * 2.0; (*e)--; }\n"
 	"\treturn x < 0 ? -a : a;\n"
 	"}\n"
+	,
 	"\n"
 	"double modf(double x, double *ip) {\n"
 	"\tdouble t = trunc(x);\n"
@@ -1407,7 +1648,6 @@ static const char *builtin_libc[] = {
 	"\tdouble ln2 = 0.69314718055994530942;\n"
 	"\tdouble z = (m - 1) / (m + 1), z2 = z * z, term = z, sum = 0;\n"
 	"\tfor (int i = 1; i < 60; i += 2) { sum = sum + term / i; term = term * z2; }\n"
-	,
 	"\treturn 2 * sum + e * ln2;\n"
 	"}\n"
 	"\n"
@@ -1420,6 +1660,7 @@ static const char *builtin_libc[] = {
 	"\t\tint inv = n < 0;\n"
 	"\t\tif (inv) n = -n;\n"
 	"\t\tdouble r = 1.0, b = x;\n"
+	,
 	"\t\twhile (n) { if (n & 1) r = r * b; b = b * b; n >>= 1; }\n"
 	"\t\treturn inv ? 1.0 / r : r;\n"
 	"\t}\n"
@@ -1448,7 +1689,6 @@ static const char *builtin_libc[] = {
 	"\tdouble y = x / (1 + sqrt(1 + x * x));\n"
 	"\tdouble term = y, sum = 0, y2 = y * y;\n"
 	"\tfor (int i = 1; i < 80; i += 2) { sum = sum + term / i; term = -term * y2; }\n"
-	,
 	"\treturn 2 * sum;\n"
 	"}\n"
 	"\n"
@@ -1461,6 +1701,7 @@ static const char *builtin_libc[] = {
 	"\treturn 0.0;\n"
 	"}\n"
 	"\n"
+	,
 	"#define F_READ 1\n"
 	"#define F_WRITE 2\n"
 	"#define F_EOF 4\n"
@@ -1489,7 +1730,6 @@ static const char *builtin_libc[] = {
 	"static int stdio_ready;\n"
 	"\n"
 	"static void (*atexit_fns[32])(void);\n"
-	,
 	"static int natexit;\n"
 	"\n"
 	"static void init_file(FILE *f, int fd, int flags) {\n"
@@ -1502,6 +1742,7 @@ static const char *builtin_libc[] = {
 	"\tf->unget = -1;\n"
 	"\tf->next = open_files;\n"
 	"\topen_files = f;\n"
+	,
 	"}\n"
 	"\n"
 	"static void stdio_init(void) {\n"
@@ -1530,7 +1771,6 @@ static const char *builtin_libc[] = {
 	"int fflush(FILE *f) {\n"
 	"\tif (!f) {\n"
 	"\t\tfor (FILE *g = open_files; g; g = g->next) fflush(g);\n"
-	,
 	"\t\treturn 0;\n"
 	"\t}\n"
 	"\tif ((f->flags & F_WRITE) && f->pos > 0) {\n"
@@ -1543,6 +1783,7 @@ static const char *builtin_libc[] = {
 	"\n"
 	"static int ensure_buf(FILE *f) {\n"
 	"\tif (f->buf) return 0;\n"
+	,
 	"\tf->bufsize = BUFSIZ;\n"
 	"\tf->buf = (unsigned char *)malloc(f->bufsize);\n"
 	"\tif (!f->buf) { f->flags |= F_ERR; return -1; }\n"
@@ -1571,7 +1812,6 @@ static const char *builtin_libc[] = {
 	"\treturn n;\n"
 	"}\n"
 	"\n"
-	,
 	"int setvbuf(FILE *f, char *buf, int mode, size_t size) {\n"
 	"\t(void)buf;\n"
 	"\t(void)size;\n"
@@ -1584,6 +1824,7 @@ static const char *builtin_libc[] = {
 	"}\n"
 	"\n"
 	"void setbuf(FILE *f, char *buf) { setvbuf(f, buf, buf ? _IOFBF : _IONBF, BUFSIZ); }\n"
+	,
 	"\n"
 	"int fputc(int c, FILE *f) {\n"
 	"\tunsigned char ch = (unsigned char)c;\n"
@@ -1612,7 +1853,6 @@ static const char *builtin_libc[] = {
 	"\t\tif (r < 0 && errno == EINTR) continue;\n"
 	"\t\tif (r < 0) { f->flags |= F_ERR; return -1; }\n"
 	"\t\tif (r == 0) { f->flags |= F_EOF; return -1; }\n"
-	,
 	"\t\tf->pos = 0;\n"
 	"\t\tf->len = (int)r;\n"
 	"\t\treturn 0;\n"
@@ -1625,6 +1865,7 @@ static const char *builtin_libc[] = {
 	"\treturn f->buf[f->pos++];\n"
 	"}\n"
 	"int getc(FILE *f) { return fgetc(f); }\n"
+	,
 	"int getchar(void) { return fgetc(stdin); }\n"
 	"\n"
 	"int ungetc(int c, FILE *f) {\n"
@@ -1653,7 +1894,6 @@ static const char *builtin_libc[] = {
 	"\tunsigned char *p = (unsigned char *)buf;\n"
 	"\tif (total == 0) return 0;\n"
 	"\tif (f->unget >= 0) { p[got++] = (unsigned char)f->unget; f->unget = -1; }\n"
-	,
 	"\twhile (got < total) {\n"
 	"\t\tif (f->pos < f->len) {\n"
 	"\t\t\tsize_t k = f->len - f->pos;\n"
@@ -1666,6 +1906,7 @@ static const char *builtin_libc[] = {
 	"\t\tif (total - got >= BUFSIZ) {\n"
 	"\t\t\tssize_t r = read(f->fd, p + got, total - got);\n"
 	"\t\t\tif (r < 0 && errno == EINTR) continue;\n"
+	,
 	"\t\t\tif (r < 0) { f->flags |= F_ERR; break; }\n"
 	"\t\t\tif (r == 0) { f->flags |= F_EOF; break; }\n"
 	"\t\t\tgot += r;\n"
@@ -1694,7 +1935,6 @@ static const char *builtin_libc[] = {
 	"\tint fd = open(path, flags, 0666);\n"
 	"\tif (fd < 0) return NULL;\n"
 	"\tFILE *f = fdopen(fd, mode);\n"
-	,
 	"\tif (!f) close(fd);\n"
 	"\treturn f;\n"
 	"}\n"
@@ -1707,6 +1947,7 @@ static const char *builtin_libc[] = {
 	"\tif (*pp) *pp = f->next;\n"
 	"\tif (f->buf) free(f->buf);\n"
 	"\tif (f != &file_stdin && f != &file_stdout && f != &file_stderr) free(f);\n"
+	,
 	"\treturn r;\n"
 	"}\n"
 	"\n"
@@ -1735,7 +1976,6 @@ static const char *builtin_libc[] = {
 	"\n"
 	"typedef struct {\n"
 	"\tFILE *f;\n"
-	,
 	"\tchar *buf;\n"
 	"\tsize_t cap;\n"
 	"\tsize_t n;\n"
@@ -1748,6 +1988,7 @@ static const char *builtin_libc[] = {
 	"}\n"
 	"\n"
 	"static void out_pad(Out *o, int c, int n) { while (n-- > 0) out_ch(o, c); }\n"
+	,
 	"\n"
 	"#define BIG_LIMBS 90\n"
 	"\n"
@@ -1776,7 +2017,6 @@ static const char *builtin_libc[] = {
 	"\t\t\tbig[i] = (unsigned int)t;\n"
 	"\t\t\tcarry = t >> 32;\n"
 	"\t\t}\n"
-	,
 	"\t\tif (carry) big[n++] = (unsigned int)carry;\n"
 	"\t\tcount -= k;\n"
 	"\t}\n"
@@ -1789,6 +2029,7 @@ static const char *builtin_libc[] = {
 	"\t\t\tbig[i] = (unsigned int)(cur / 1000000000UL);\n"
 	"\t\t\trem = cur % 1000000000UL;\n"
 	"\t\t}\n"
+	,
 	"\t\twhile (n > 0 && big[n - 1] == 0) n--;\n"
 	"\t\tfor (int j = 0; j < 9; j++) { rev[nd++] = (char)('0' + rem % 10); rem /= 10; }\n"
 	"\t}\n"
@@ -1817,7 +2058,6 @@ static const char *builtin_libc[] = {
 	"\t\twhile (i >= 0 && d[i] == '9') { d[i] = '0'; i--; }\n"
 	"\t\tif (i >= 0) d[i]++;\n"
 	"\t\telse {\n"
-	,
 	"\t\t\tmemmove(d + 1, d, nd);\n"
 	"\t\t\td[0] = '1';\n"
 	"\t\t\tnd++;\n"
@@ -1830,6 +2070,7 @@ static const char *builtin_libc[] = {
 	"static char digit_at(char *d, int nd, int i) { return i >= 0 && i < nd ? d[i] : '0'; }\n"
 	"\n"
 	"static int put_fixed(char *buf, char *d, int nd, int dp, int prec, int alt) {\n"
+	,
 	"\tint n = 0;\n"
 	"\tif (dp <= 0) buf[n++] = '0';\n"
 	"\telse for (int i = 0; i < dp; i++) buf[n++] = digit_at(d, nd, i);\n"
@@ -1858,7 +2099,6 @@ static const char *builtin_libc[] = {
 	"\tunsigned long bits;\n"
 	"\tmemcpy(&bits, &v, 8);\n"
 	"\tif (bits >> 63) { buf[n++] = '-'; v = -v; }\n"
-	,
 	"\telse if (plus) buf[n++] = '+';\n"
 	"\telse if (space) buf[n++] = ' ';\n"
 	"\tif (v != v) {\n"
@@ -1871,6 +2111,7 @@ static const char *builtin_libc[] = {
 	"\t}\n"
 	"\tif (prec > 350) prec = 350;\n"
 	"\tchar d[1200];\n"
+	,
 	"\tint dp;\n"
 	"\tint nd = exact_decimal(v, d, &dp);\n"
 	"\tint zero = v == 0;\n"
@@ -1899,7 +2140,6 @@ static const char *builtin_libc[] = {
 	"\treturn n + len;\n"
 	"}\n"
 	"\n"
-	,
 	"static int format(Out *o, const char *fmt, va_list ap) {\n"
 	"\tfor (; *fmt; fmt++) {\n"
 	"\t\tif (*fmt != '%') { out_ch(o, *fmt); continue; }\n"
@@ -1912,6 +2152,7 @@ static const char *builtin_libc[] = {
 	"\t\t\telse if (*fmt == '#') alt = 1;\n"
 	"\t\t\telse if (*fmt == '0') zero = 1;\n"
 	"\t\t\telse break;\n"
+	,
 	"\t\t}\n"
 	"\t\tint width = 0;\n"
 	"\t\tif (*fmt == '*') { width = va_arg(ap, int); if (width < 0) { left = 1; width = -width; } fmt++; }\n"
@@ -1940,7 +2181,6 @@ static const char *builtin_libc[] = {
 	"\t\t\tcontinue;\n"
 	"\t\t}\n"
 	"\t\tif (c == 's') {\n"
-	,
 	"\t\t\tconst char *s = va_arg(ap, const char *);\n"
 	"\t\t\tif (!s) s = \"(null)\";\n"
 	"\t\t\tint len = 0;\n"
@@ -1953,6 +2193,7 @@ static const char *builtin_libc[] = {
 	"\t\tif (c == 'n') { int *p = va_arg(ap, int *); *p = (int)o->n; continue; }\n"
 	"\t\tif (c == 'f' || c == 'F' || c == 'e' || c == 'E' || c == 'g' || c == 'G') {\n"
 	"\t\t\tdouble d = va_arg(ap, double);\n"
+	,
 	"\t\t\tchar tmp[400];\n"
 	"\t\t\tint len = fmt_double(tmp, d, prec < 0 ? 6 : prec, c, alt, plus, space);\n"
 	"\t\t\tif (zero && !left && len < width && isdigit(tmp[len - 1])) {\n"
@@ -1981,7 +2222,6 @@ static const char *builtin_libc[] = {
 	"\t\t\tif (c == 'p') { v = (unsigned long)va_arg(ap, void *); lng = 1; alt = 1; }\n"
 	"\t\t\telse if (lng == 1) v = va_arg(ap, unsigned long);\n"
 	"\t\t\telse v = va_arg(ap, unsigned int);\n"
-	,
 	"\t\t\tif (lng == -1) v = (unsigned short)v;\n"
 	"\t\t\tif (lng == -2) v = (unsigned char)v;\n"
 	"\t\t\tif (c == 'x' || c == 'p') base = 16;\n"
@@ -1994,6 +2234,7 @@ static const char *builtin_libc[] = {
 	"\t\t\tout_ch(o, c);\n"
 	"\t\t\tcontinue;\n"
 	"\t\t}\n"
+	,
 	"\t\tchar digits[32];\n"
 	"\t\tint nd = 0;\n"
 	"\t\tconst char *dig = upper ? \"0123456789ABCDEF\" : \"0123456789abcdef\";\n"
@@ -2022,7 +2263,6 @@ static const char *builtin_libc[] = {
 	"\n"
 	"int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {\n"
 	"\tOut o;\n"
-	,
 	"\to.f = NULL; o.buf = buf; o.cap = n; o.n = 0;\n"
 	"\tint r = format(&o, fmt, ap);\n"
 	"\tif (n) buf[o.n < n ? o.n : n - 1] = 0;\n"
@@ -2035,6 +2275,7 @@ static const char *builtin_libc[] = {
 	"int printf(const char *fmt, ...) {\n"
 	"\tva_list ap;\n"
 	"\tva_start(ap, fmt);\n"
+	,
 	"\tint r = vfprintf(stdout, fmt, ap);\n"
 	"\tva_end(ap);\n"
 	"\treturn r;\n"
@@ -2063,7 +2304,6 @@ static const char *builtin_libc[] = {
 	"\tva_end(ap);\n"
 	"\treturn r;\n"
 	"}\n"
-	,
 	"\n"
 	"void perror(const char *s) {\n"
 	"\tif (s && *s) fprintf(stderr, \"%s: \", s);\n"
@@ -2076,6 +2316,7 @@ static const char *builtin_libc[] = {
 	"\treturn 0;\n"
 	"}\n"
 	"\n"
+	,
 	"void exit(int status) {\n"
 	"\twhile (natexit > 0) atexit_fns[--natexit]();\n"
 	"\tfflush(NULL);\n"

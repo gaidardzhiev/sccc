@@ -1,0 +1,8 @@
+twice(5) = 10
+square(5) = 25
+negate(5) = -5
+data aligned: 1
+counter in data: 1
+zero in bss: 1
+banner: ok
+counter: 7

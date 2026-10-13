@@ -3,6 +3,75 @@
  * Licensed under the GPL-3.0-only
  */
 
+#ifdef ASM_BUILTINS
+static inline void k_outb(unsigned short port, unsigned char v) { __asm__ __volatile__("outb %0, %1" : : "a"(v), "Nd"(port)); }
+static inline void k_outw(unsigned short port, unsigned short v) { __asm__ __volatile__("outw %0, %1" : : "a"(v), "Nd"(port)); }
+static inline void k_outl(unsigned short port, unsigned v) { __asm__ __volatile__("outl %0, %1" : : "a"(v), "Nd"(port)); }
+static inline unsigned char k_inb(unsigned short port) { unsigned char v; __asm__ __volatile__("inb %1, %0" : "=a"(v) : "Nd"(port)); return v; }
+static inline unsigned short k_inw(unsigned short port) { unsigned short v; __asm__ __volatile__("inw %1, %0" : "=a"(v) : "Nd"(port)); return v; }
+static inline unsigned k_inl(unsigned short port) { unsigned v; __asm__ __volatile__("inl %1, %0" : "=a"(v) : "Nd"(port)); return v; }
+static inline unsigned long k_read_cr(int n) {
+	unsigned long v = 0;
+	switch (n) {
+	case 0: __asm__ __volatile__("mov %%cr0, %0" : "=r"(v)); break;
+	case 2: __asm__ __volatile__("mov %%cr2, %0" : "=r"(v)); break;
+	case 3: __asm__ __volatile__("mov %%cr3, %0" : "=r"(v)); break;
+	case 4: __asm__ __volatile__("mov %%cr4, %0" : "=r"(v)); break;
+	}
+	return v;
+}
+static inline void k_write_cr(int n, unsigned long v) {
+	switch (n) {
+	case 0: __asm__ __volatile__("mov %0, %%cr0" : : "r"(v) : "memory"); break;
+	case 2: __asm__ __volatile__("mov %0, %%cr2" : : "r"(v) : "memory"); break;
+	case 3: __asm__ __volatile__("mov %0, %%cr3" : : "r"(v) : "memory"); break;
+	case 4: __asm__ __volatile__("mov %0, %%cr4" : : "r"(v) : "memory"); break;
+	}
+}
+static inline unsigned long k_rdmsr(unsigned msr) {
+	unsigned lo, hi;
+	__asm__ __volatile__("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+	return (unsigned long)hi << 32 | lo;
+}
+static inline void k_wrmsr(unsigned msr, unsigned long v) {
+	__asm__ __volatile__("wrmsr" : : "c"(msr), "a"((unsigned)v), "d"((unsigned)(v >> 32)));
+}
+static inline void k_cpuid(unsigned leaf, unsigned sub, unsigned *r) {
+	__asm__ __volatile__("cpuid" : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3]) : "a"(leaf), "c"(sub));
+}
+static inline unsigned long k_rdtsc(void) {
+	unsigned lo, hi;
+	__asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+	return (unsigned long)hi << 32 | lo;
+}
+#define __outb(p, v) k_outb((p), (v))
+#define __outw(p, v) k_outw((p), (v))
+#define __outl(p, v) k_outl((p), (v))
+#define __inb(p) k_inb(p)
+#define __inw(p) k_inw(p)
+#define __inl(p) k_inl(p)
+#define __cli() __asm__ __volatile__("cli" : : : "memory")
+#define __sti() __asm__ __volatile__("sti" : : : "memory")
+#define __hlt() __asm__ __volatile__("hlt")
+#define __pause() __asm__ __volatile__("pause")
+#define __lgdt(p) __asm__ __volatile__("lgdt (%0)" : : "r"(p) : "memory")
+#define __lidt(p) __asm__ __volatile__("lidt (%0)" : : "r"(p) : "memory")
+#define __ltr(sel) __asm__ __volatile__("ltr %w0" : : "r"((unsigned)(sel)))
+#define __read_cr0() k_read_cr(0)
+#define __read_cr2() k_read_cr(2)
+#define __read_cr3() k_read_cr(3)
+#define __read_cr4() k_read_cr(4)
+#define __write_cr0(v) k_write_cr(0, (v))
+#define __write_cr2(v) k_write_cr(2, (v))
+#define __write_cr3(v) k_write_cr(3, (v))
+#define __write_cr4(v) k_write_cr(4, (v))
+#define __rdmsr(m) k_rdmsr(m)
+#define __wrmsr(m, v) k_wrmsr((m), (v))
+#define __invlpg(p) __asm__ __volatile__("invlpg (%0)" : : "r"(p) : "memory")
+#define __cpuid(l, s, r) k_cpuid((l), (s), (r))
+#define __rdtsc() k_rdtsc()
+#endif
+
 struct frame { unsigned long ip, cs, flags, sp, ss; };
 struct e820 { unsigned long base, len; unsigned type, ext; };
 

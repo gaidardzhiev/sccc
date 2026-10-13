@@ -1,0 +1,20 @@
+.S : { *(.wa) }
+.S : { *(.xa) }
+.S : { *(.ra) }
+.S : { *(.ba) }
+.S : { *(.wa) } .T : { *(.xa) }
+.S : { *(.xa) } .T : { *(.wa) }
+.S : { *(.ra) } .T : { *(.wa) }
+.S : { *(.wa) } .T : { *(.ra) }
+.S : { *(.wa) } .T : { *(.ba) }
+.S : { *(.ba) } .T : { *(.wa) }
+.S : { BYTE(1) }
+.S : { *(.ra) BYTE(1) }
+.text : { *(.wa) } .S : { *(.ra) }
+.S : { *(.xa) } .data : { *(.ra) }
+.S : { *(.ra .xa) }
+.rodata : { *(.xa) } .S : { *(.wa) }
+.S : { *(.xa .ra) } .T : { *(.ba) } .U : { *(.wa) }
+.text : { *(.xa) } .rodata : { *(.ra) } .data : { *(.wa) } .bss : { *(.ba) }
+.data : { *(.xa) } x = .; .bss : { *(.ra) }
+.S : { *(.xa) } y = .; . = ALIGN(16); .T : { *(.wa) }

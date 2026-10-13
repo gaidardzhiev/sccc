@@ -1,0 +1,10 @@
+top 77 naked 7 section 42
+add 7 plus 15 cpu 1
+memory 7243
+imm 1335 sizes 30857
+named 36 matching 12 static 15
+goto 5 7 0 back 3
+rbx 42 unique 4 many 21 stmt 102
+label 9 18
+syscall
+wrote 8

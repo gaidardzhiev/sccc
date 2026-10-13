@@ -69,7 +69,7 @@ Names are interned in a hash table of 8192 buckets. Each `Str` holds the spellin
 
 = The language
 
-The source language is C with the types and constructs implemented by the parser in `sccc.c`. Its basic types are `void`, `_Bool`, `char`, `short`, `int`, `long`, `float`, and `double`, together with signed and unsigned forms of the integer types. On the target, `char` and `_Bool` occupy one byte, `short` two, `int` four, and `long` eight. Pointers occupy eight bytes. Floating-point objects occupy four or eight bytes. A declaration of `long double` is handled by the `double` type path in `declspec`; it does not introduce an extended-precision representation.
+The source language is C with the types and constructs implemented by the parser in `sccc.c`. Its basic types are `void`, `_Bool`, `char`, `short`, `int`, `long`, `float`, and `double`, together with signed and unsigned forms of the integer types. On the target, `char` and `_Bool` occupy one byte, `short` two, `int` four, and `long` eight. Pointers occupy eight bytes. Floating-point objects occupy four or eight bytes. A declaration of `long double` is handled by the `double` type path in `declspec`; it does not introduce an extended-precision representation. `signed char` and `long long` have type records of their own. They behave exactly like `char` and `long` in code generation, but they are different objects, so `_Generic` and `__builtin_types_compatible_p` can tell them apart.
 
 `typedef`, enumerations, pointers, arrays, functions, structures, unions, and bit-fields are part of the parser. The recognized storage-class words include `static`, `extern`, and `typedef`. `auto`, `register`, and `inline` are read and discarded by `declspec`; `const`, `volatile`, and `restrict` are likewise accepted without a separate qualified type. Consequently, these spellings do not introduce an independent qualifier-enforcement or volatile-access mechanism in the generated code.
 
@@ -294,11 +294,11 @@ A program can also be compiled with `-nostdlib`. In this mode, no library functi
 
 For a default hosted build, `write_elf` gives final locations to text, read-only constants, initialized data, and BSS. The executable begins at the virtual base address `0x400000`. The ELF header is 64 bytes, followed by two 56-byte program headers. The generated code begins after these 176 bytes. `.rodata` follows the text at a 16-byte boundary; `.data` begins at a page boundary; `.bss` follows initialized data in memory.
 
-The first loadable segment is readable and executable and covers the headers, machine code, and read-only data. The second is readable and writable and contains initialized data followed by the zero-filled BSS region. ELF program headers tell Linux how to map those areas when the process starts. Section headers are also written for `.text`, `.rodata`, `.data`, `.bss`, `.symtab`, `.strtab`, and `.shstrtab`. The symbol table contains `_start` and defined C symbols, with local and global bindings.
+The first loadable segment is readable and executable and covers the headers, machine code, and read-only data. The second is readable and writable and contains initialized data followed by the zero-filled BSS region. ELF program headers tell Linux how to map those areas when the process starts. Section headers are also written for `.text`, `.rodata`, `.data`, `.bss`, every section named with the `section` attribute, `.symtab`, `.strtab`, and `.shstrtab`. The symbol table contains `_start` and defined C symbols, with local, global, and weak bindings.
 
 == Resolving addresses
 
-Relocations have two forms. `R_PC32` holds a signed 32-bit displacement relative to the end of an instruction, used for calls and RIP-relative addresses. `R_ABS64` holds an eight-byte absolute address, used for initialized pointers. Each relocation stores its position, symbol or section, and addend.
+Relocations have two forms. `R_PC32` holds a signed 32-bit displacement relative to the end of an instruction, used for calls and RIP-relative addresses. `R_ABS64` holds an eight-byte absolute address, used for initialized pointers. Each relocation stores its position, the section whose buffer holds that position, the target symbol or section, and an addend. `add_reloc` takes the holding section from `cur_text` for a displacement and from `cur_data` for an absolute address. Both name the built-in sections except while a function or variable is being placed in a section of its own.
 
 For a relative call the calculation is:
 
@@ -306,7 +306,7 @@ For a relative call the calculation is:
 rel = target_address - (instruction_address + 4);
 ```
 
-Here `instruction_address` means the address of the four-byte displacement field. The extra four advances to the following instruction. The writer checks that the result fits in a signed 32-bit value, then patches those bytes. For an absolute relocation, it writes the full 64-bit target address into the data section. An unresolved symbol produces an error before the file is finished.
+Here `instruction_address` means the address of the four-byte displacement field. The extra four advances to the following instruction. The writer checks that the result fits in a signed 32-bit value, then patches those bytes. For an absolute relocation, it writes the full 64-bit target address into the section that holds the field. An unresolved symbol produces an error before the file is finished, unless it is weak; an undefined weak symbol resolves to address 0.
 
 == Process startup
 
@@ -333,7 +333,7 @@ Three options determine kernel placement. `-oformat` chooses `elf`, `bin`, `img`
 
 == Section layout
 
-The layout code in `write_elf` is shared by all four output formats. `.text` contains emitted instructions, `.rodata` contains strings and other read-only constants, `.data` holds initialized objects, and `.bss` reserves zero-filled memory. References between these sections are resolved before the output bytes are written. In the flat format the bytes of `.text`, `.rodata`, and `.data` appear consecutively with alignment padding. `.bss` occupies no file bytes; its extent is included in the address calculations used by the boot loaders.
+The layout code in `write_elf` is shared by all four output formats. `.text` contains emitted instructions, `.rodata` contains strings and other read-only constants, `.data` holds initialized objects, and `.bss` reserves zero-filled memory. A section named in a `section` attribute follows the built-in section of its kind. The writer first builds the order: `.text` and the code sections, `.rodata` and the read-only sections, `.data` and the data sections, then `.bss`. It then gives each one an address aligned to the largest alignment requested inside it. References between these sections are resolved before the output bytes are written. In the flat format the sections other than `.bss` appear consecutively with alignment padding. `.bss` occupies no file bytes; its extent is included in the address calculations used by the boot loaders.
 
 ```sh
 ./sccc -ffreestanding -oformat bin -Ttext 0x100000 \
@@ -418,7 +418,7 @@ The header also contains a `finish` routine. It waits for serial output to drain
 
 = Kernel programs
 
-The `baremetal` directory contains five kernel programs written in C. Each uses the disk image output, starts through the generated boot sector, and runs without the Linux runtime. Their output goes through COM1; `hello` also writes directly to VGA text memory at physical address `0xb8000`.
+The `baremetal` directory contains six kernel programs written in C. Each uses the disk image output, starts through the generated boot sector, and runs without the Linux runtime. Their output goes through COM1; `hello` also writes directly to VGA text memory at physical address `0xb8000`.
 
 The `hello` kernel initializes the serial port, writes a line of text, fills the 80-by-25 VGA character cells, and verifies that the character-and-attribute words can be read back. It prints the result over serial before stopping the emulator. The kernel does not call `printf`. Its output routine is a loop over I/O-port writes in `kernel.h`.
 
@@ -430,7 +430,9 @@ The `keyboard` kernel handles PS/2 keyboard interrupts on vector 33. Its handler
 
 The `memory` kernel receives the E820 map passed by the BIOS boot sector. It creates a bitmap covering the first gigabyte in 4096-byte page frames, marks only usable memory above 2 MB available, and allocates and releases frames while checking their contents. It also finds a consecutive 256-frame run and uses it as a one-megabyte heap. The heap keeps a linked list of blocks, splits a block for allocation, and coalesces adjacent free blocks on release. A test performs 3000 pseudorandom allocations and frees, checking data and 16-byte alignment. Both the page-frame and heap tests finish with their free counts restored.
 
-The five programs exercise different parts of the compiler while running on the processor directly: volatile memory accesses, integer types and pointer arithmetic, hardware operations, function wrappers, control-flow patching, constant data, global initialization, and structure layouts. The `baremetal/run.sh` suite compiles each kernel, boots it in QEMU and Bochs, and compares its serial output with the checked-in `.out` file. QEMU completion is also checked through the debug-exit status; Bochs completion is checked through its shutdown request. The source of the kernels and their expected output live together in the repository.
+The `initcall` kernel is laid out the way larger kernels organize their start-up code. Each init function is registered with a macro that places a function pointer in the section `initcalls`, and `kmain` walks the table from `__start_initcalls` to `__stop_initcalls`. One init function builds new page tables in static arrays declared with `aligned(4096)`. They identity map the first gigabyte and map it a second time at `0xffffffff80000000`. The function loads them with `__write_cr3` and checks a variable through both addresses. Another runs a small bytecode program through a table of label addresses and `goto *`. A third classifies characters with case ranges and fills a table with range designators. The last checks that an undefined weak symbol has address 0 and that an alias calls its target. Output goes through `_Generic` and statement-expression macros.
+
+The six programs exercise different parts of the compiler while running on the processor directly: volatile memory accesses, integer types and pointer arithmetic, hardware operations, function wrappers, control-flow patching, constant data, global initialization, and structure layouts. The `baremetal/run.sh` suite compiles each kernel, boots it in QEMU and Bochs, and compares its serial output with the checked-in `.out` file. QEMU completion is also checked through the debug-exit status; Bochs completion is checked through its shutdown request. The source of the kernels and their expected output live together in the repository.
 
 ```sh
 make baremetal
@@ -453,6 +455,71 @@ The `modules` example exercises a declaration in a header and definitions in sep
 
 There is no separate object-file interface and no archive search. Supplying all sources in one invocation is the compilation model. The `-o` option chooses the executable name; `-I` adds header directories; `-D` supplies command-line macro definitions; `-nostdlib` omits the built-in library. Without `-o`, the output is `a.out`. The command line accepts up to 64 source inputs, with fixed-size arrays for include directories and `-D` definitions.
 
+= GNU C and C11 extensions
+
+Kernel and library sources are seldom written in plain C99. They rely on a group of GNU extensions and C11 additions, and SCCC implements the common ones within its single pass. Most of them reuse two small mechanisms: compiling an expression only for its type, and reading a group of tokens a second time.
+
+== Compiling for the type only
+
+`sizeof expr` already compiled its operand and threw the code away. That step is now the pair `mark_code` and `drop_code`. A `Mark` records the length of the text buffer, the number of relocations, and the push count. `drop_code` restores all three and drops any label patch that points into the removed bytes. `typeof(expr)`, `_Alignof expr`, the controlling expression of `_Generic`, and the associations `_Generic` does not select are compiled this way. So are the second argument of `__builtin_expect` and the unchosen branch of `__builtin_choose_expr`.
+
+```c
+#define max(a, b) ({ typeof(a) _a = (a); typeof(b) _b = (b); \
+	_a > _b ? _a : _b; })
+```
+
+`_Generic` compares the type of its controlling expression with each association using `same_type`. Arrays and functions decay first, and type copies made by `aligned` are traced back through `origin`. The association that matches is compiled in place, and its value is the value of the whole expression. A `default` association may appear before the matching one, so its tokens are saved with `capture_expr`. When nothing else matches, `replay` pushes them back onto the source stack, ahead of the current token, and they are parsed again. The same pair of functions handles a range designator followed by a member designator, which is parsed once for each element of the range.
+
+== Statement expressions
+
+`({ ... })` is recognized in `parse_primary` when a parenthesis is followed by a brace. The block is parsed statement by statement in a new scope. An expression statement whose semicolon is followed by the closing brace is the result: `rval` loads it into `RAX` before anything else is emitted. A label directly before the last statement is defined in place, so the value survives. The code and stack accounting are those of an ordinary block, so a statement expression may declare variables, contain loops, or `break` out of an enclosing loop.
+
+== Builtins
+
+`__builtin_constant_p` never compiles its argument. Its tokens are captured, and the result is 1 when every identifier is an enumeration constant or a type name. Assignments, increments, the comma operator, and braces make the result 0, and the operand of `sizeof` is skipped. `__builtin_types_compatible_p` and `__builtin_offsetof` are computed by `builtin_const` from type records alone. All three, with `__builtin_choose_expr` and `__builtin_expect`, are also accepted by the constant-expression evaluator, so `offsetof` from `<stddef.h>` now works in array sizes, `case` labels, and static initializers.
+
+== Ranges
+
+A case range `case lo ... hi:` stores both bounds. The dispatch sequence after the `switch` body subtracts `lo` from the controlling value and compares the difference with `hi - lo` as an unsigned number, so one `jbe` covers the whole range for signed and unsigned types alike:
+
+```c
+switch (c) {
+case '0' ... '9': return DIGIT;
+case 'a' ... 'z': case 'A' ... 'Z': return LETTER;
+}
+```
+
+A range designator `[lo ... hi] = v` initializes element `lo` and then copies it. For static data the bytes are copied in the data buffer, and every absolute relocation inside the first element is repeated for the others. For an automatic array one overlapping `rep movsb`, from element `lo` to element `lo + 1`, replicates the element across the range.
+
+== Labels as values
+
+`&&label` emits `lea rax, [rip + disp]`. The displacement is patched like a jump, through the label's patch list, so it works before and after the label is defined. `goto *p` compiles `p` and emits `jmp rax`. A static array of label addresses is initialized with absolute relocations against the text section. Their addends are filled in when the label is defined, through a second list in `Label`. That is the table a threaded interpreter needs:
+
+```c
+static const void *ops[] = { &&push, &&add, &&halt };
+goto *ops[*pc++];
+```
+
+== Attributes
+
+`skip_attribute` reads each attribute in an `__attribute__((...))` list together with its argument tokens. The argument of `aligned` is a constant expression. `eval_tokens` evaluates it by pushing the tokens and a sentinel onto the source stack and calling `const_expr`, then restoring the current and peeked tokens, as `pp_eval` does for `#if`. String arguments of `section` and `alias` are interned. The results go into an `Attr` record that rides on the following token, next to the existing bit flags for `packed`, `interrupt`, and `weak`. `declspec` merges the records it passes over. Declarations merge in the one after the declarator, and `struct_decl` uses the ones after `struct`, after the tag, and after the closing brace.
+
+Alignment is applied where storage is assigned. Structure layout takes the larger of a member's own alignment and its attribute, and the structure's attribute raises the alignment and so the rounded size. A typedef with `aligned` gets a copy of its type with the new alignment and `origin` pointing back. Globals record their alignment in `Sym`, and each section keeps the largest alignment placed in it, which `write_elf` uses when it assigns addresses. A function with `aligned(n)` is preceded by `int3` padding. Local variables are addressed from `rbp`, which is 16-byte aligned, so a local with a larger alignment is an error.
+
+A weak symbol keeps the number of the file that declared it weak. When a second definition of a symbol arrives, a weak earlier definition gives way: the new body is compiled into the same `Sym`, and the earlier code remains in the file unused. A weak later definition is compiled into a discarded local symbol instead, which is the treatment library functions already received when the program defines them. An alias records the name of its target. At the end of the file, `resolve_aliases` looks the name up among the file-scope symbols, and `write_elf` copies the target's section and offset before it resolves relocations.
+
+== Sections
+
+A `section` attribute selects one of the `Sec` records in `Ctx`, created on first use with a kind of code, read-only, or data. A function is compiled into its section by swapping the section's buffer with `ctx->text` and setting `cur_text` for the duration of `parse_func_body`. A variable is defined by swapping with `ctx->data` and setting `cur_data`. Everything that emits code or data keeps working on `ctx->text` and `ctx->data` unchanged. Labels, jump patches, and the `sizeof` rollback all stay within the current buffer.
+
+```c
+#define initcall(fn) static int (*const fn##_call)(void) \
+	__attribute__((section("initcalls"), used)) = fn
+extern int (*const __start_initcalls[])(void), (*const __stop_initcalls[])(void);
+```
+
+Before relocations are resolved, `define_bounds` gives each undefined `__start_name` or `__stop_name` the address of the start or end of section `name`, as GNU ld does. Tables built in several files therefore need no registration code at run time. The `initcall` kernel boots this way.
+
 = Self compilation and testing
 
 The bootstrap rule is short enough to give in full:
@@ -469,15 +536,15 @@ The hosted compiler has two main kinds of tests. `test_sccc.c` writes small C pr
 
 The `examples/` directory holds larger programs. Among them are a parser for Lisp-like input, SHA-256, sorting, a maze, a small language interpreter, numerical calculations, and terminal games. `examples/run.sh` compiles each program, runs it with the supplied inputs and arguments, and compares its output with the stored result. `make check` runs the C driver, feature suite, and examples against both `sccc` and `sccc2`, and invokes `baremetal/run.sh` for the kernel tests. `make baremetal` runs the kernel suite separately. `make fuzz` runs a generated-expression test separately.
 
-For the archive used in these notes, `make check` completed with 96 passing C-driver cases, 16 passing feature programs, and 47 passing examples for #strong[each] compiler generation. The two bootstrap files also compared equal. The scripts report zero failures in all three groups. The complete output can be reproduced from the Makefile rather than from a separately maintained list of claimed successes.
+For the archive used in these notes, `make check` completed with 112 passing C-driver cases, 18 passing feature programs, and 47 passing examples for #strong[each] compiler generation. The two bootstrap files also compared equal. The scripts report zero failures in all three groups. The complete output can be reproduced from the Makefile rather than from a separately maintained list of claimed successes.
 
 There are two different properties under test. Byte identity checks reproduction of the compiler binary. Running programs checks the behavior of generated executables. A compiler can reproduce an error consistently, so the second group of tests remains part of the bootstrap procedure. Both generations are asked to translate other source code, not only their own.
 
 = Source size and executable size
 
-The compiler source contains 4482 lines of C. The embedded library is written in 1468 lines in `lib/libc.c`; its public declarations live in the separate header files. The C test driver is another 463 lines. `builtin.h` is generated from the library and headers, so its size is a consequence of the embedding process, not an independently maintained implementation.
+The compiler source contains 5300 lines of C. The embedded library is written in 1468 lines in `lib/libc.c`; its public declarations live in the separate header files. The C test driver is another 492 lines. `builtin.h` is generated from the library and headers, so its size is a consequence of the embedding process, not an independently maintained implementation.
 
-In the bootstrap run described above, the host-built `sccc` executable occupied 232208 bytes. Both self-compiled stages occupied 413968 bytes. The host compiler was invoked with `-O2`; SCCC emits its own code directly, without a global optimization pass. Those sizes include different machine-code sequences for the same compiler source. The equal sizes of `sccc2` and `sccc3` are accompanied by their byte-for-byte equality, checked by `cmp`.
+In the bootstrap run described above, the host-built `sccc` executable occupied 261848 bytes. Both self-compiled stages occupied 465040 bytes. The host compiler was invoked with `-O2`; SCCC emits its own code directly, without a global optimization pass. Those sizes include different machine-code sequences for the same compiler source. The equal sizes of `sccc2` and `sccc3` are accompanied by their byte-for-byte equality, checked by `cmp`.
 
 The work done by the compiler is concentrated in two places. Most source constructs cause machine instructions to be emitted as soon as the parser recognizes them. After all input has been translated, `write_elf` walks the relocation list, fixes addresses, and copies the sections into the selected output file. `write_image` and `write_multiboot` add their generated bootstrap code to the flat kernel bytes. The implementation has no object-file readback pass or separate loader program.
 

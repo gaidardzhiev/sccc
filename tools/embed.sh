@@ -14,6 +14,10 @@ headers() {
 	(cd "$ROOT/lib/include" && find . -name '*.h' | sed 's|^\./||' | LC_ALL=C sort)
 }
 
+boots() {
+	(cd "$ROOT/lib/boot" && find . -name '*.s' | sed 's|^\./||' | LC_ALL=C sort)
+}
+
 {
 	echo "/*"
 	echo " * Copyright (C) 2026 Ivan Gaydardzhiev"
@@ -29,6 +33,19 @@ headers() {
 	echo "static const char *builtin_srcs[] = {"
 	headers | while read -r h; do
 		quote "$ROOT/lib/include/$h"
+		echo "	,"
+	done
+	echo "	NULL"
+	echo "};"
+	echo "static const char *builtin_boot_names[] = {"
+	boots | while read -r b; do
+		echo "	\"$b\","
+	done
+	echo "	NULL"
+	echo "};"
+	echo "static const char *builtin_boot_srcs[] = {"
+	boots | while read -r b; do
+		quote "$ROOT/lib/boot/$b"
 		echo "	,"
 	done
 	echo "	NULL"

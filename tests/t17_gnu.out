@@ -1,0 +1,38 @@
+char schar llong llong ullong ulong
+int* char* float int other
+12 1 8 120
+49 1.5 25
+8 8 1 1
+16 dflt
+40 33
+1 1 0 0
+1 0 0
+1 0 1 1
+0 1
+likely
+5
+10 15
+lp64
+case off
+10 1
+9 2.5
+1 1
+56
+4 5 8
+9 3
+25
+q0 q1 q2 
+abc 23
+2
+112
+low low low low mid mid mid top 
+0 0 7 7 1 7 0 0 0 0 
+{1 2 e} {1 9 e} {1 9 e} {0 9 -} 6
+letter space letter space digit space other neg other
+1 2 0 2
+0 10 10 -1 10 10 10 0 {5 6 x} {5 6 x} {5 6 x} 1122334455667788 1122334455667788
+45
+6
+100 101 208
+1
+4 hello 0 0 6

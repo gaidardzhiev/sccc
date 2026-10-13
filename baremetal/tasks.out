@@ -1,0 +1,12 @@
+tasks
+exceptions ok
+gp err 0x0000000000001230
+interrupts on ok
+timer ok
+A0 B0 C0 A1 B1 C1 A2 B2 C2 
+tasks ok
+co 1000
+co 1001
+co 1002
+checksum ok
+steps ok

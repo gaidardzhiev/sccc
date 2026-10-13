@@ -86,18 +86,6 @@ int open(const char *path, int flags, ...) {
 	return (int)sys_ret(__syscall(SYS_open, path, flags, mode));
 }
 
-void *__va_arg_ptr(__va_elem *ap, unsigned long size) {
-	void *p;
-	if (size <= 8 && ap->gp_offset < 48) {
-		p = (char *)ap->reg_save_area + ap->gp_offset;
-		ap->gp_offset += 8;
-		return p;
-	}
-	p = ap->overflow_arg_area;
-	ap->overflow_arg_area = (char *)p + ((size + 7) & ~7UL);
-	return p;
-}
-
 #define NCLASS 21
 #define CHUNK (4L << 20)
 

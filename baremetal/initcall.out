@@ -1,0 +1,7 @@
+initcall
+paging ok
+dispatch ok
+ranges ok
+symbols ok
+ran 4 initcalls
+initcalls ok

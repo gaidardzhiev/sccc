@@ -12,18 +12,22 @@
 #include <fcntl.h>
 
 #define TMP_SRC "/tmp/tc_src.c"
+#define TMP_ASM "/tmp/tc_asm.s"
+#define TMP_ASMP "/tmp/tc_asm.S"
 #define TMP_BIN "/tmp/tc_bin"
 
 static int g_pass = 0;
 static int g_fail = 0;
 static const char *g_compiler = NULL;
 
-static void write_src(const char *src) {
-	FILE *f = fopen(TMP_SRC, "w");
-	if (!f) { perror("fopen " TMP_SRC); exit(1); }
+static void write_file(const char *path, const char *src) {
+	FILE *f = fopen(path, "w");
+	if (!f) { perror(path); exit(1); }
 	fputs(src, f);
 	fclose(f);
 }
+
+static void write_src(const char *src) { write_file(TMP_SRC, src); }
 
 static int run(char *const argv[]) {
 	pid_t pid = fork();
@@ -82,6 +86,100 @@ static void check_compile_err(const char *desc, const char *src) {
 		printf("  FAIL  [%s]  (expected compile error but succeeded)\n", desc);
 		g_fail++;
 	}
+}
+
+static int compile_asm(const char *csrc, const char *asrc, int cpp) {
+	const char *apath = cpp ? TMP_ASMP : TMP_ASM;
+	write_file(apath, asrc);
+	if (csrc) write_src(csrc);
+	char *argv[] = { (char*)g_compiler, (char*)apath, csrc ? TMP_SRC : NULL, NULL, NULL, NULL };
+	if (csrc) { argv[3] = "-o"; argv[4] = TMP_BIN; }
+	else { argv[2] = "-o"; argv[3] = TMP_BIN; }
+	int st = run(argv);
+	if (!WIFEXITED(st)) return 1;
+	return WEXITSTATUS(st);
+}
+
+static void check_asm(const char *desc, const char *csrc, const char *asrc, int cpp, int want) {
+	int cc_ret = compile_asm(csrc, asrc, cpp);
+	if (cc_ret != 0) {
+		printf("  FAIL  [%s]  compiler exited %d (expected success)\n", desc, cc_ret);
+		g_fail++;
+		return;
+	}
+	int got = run_bin();
+	if (got == want) {
+		printf("  PASS  [%s]  exit=%d\n", desc, got);
+		g_pass++;
+	} else {
+		printf("  FAIL  [%s]  expected=%d got=%d\n", desc, want, got);
+		g_fail++;
+	}
+}
+
+static void check_asm_err(const char *desc, const char *asrc) {
+	if (compile_asm(NULL, asrc, 0) != 0) {
+		printf("  PASS  [%s]  (assembly error as expected)\n", desc);
+		g_pass++;
+	} else {
+		printf("  FAIL  [%s]  (expected assembly error but succeeded)\n", desc);
+		g_fail++;
+	}
+}
+
+static int compile_objects(const char *a, const char *b) {
+	write_file("/tmp/tc_a.c", a);
+	write_file("/tmp/tc_b.c", b);
+	char *c1[] = { (char*)g_compiler, "-c", "/tmp/tc_a.c", "-o", "/tmp/tc_a.o", NULL };
+	char *c2[] = { (char*)g_compiler, "-c", "/tmp/tc_b.c", "-o", "/tmp/tc_b.o", NULL };
+	char *ln[] = { (char*)g_compiler, "/tmp/tc_a.o", "/tmp/tc_b.o", "-o", TMP_BIN, NULL };
+	int st = run(c1);
+	if (!WIFEXITED(st) || WEXITSTATUS(st)) return 1;
+	st = run(c2);
+	if (!WIFEXITED(st) || WEXITSTATUS(st)) return 1;
+	st = run(ln);
+	return !WIFEXITED(st) || WEXITSTATUS(st);
+}
+
+static void check_objects(const char *desc, const char *a, const char *b, int want) {
+	if (compile_objects(a, b)) {
+		printf("  FAIL  [%s]  compile or link failed\n", desc);
+		g_fail++;
+		return;
+	}
+	int got = run_bin();
+	if (got == want) { printf("  PASS  [%s]  exit=%d\n", desc, got); g_pass++; }
+	else { printf("  FAIL  [%s]  expected=%d got=%d\n", desc, want, got); g_fail++; }
+}
+
+static void check_link_err(const char *desc, const char *a, const char *b) {
+	if (compile_objects(a, b)) { printf("  PASS  [%s]  (link error as expected)\n", desc); g_pass++; }
+	else { printf("  FAIL  [%s]  (expected link error but succeeded)\n", desc); g_fail++; }
+}
+
+static int compile_script(const char *src, const char *script, int compile_only) {
+	write_src(src);
+	write_file("/tmp/tc_script.ld", script);
+	char *argv[] = { (char*)g_compiler, "-T", "/tmp/tc_script.ld", TMP_SRC, "-o", TMP_BIN, NULL, NULL };
+	if (compile_only) argv[6] = "-c";
+	int st = run(argv);
+	return !WIFEXITED(st) || WEXITSTATUS(st);
+}
+
+static void check_script(const char *desc, const char *src, const char *script, int want) {
+	if (compile_script(src, script, 0)) {
+		printf("  FAIL  [%s]  compile or link failed\n", desc);
+		g_fail++;
+		return;
+	}
+	int got = run_bin();
+	if (got == want) { printf("  PASS  [%s]  exit=%d\n", desc, got); g_pass++; }
+	else { printf("  FAIL  [%s]  expected=%d got=%d\n", desc, want, got); g_fail++; }
+}
+
+static void check_script_err(const char *desc, const char *src, const char *script, int compile_only) {
+	if (compile_script(src, script, compile_only)) { printf("  PASS  [%s]  (error as expected)\n", desc); g_pass++; }
+	else { printf("  FAIL  [%s]  (expected an error but succeeded)\n", desc); g_fail++; }
 }
 
 static void section(const char *title) {
@@ -451,11 +549,153 @@ int main(int argc, char **argv) {
 		"  return s;"
 		"}", 6);
 
+	section("GNU C and C11 extensions");
+	check("statement expression",
+		"int main(){ int x = ({ int a = 4; a * 5; }); return x; }", 20);
+	check("typeof",
+		"int main(){ long v = 3; typeof(v) w = 9; return sizeof(w) + w; }", 17);
+	check("_Generic",
+		"int main(){ return _Generic(1L, int: 1, long: 2, default: 3); }", 2);
+	check("case range",
+		"int main(){ switch (42) { case 40 ... 49: return 4; default: return 0; } }", 4);
+	check("range designator",
+		"int a[6] = { [1 ... 4] = 3 }; int main(){ return a[0] + a[1] + a[4] + a[5]; }", 6);
+	check("computed goto",
+		"int main(){ void *p = &&b; goto *p; a: return 1; b: return 2; }", 2);
+	check("__builtin_constant_p",
+		"int main(){ int x = 1; return __builtin_constant_p(3) * 10 + __builtin_constant_p(x); }", 10);
+	check("__builtin_offsetof",
+		"struct s { char c; int v[4]; }; int main(){ return __builtin_offsetof(struct s, v[2]); }", 12);
+	check("aligned global",
+		"char c; int v __attribute__((aligned(256))); int main(){ return (long)&v % 256; }", 0);
+	check("weak undefined",
+		"int f(void) __attribute__((weak)); int main(){ return f ? 1 : 7; }", 7);
+
+	section("assembler");
+	check_asm("C calls asm",
+		"int f(void); int main(){ return f(); }",
+		".globl f\nf:\n\tmov $42, %eax\n\tret\n", 0, 42);
+	check_asm("main in asm", NULL,
+		"\t.globl main\nmain:\tmov $7, %eax; ret\n", 0, 7);
+	check_asm("asm calls C",
+		"int twice(int x){ return 2 * x; }",
+		"\t.globl main\nmain:\tsub $8, %rsp\n\tmov $21, %edi\n\tcall twice\n\tadd $8, %rsp\n\tret\n", 0, 42);
+	check_asm("asm data",
+		"extern int v[]; int main(){ return v[0] * v[1]; }",
+		"\t.data\n\t.globl v\nv:\t.long 5, 6\n", 0, 30);
+	check_asm("local labels", NULL,
+		"\t.globl main\nmain:\txor %eax, %eax\n\tmov $10, %ecx\n1:\tadd %ecx, %eax\n\tloop 1b\n\tret\n", 0, 55);
+	check_asm(".S macros", NULL,
+		"#define N 9\n#define F(x) ((x) * 2)\n\t.globl main\nmain:\tmov $F(N), %eax # comment\n\tret\n", 1, 18);
+	check_asm("relaxed jump", NULL,
+		"\t.globl main\nmain:\tmov $3, %eax\n\tjmp 1f\n\t.fill 300, 1, 0xcc\n1:\tret\n", 0, 3);
+	check_asm(".comm buffer",
+		"extern char buf[]; int main(){ buf[63] = 9; return buf[63] + buf[0]; }",
+		"\t.comm buf, 64, 16\n", 0, 9);
+	check_asm("forward equate", NULL,
+		"\t.globl main\nmain:\tmov $K * 2, %eax\n\tret\n\t.set K, 21\n", 0, 42);
+	check_asm("jump table", NULL,
+		"\t.globl main\nmain:\tmov $2, %eax\n\tlea t(%rip), %rdx\n\tjmp *(%rdx,%rax,8)\n"
+		"a:\tmov $1, %eax; ret\nb:\tmov $2, %eax; ret\nc:\tmov $3, %eax; ret\n"
+		"\t.data\nt:\t.quad a, b, c\n", 0, 3);
+	check_asm_err("unknown instruction", "\tfrob %eax\n");
+	check_asm_err("unknown register", "\tmov %eqx, %eax\n");
+	check_asm_err("operand size unknown", "\tmov $1, (%rax)\n");
+	check_asm_err("immediate too large", "\tmovb $300, %al\n");
+	check_asm_err("undefined local label", "\tjmp 1f\n");
+	check_asm_err("duplicate label", "a:\tnop\na:\tnop\n");
+	check_asm_err("64-bit register in 16-bit code", "\t.code16\n\tmov %rax, %rbx\n");
+	check_asm_err("%ah with REX", "\tmov %ah, %sil\n");
+
+	section("inline assembly");
+	check("asm output",
+		"int main(){ int r; asm(\"mov $42, %0\" : \"=r\"(r)); return r; }", 42);
+	check("asm inputs",
+		"int main(){ int a = 20, b = 22, r; __asm__(\"lea (%1,%2), %0\" : \"=r\"(r) : \"r\"(a), \"r\"(b)); return r; }", 42);
+	check("asm read-write",
+		"int main(){ long v = 40; __asm__ __volatile__(\"add $2, %0\" : \"+r\"(v)); return v; }", 42);
+	check("asm memory operand",
+		"int g = 41; int main(){ asm(\"incl %0\" : \"+m\"(g)); return g; }", 42);
+	check("asm fixed registers",
+		"int main(){ unsigned a, d; asm(\"mul %%edx\" : \"=a\"(a), \"=d\"(d) : \"a\"(6), \"d\"(7)); return a; }", 42);
+	check("asm goto",
+		"int main(){ asm goto(\"jmp %l0\" : : : : out); return 1; out: return 42; }", 42);
+	check("naked function",
+		"__attribute__((naked)) int f(void){ asm(\"mov $42, %eax; ret\"); } int main(){ return f(); }", 42);
+	check("file scope asm",
+		"asm(\".globl f; f: mov $42, %eax; ret\"); int f(void); int main(){ return f(); }", 42);
+	check("register variable",
+		"int main(){ register long x asm(\"r9\") = 41; long r; asm(\"lea 1(%%r9), %0\" : \"=r\"(r) : \"r\"(x)); return r; }", 42);
+	check_compile_err("asm unsupported constraint", "int main(){ float f; asm(\"\" : \"=x\"(f)); return 0; }");
+	check_compile_err("asm output not lvalue", "int main(){ asm(\"\" : \"=r\"(1)); return 0; }");
+	check_compile_err("asm unknown operand name", "int main(){ int r; asm(\"mov %[nope], %0\" : \"=r\"(r)); return r; }");
+	check_compile_err("asm operand out of range", "int main(){ int r; asm(\"mov %3, %0\" : \"=r\"(r)); return r; }");
+	check_compile_err("asm operands at file scope", "asm(\"\" : : \"r\"(1)); int main(){ return 0; }");
+	check_compile_err("naked with C code", "__attribute__((naked)) int f(void){ return 1; } int main(){ return f(); }");
+	check_compile_err("asm clobbers rsp", "int main(){ asm(\"\" : : : \"rsp\"); return 0; }");
+	check_compile_err("asm bad instruction", "int main(){ asm(\"frob %eax\"); return 0; }");
+
+	section("objects and linking");
+	check_objects("call across objects",
+		"int f(int); int main(){ return f(40); }", "int f(int x){ return x + 2; }", 42);
+	check_objects("struct return across objects",
+		"struct s { long a, b; }; struct s f(void); int main(){ struct s v = f(); return v.a + v.b; }",
+		"struct s { long a, b; }; struct s f(void){ struct s v = { 40, 2 }; return v; }", 42);
+	check_objects("double across objects",
+		"double f(double, float); int main(){ return (int)f(40.5, 1.5f); }", "double f(double a, float b){ return a + b; }", 42);
+	check_objects("weak overridden",
+		"int f(void) __attribute__((weak)); int f(void){ return 1; } int main(){ return f(); }", "int f(void){ return 42; }", 42);
+	check_objects("tentative definitions merge",
+		"int n; int g(void); int main(){ n = 40; return g(); }", "int n; int g(void){ return n + 2; }", 42);
+	check_objects("global data across objects",
+		"extern int t[]; int main(){ return t[1]; }", "int t[] = { 1, 42, 3 };", 42);
+	check_link_err("multiple definition", "int f(void){ return 1; } int main(){ return f(); }", "int f(void){ return 2; }");
+	check_link_err("undefined reference", "int g(void); int main(){ return g(); }", "int h(void){ return 2; }");
+
+	section("linker scripts");
+#define BASIC_LD "SECTIONS { . = 0x500000 + SIZEOF_HEADERS; .text : { *(.text) } .rodata : { *(.rodata) } "
+	check_script("sections and symbols",
+		"extern char start_d[], end_d[]; int x = 5, y = 6; int main(){ return (end_d - start_d >= 8) + 41 * !((long)start_d & 0xFFF); }",
+		BASIC_LD ". = ALIGN(0x1000); .data : { start_d = .; *(.data) end_d = .; } .bss : { *(.bss) } }", 42);
+	check_script("PROVIDE gives an absolute symbol",
+		"extern char answer[]; int main(){ return (int)(long)answer; }",
+		BASIC_LD ".data : { *(.data) } .bss : { *(.bss) } PROVIDE(answer = 42); PROVIDE(unused = 1); }", 42);
+	check_script("data commands",
+		"extern unsigned char tbl[]; int main(){ return tbl[0] + tbl[1] + tbl[2]; }",
+		BASIC_LD ".data : { *(.data) tbl = .; BYTE(40) BYTE(2) BYTE(0) } .bss : { *(.bss) } }", 42);
+	check_script("SORT and KEEP build a table",
+		"__attribute__((section(\".t.2\"))) const int b = 2; __attribute__((section(\".t.1\"))) const int a = 40;"
+		"extern const int ts[], te[]; int main(){ return te - ts == 2 && ts[0] == 40 ? ts[0] + ts[1] : 1; }",
+		BASIC_LD ".tab : { ts = .; KEEP(*(SORT(.t.*))) te = .; } .data : { *(.data) } .bss : { *(.bss) } }", 42);
+	check_script("orphans follow their kind",
+		"__attribute__((section(\"mine\"))) int m = 42; int main(){ return m; }",
+		BASIC_LD ".data : { *(.data) } .bss : { *(.bss) } }", 42);
+	check_script_err("ASSERT fails", "int main(){ return 0; }", BASIC_LD "ASSERT(0, \"no\") }", 0);
+	check_script_err("undefined symbol in a script", "int main(){ return 0; }", BASIC_LD "x = nothing + 1; }", 0);
+	check_script_err("script syntax error", "int main(){ return 0; }", "SECTIONS { .text : { *(.text) ", 0);
+	check_script_err("unsupported command", "int main(){ return 0; }", "MEMORY { ram : ORIGIN = 0, LENGTH = 1M }", 0);
+	check_script_err("sections overlap", "int x = 1; int main(){ return x; }",
+		"SECTIONS { .text 0x500000 : { *(.text) } .data 0x500010 : { *(.data) } }", 0);
+	check_script_err("symbol in a discarded section", "const char *s = \"text\"; int main(){ return s[0]; }",
+		"SECTIONS { /DISCARD/ : { *(.rodata) } . = 0x500000; .text : { *(.text) } .data : { *(.data) } }", 0);
+	check_script_err("-T with -c", "int main(){ return 0; }", BASIC_LD "}", 1);
+	check_asm("conditional assembly",
+		"int f(void); int main(){ return f(); }",
+		"\t.set X, 3\n\t.globl f\nf:\n.if X - 3\n\tmov $1, %eax\n.elseif X\n.ifdef f\n\tmov $42, %eax\n.else\n\tmov $2, %eax\n.endif\n.else\n\tmov $3, %eax\n.endif\n\tret\n", 0, 42);
+	check_asm_err("missing .endif", ".if 1\n\tnop\n");
+
 	section("expected compile errors");
 	check_compile_err("undeclared var", "int main(){ return x; }");
 	check_compile_err("redeclare var", "int main(){ int x=1; int x=2; return x; }");
 	check_compile_err("break outside loop", "int main(){ break; return 0; }");
 	check_compile_err("continue outside loop","int main(){ continue; return 0; }");
+	check_compile_err("_Generic no match", "int main(){ return _Generic(1.0, int: 1); }");
+	check_compile_err("local aligned 64", "int main(){ int x __attribute__((aligned(64))) = 0; return x; }");
+	check_compile_err("alignment not 2^n", "int x __attribute__((aligned(12))); int main(){ return 0; }");
+	check_compile_err("alias of undefined", "int f(void) __attribute__((alias(\"g\"))); int main(){ return 0; }");
+	check_compile_err("section kind clash",
+		"int a __attribute__((section(\"s\"))) = 1; void f(void) __attribute__((section(\"s\"))); void f(void) {} int main(){ return 0; }");
+	check_compile_err("goto * integer", "int main(){ int x = 0; goto *x; }");
 
 	printf("\n");
 	printf("Results: %d passed, %d failed\n", g_pass, g_fail);
