@@ -20,7 +20,7 @@ sccc -ffreestanding [-mgeneral-regs-only] [-e sym] [-Ttext addr | -T script]
 
 A file whose name ends in *.s* is assembly, and one ending in *.S* is assembly that goes through the preprocessor first. A file ending in *.o* is a relocatable object and one ending in *.a* an archive of them, which are linked in. Every other file is C. *sccc* assembles AT&T syntax itself, in 16-bit, 32-bit, and 64-bit code, and C and assembly files on one command line share their symbols.
 
-With *-c* each C or assembly file becomes an object file instead, which *sccc* or another linker can link later. *sccc* follows the System V calling convention, so its objects and gcc's call each other in both directions. See OBJECT FILES AND LINKING. A GNU ld script given with *-T* controls the layout of the output, as kernels need. See LINKER SCRIPTS.
+With *-c* each C or assembly file becomes an object file instead, which *sccc* or another linker can link later. *sccc* follows the System V calling convention, so its objects and gcc's call each other in both directions. See OBJECT FILES AND LINKING. *-T* takes a linker script in the GNU ld language to control the layout of the output, as kernels need. See LINKER SCRIPTS.
 
 ## BUILDING
 
@@ -123,7 +123,7 @@ gcc -no-pie main.c part.o -o prog
 
 ## LINKER SCRIPTS
 
-*-T script* reads a GNU ld script. The inputs are compiled or loaded as usual, and the script decides where each of their sections goes. Every input section is placed whole: the `.text` of one C file, one section of an object, or a run of a named `@nobits` section in an assembly file. The supported subset:
+*-T script* reads a linker script in the GNU ld language. The inputs are compiled or loaded as usual, and the script decides where each of their sections goes. Every input section is placed whole: the `.text` of one C file, one section of an object, or a run of a named `@nobits` section in an assembly file. The supported subset:
 
 ```
 SECTIONS { ... }    output sections, assignments, and the commands below
