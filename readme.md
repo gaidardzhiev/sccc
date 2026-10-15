@@ -100,10 +100,33 @@ There is no install target and nothing else to install.
                  segment, without page alignment between them.
 -b format        Read the following inputs as binary (raw bytes)
                  or as elf64-x86-64 (or default), as GNU ld does.
--m elf_x86_64    The only emulation, accepted for GNU ld.
+-m emulation     elf_x86_64, the default, or elf_i386, which writes
+                 an ELF32 file from objects assembled with -m32 or
+                 -m16, as for the real-mode code of Linux.
+-r               Link the inputs into one relocatable object.
+-shared          Write a shared object (ET_DYN) with .dynsym,
+                 .dynstr, .hash, .gnu.hash, .dynamic, and the
+                 VERSION blocks of a script, as for the Linux vDSO.
+                 A link that needs dynamic relocations is an error.
+-m32, -m16       Assemble in 32-bit or 16-bit mode from the start of
+                 the file, and predefine the i386 macros.
+-mcmodel=kernel  Take addresses of symbols as sign-extended 32-bit
+                 immediates (R_X86_64_32S), for a kernel linked in
+                 the top 2 GB.
+-mno-sse         Do not save the XMM argument registers in variadic
+                 functions.
+-O, -O1 to -O3, -Os
+                 Fold constants, leave out code under constant
+                 conditions and after return, goto, break and
+                 continue, compile static functions only when they
+                 are used, and expand always_inline and small static
+                 functions in place, as Kbuild expects of gcc.  -O0
+                 turns this off.
 ```
 
-These gcc options are accepted and change nothing, because *sccc* already behaves that way or has nothing to change: `-fno-pic`, `-fno-PIC`, `-fno-pie`, `-fno-PIE`, `-static`, `-fno-builtin`, `-fno-strict-aliasing`, `-fno-omit-frame-pointer`, `-fno-stack-protector`, `-fcommon`, `-mno-red-zone`, `-mtls-direct-seg-refs`, `-mcmodel=kernel`, `-mcmodel=small`, `-m64`, `-O`, `-O0` to `-O3`, `-Os`, every `-g` option, every `-W` warning option, `-MD`, `-MMD`, `-pipe`, and `-Wa,-divide` (`/` is always division). `-MD` writes no dependency file.
+For Kbuild and other GNU makefiles, *sccc* also takes the gcc options `-E`, `-S` (which writes the inline assembly), `-x language`, `-include file`, `-isystem`, `-iquote`, `-idirafter`, `-std=c89`, `c99`, `c11`, `gnu89`, `gnu99`, `gnu11` (the `gnu` forms define `__GNUC__` as 4.9 and make `extern inline` GNU89's), `-ansi`, `-M`, `-MM`, `-MD`, `-MMD`, `-MF`, `-MT`, `-MQ`, `-MP`, `-Wp,` and `-Wa,` for the options above, `-print-file-name=`, `-dumpversion`, `-v` and `--version`, and the ld options `--whole-archive`, `--no-whole-archive`, `--start-group` and `--end-group` (also `-(` and `-)`), thin archives, `-z max-page-size=` and other `-z` keywords, `--build-id`, `--emit-relocs`, `-soname` (or `-h`), `-Map`, `-Bsymbolic`, `--hash-style=`, `--no-undefined`, `--gc-sections`, `--strip-debug`, `--eh-frame-hdr`, and `-q`. `-r` and `-shared` always imply *-nostdlib* and *-nodefaultlibs*, and the other ld options do when the inputs are only objects and archives. Without *-T*, `-shared` and `-m elf_i386` lay the output out with a built-in script.
+
+These gcc options are accepted and change nothing, because *sccc* already behaves that way or has nothing to change: `-fno-pic`, `-fno-PIC`, `-fno-pie`, `-fno-PIE`, `-static`, `-fno-builtin`, `-fno-strict-aliasing`, `-fno-omit-frame-pointer`, `-fno-stack-protector`, `-fcommon`, `-mno-red-zone`, `-mtls-direct-seg-refs`, `-mcmodel=small`, `-m64`, every `-g` option, every `-W` warning option, `-MD`, `-MMD`, `-pipe`, and `-Wa,-divide` (`/` is always division). `-MD` writes no dependency file.
 
 Any other argument beginning with a minus sign is an error.
 
@@ -114,7 +137,7 @@ Any other argument beginning with a minus sign is an error.
 Without *-c*, the inputs are linked in the order given: C and assembly files are compiled, objects are loaded, and an archive contributes only the members that define a symbol some earlier input references and nothing has defined yet, repeating within the archive until no more are needed. The built-in library comes last, unless *-nostdlib* is given, and a function in it gives way to one from the inputs. The linker resolves
 
 - a symbol defined in one file and used in another;
-- weak definitions, which give way to ordinary ones, and undefined weak references, which have the address 0;
+- weak definitions, which give way to ordinary ones, and undefined weak references, which have the address 0 and, as with ld, do not pull members out of an archive;
 - common symbols, which merge with each other and with an ordinary definition and otherwise get space in `.bss`;
 - `__start_name` and `__stop_name`, as under SECTIONS;
 - the GOT relocations of objects compiled with *-fPIC*, through a table in a section `.got`.
@@ -550,6 +573,28 @@ make xv6run
 
 or `tools/xv6run.sh [command]` fetches xv6-x86_64 with git into *xv6/* in this directory, once, at the commit that was tested (`XV6_URL` and `XV6_REV` choose another), builds the kernel and the file system image with *sccc* through xv6's own Makefile, with `CC`, `AS`, and `LD` set to *sccc*, and boots it in QEMU with `-kernel`. On a terminal the xv6 shell appears there, and Ctrl-a x quits QEMU. Otherwise it boots without a terminal, types *command* (`ls` by default) at the first prompt, prints what the console showed, and exits. The build log is *xv6/build.log*. *xv6/* is listed in *.gitignore*.
 
+## RUNNING LINUX
+
+```
+make linuxrun
+```
+
+or `tools/linuxrun.sh [stage]` builds Linux 5.4.302 with *sccc* and boots it. It downloads the tarball from kernel.org into *linux/* in this directory, once, and checks it against kernel.org's *sha256sums.asc* (`LINUX_VER` and `LINUX_DIR` choose another). It configures `tinyconfig` plus *tools/linux.config*, builds `vmlinux` through Kbuild with `CC`, `AS`, and `LD` set to *sccc* and `HOSTCC` to gcc, into *linux/build-sccc/* (`LINUX_OUT` chooses another), compiles *tools/linuxinit.c* with `-ffreestanding` into a static `/init`, and packs it into an initramfs with Kbuild's *gen_init_cpio*. It then boots `vmlinux` in QEMU through PVH, with KVM when */dev/kvm* is usable, first without the initramfs, where the kernel must print to the serial console and panic with "No working init found", and then with it, where `/init` must print from user space. *stage* stops early after `fetch`, `config`, `build`, or `init`. The logs are *sccc-config.log*, *sccc-build.log*, and *sccc-boot.log* in the build directory. A full run takes about a minute and a half on eight cores. It needs curl, make, gcc, bc, flex, bison, and QEMU. *linux/* is listed in *.gitignore*.
+
+## RUNNING BUSYBOX
+
+```
+make busyboxrun
+```
+
+or `tools/busyboxrun.sh [stage]` gives the *sccc* kernel a userspace. It downloads musl 1.2.5 and BusyBox 1.36.1 into *busybox/* in this directory, once, checking musl against its GPG signature (when gpg is installed) and a pinned sha256 and BusyBox against its published sha256, and fetches Linux like *tools/linuxrun.sh*. It builds musl with *sccc* into *busybox/musl*, installs the kernel's UAPI headers into *busybox/kheaders*, and builds BusyBox from `allnoconfig` plus *tools/busybox.config* with *tools/musl-sccc* as `CC`, a driver that compiles and links against that musl. It then builds the kernel from `tinyconfig`, *tools/linux.config* and *tools/linux-busybox.config* into *linux/build-busybox/*, packs BusyBox, its applet links, */etc/inittab* and an */etc/init.d/rcS* that mounts proc, sysfs, devtmpfs and tmpfs into an initramfs, and boots it in QEMU, with KVM when */dev/kvm* is usable. On a terminal the BusyBox shell appears there; `poweroff` ends the session and Ctrl-a x quits QEMU. Otherwise a scripted session runs `uname -a`, `ls /`, `cat /proc/meminfo`, `ps`, `mount`, arithmetic, a pipe, a here-document, a background job and a missing command, checks the output, and powers off. *stage* stops early after `fetch`, `musl`, `busybox`, `kernel`, or `initramfs`.
+
+```
+make busyboxcheck
+```
+
+runs the same without a terminal and also builds musl and BusyBox with gcc into *busybox/musl-gcc* and *busybox/bb-gcc*: *tools/musltest.c* built against each musl and *tools/bbtest.sh* run with each BusyBox must give the same output. It exits non-zero when a step fails. It needs curl, gcc, make, ar, bzip2 and QEMU, and takes a few minutes. *busybox/* is listed in *.gitignore*.
+
 ## RUNNING A KERNEL
 
 Build a kernel from *baremetal/* as a disk image:
@@ -759,6 +804,17 @@ tools/ldfuzz.py     compares linker scripts with GNU ld
 tools/xv6run.sh     fetches xv6-x86_64, builds it with sccc, boots it
 tools/xv6.sh        runs usertests on xv6 built by sccc and by gcc
 xv6/                xv6-x86_64, fetched by tools/xv6run.sh
+tools/linuxrun.sh   fetches Linux 5.4.302, builds it with sccc, boots it
+tools/linux.config  options added to tinyconfig for tools/linuxrun.sh
+tools/busyboxrun.sh builds musl, BusyBox and Linux with sccc, boots them
+tools/busybox.config  options added to allnoconfig for BusyBox
+tools/linux-busybox.config  kernel options for the BusyBox userspace
+tools/musl-sccc     compiles and links with sccc against musl
+tools/musltest.c    compares musl built by sccc and by gcc
+tools/bbtest.sh     compares BusyBox built by sccc and by gcc
+busybox/            musl, BusyBox and their builds, made by tools/busyboxrun.sh
+tools/linuxinit.c   the static /init that tools/linuxrun.sh boots
+linux/              Linux sources and builds, made by tools/linuxrun.sh
 test_sccc.c         exit status test harness
 tests/              language tests and expected output
 tests/link/         linking with gcc objects and archives
@@ -776,27 +832,25 @@ gcc(1), elf(5), syscall(2), qemu-system-x86_64(1), bochs(1)
 
 ## BUGS
 
-Variable length arrays are not supported.
+A variable length array cannot be declared inside a statement expression that is an operand of a larger expression, in a structure, or in a function's parameter list (there `T a[n]` is a pointer, and `T (*p)[n]` points to an incomplete array). A function that declares one or calls `alloca` is not inlined.
 
 K&R function definitions are not supported.
 
-Wide characters and wide strings are not supported.
+Wide character and wide string literals are supported; the built-in library has no wide character functions.
 
-`_Complex` is not supported.
+Complex types are `float`, `double` and `long double` only. Complex division uses the textbook formula, so it overflows sooner than gcc's `__divdc3` and differs for infinities and NaNs.
 
 A local variable may be aligned to at most 16 bytes, the alignment of the stack frame.
 
 In `[a ... b].m = e`, a range designator followed by a member designator, `e` is evaluated once for each element.
 
-Universal character names are not recognized. `'\u0041'` is accepted and is not `'A'`.
+Universal character names are recognized in character and string literals, not in identifiers.
 
 Trigraphs and digraphs are not recognized.
 
-The assembler has no `.macro`, `.rept`, or `.irp`; use the preprocessor in a *.S* file. `.if` needs a value known where it stands. It has no x87, AVX, or Intel syntax. `.set` needs a value or an address that is already defined. Expressions follow C precedence, which differs from GNU as for a few mixtures such as `a | b + c`. Code alignment uses one-byte `nop`s where GNU as uses longer ones. `jcxz`, `loop`, and the other branches with only an 8-bit form fail when the target is out of reach.
+`.if` needs a value known where it stands. The assembler has no AVX or Intel syntax. `.set` needs a value or an address that is already defined. Expressions follow C precedence, which differs from GNU as for a few mixtures such as `a | b + c`. `jcxz`, `loop`, and the other branches with only an 8-bit form fail when the target is out of reach.
 
-Inline assembly has no constraints for SSE or x87 registers and no `A`; a floating operand goes in a general register as raw bits. `asm goto` takes no outputs. Each register operand gets its own register, so a statement may run out of registers where gcc would share them. Numeric labels such as `1:` are local to one asm statement. An asm statement inside `sizeof` or `typeof` still leaves anything it put in other sections.
-
-`long double` is `double`.
+Inline assembly has no `A` constraint and no MMX operands; a floating operand under a general constraint goes in a general register as raw bits. An x87 input that the instruction pops must be declared by clobbering `st` or `st(1)`, as with gcc. `asm goto` takes no outputs. Each register operand gets its own register, so a statement may run out of registers where gcc would share them. Numeric labels such as `1:` are local to one asm statement. An asm statement inside `sizeof` or `typeof` still leaves anything it put in other sections.
 
 The math functions are not correctly rounded. `sqrt` can be one unit in the last place off. `sin`, `cos`, and `log` have absolute errors of about 1e-15, so their relative error is large near their zeros.
 
@@ -810,7 +864,7 @@ The *-I* directories are also searched when the built-in library is compiled. A 
 
 Input files after the 64th are ignored without a message. A 65th *-I* or *-D* is reported as an unknown argument.
 
-`long double` is passed as `double`, unlike gcc, which uses the x87 format in memory.
+A structure that contains a `long double` is returned through memory, where the ABI and gcc return it in `st(0)`.
 
 The linker does not run `.init_array`, `.fini_array`, or constructors, and does not support thread-local storage, shared libraries, or COMDAT groups. Symbols referenced only by files after an archive do not pull members from it, as with GNU ld.
 

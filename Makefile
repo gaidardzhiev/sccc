@@ -8,7 +8,7 @@ STAGE3=sccc3
 TESTC=test_sccc
 FLAGS=-std=c99 -pedantic -Wall -Wextra -O2
 
-.PHONY: all embed test bootstrap check examples baremetal ascheck link abifuzz ldscript ldfuzz xv6 xv6run fuzz clean
+.PHONY: all embed test bootstrap check examples baremetal ascheck link abifuzz ldscript ldfuzz xv6 xv6run linuxrun busyboxrun busyboxcheck fuzz clean
 
 all: $(BIN)
 
@@ -69,6 +69,15 @@ xv6: $(BIN)
 
 xv6run: $(BIN)
 	tools/xv6run.sh
+
+linuxrun: $(BIN)
+	tools/linuxrun.sh
+
+busyboxrun: $(BIN)
+	tools/busyboxrun.sh
+
+busyboxcheck: $(BIN)
+	BUSYBOX_CHECK=1 tools/busyboxrun.sh
 
 fuzz: $(BIN)
 	tools/fuzz_expr.py ./$(BIN) 50

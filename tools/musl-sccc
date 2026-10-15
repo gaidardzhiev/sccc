@@ -1,0 +1,21 @@
+#!/bin/sh
+# Copyright (C) 2026 Ivan Gaydardzhiev
+# Licensed under the GPL-3.0-only
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+SCCC=${SCCC:-$ROOT/sccc}
+MUSL=${MUSL:-$ROOT/busybox/musl}
+KHDR=${KHDR:-$ROOT/busybox/kheaders/include}
+
+link=1
+for a in "$@"; do
+	case "$a" in
+	-c|-E|-S|-M|-MM|-r|--relocatable|-shared) link=0 ;;
+	esac
+done
+
+if [ $link = 0 ]; then
+	exec "$SCCC" -nostdinc -isystem "$MUSL/include" -isystem "$KHDR" "$@"
+fi
+exec "$SCCC" -nostdinc -isystem "$MUSL/include" -isystem "$KHDR" -nostdlib -nostartfiles -L"$MUSL/lib" \
+	"$MUSL/lib/crt1.o" "$MUSL/lib/crti.o" "$@" "$MUSL/lib/libc.a" $MUSL_EXTRA "$MUSL/lib/crtn.o"

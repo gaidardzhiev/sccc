@@ -179,6 +179,50 @@ def corpus(mode):
     for op in ['bsf', 'bsr', 'popcnt', 'lzcnt', 'tzcnt']:
         for sz in [s for s in sizes if s > 1]:
             L += ['%s %%%s, %%%s' % (op, r.choice(regs(sz)), r.choice(regs(sz))), '%s %s, %%%s' % (op, r.choice(mems), r.choice(regs(sz)))]
+    for op in ['lsl', 'lar']:
+        for sz in [s for s in sizes if s > 1]:
+            L += ['%s %%%s, %%%s' % (op, r.choice(regs(2 if sz == 8 else sz)), r.choice(regs(sz))), '%s %s, %%%s' % (op, r.choice(mems), r.choice(regs(sz)))]
+    L += ['rdpid %%%s' % x for x in some(regs(8 if mode == 64 else 4), 4)]
+    for op in ['fnsave', 'fsave', 'frstor', 'fldenv', 'fnstenv', 'fstenv', 'fldcw', 'fnstcw', 'fstcw', 'fnstsw', 'fstsw']:
+        for m in some(mems, 2): L.append('%s %s' % (op, m))
+    for op in ['fadd', 'fmul', 'fcom', 'fcomp', 'fsub', 'fsubr', 'fdiv', 'fdivr', 'fld', 'fst', 'fstp', 'fist', 'fistp']:
+        for sfx in ['s', 'l']:
+            if op in ('fist', 'fistp') and sfx == 's': continue
+            if op in ('fist', 'fistp'): L.append('%s%s %s' % (op, sfx, r.choice(mems)))
+            else: L.append('%s%s %s' % (op, sfx, r.choice(mems)))
+    L += ['fldt %s' % r.choice(mems), 'fstpt %s' % r.choice(mems), 'fildl %s' % r.choice(mems), 'filds %s' % r.choice(mems),
+          'fildll %s' % r.choice(mems), 'fistpll %s' % r.choice(mems), 'fldz', 'fld1', 'stgi', 'clgi', 'emms']
+    for op in ['faddp', 'fmulp', 'fsubp', 'fsubrp', 'fdivp', 'fdivrp']:
+        L += ['%s %%st, %%st(%d)' % (op, r.randrange(8)), op]
+    L += ['fld %%st(%d)' % r.randrange(8), 'fstp %%st(%d)' % r.randrange(8), 'fxch %%st(%d)' % r.randrange(8), 'fxch']
+    L += ['f2xm1', 'fabs', 'fchs', 'fcompp', 'fcos', 'fdecstp', 'fincstp', 'fldl2t', 'fldl2e', 'fldpi', 'fldlg2', 'fldln2',
+          'fnop', 'fpatan', 'fprem', 'fprem1', 'fptan', 'frndint', 'fscale', 'fsin', 'fsincos', 'fsqrt', 'ftst', 'fucompp',
+          'fxam', 'fxtract', 'fyl2x', 'fyl2xp1']
+    for op in ['fadd', 'fmul', 'fsub', 'fsubr', 'fdiv', 'fdivr']:
+        i = r.randrange(8)
+        L += ['%s %%st(%d), %%st' % (op, i), '%s %%st, %%st(%d)' % (op, r.randrange(8)), '%s %%st(%d)' % (op, r.randrange(8))]
+    for op in ['fst', 'ffree', 'fucom', 'fucomp', 'fcom', 'fcomp']:
+        L.append('%s %%st(%d)' % (op, r.randrange(8)))
+    L += ['fucom', 'fucomp', 'fcom', 'fcomp']
+    for op in ['fcomi', 'fucomi', 'fcomip', 'fucomip', 'fcmovb', 'fcmove', 'fcmovbe', 'fcmovu', 'fcmovnb', 'fcmovne',
+               'fcmovnbe', 'fcmovnu']:
+        L.append('%s %%st(%d), %%st' % (op, r.randrange(8)))
+    L += ['fucomip', 'fcomip']
+    for op in ['fiadd', 'fimul', 'ficom', 'ficomp', 'fisub', 'fisubr', 'fidiv', 'fidivr']:
+        for sfx in ['s', 'l']: L.append('%s%s %s' % (op, sfx, r.choice(mems)))
+    L += ['%s %s' % (op, r.choice(mems)) for op in ['fists', 'fistps', 'fisttps', 'fisttpl', 'fisttpll', 'fbld', 'fbstp']]
+    for op in ['pcmpeqb', 'pcmpeqw', 'pcmpeqd', 'pcmpgtb', 'pcmpgtw', 'pcmpgtd', 'psrlw', 'psrld', 'psrlq', 'psraw', 'psrad',
+               'psllw', 'pslld', 'psllq']:
+        L += ['%s %%xmm%d, %%xmm%d' % (op, r.randrange(16), r.randrange(16)), '%s %s, %%xmm%d' % (op, r.choice(mems), r.randrange(16))]
+    for op in ['psrlw', 'psrld', 'psrlq', 'psraw', 'psrad', 'psllw', 'pslld', 'psllq', 'psrldq', 'pslldq']:
+        L.append('%s $%d, %%xmm%d' % (op, r.randrange(64), r.randrange(16)))
+    L += ['pmovmskb %%xmm%d, %%e%s' % (r.randrange(16), x) for x in ['ax', 'cx', 'di']]
+    L += ['fnstsw %ax', 'fstsw %ax', 'fninit', 'finit', 'fnclex', 'fclex', 'fwait', 'wait', 'vmcall', 'vmmcall',
+          'vmlaunch', 'vmresume', 'vmxoff']
+    for sz in [s for s in sizes if s > 2]:
+        L += ['movnti %%%s, %s' % (r.choice(regs(sz)), m) for m in some(mems, 2)]
+    for op in ['prefetchnta', 'prefetcht0', 'prefetcht1', 'prefetcht2', 'prefetch', 'prefetchw']:
+        for m in some(mems, 2): L.append('%s %s' % (op, m))
     for op in ['xadd', 'cmpxchg']:
         for sz in sizes:
             L += ['%s %%%s, %%%s' % (op, r.choice(regs(sz)), r.choice(regs(sz))), '%s %%%s, %s' % (op, r.choice(regs(sz)), r.choice(mems))]

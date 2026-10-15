@@ -77,9 +77,21 @@ static void le64(uint8_t *p, uint64_t x) { for(int i=0;i<8;i++) p[i]=(uint8_t)(x
 
 static size_t align_up(size_t x, size_t a) { return (x + a - 1) / a * a; }
 
+static char *read_stream(FILE *f) {
+	Buf b; buf_init(&b);
+	char tmp[65536];
+	size_t n;
+	while ((n = fread(tmp, 1, sizeof(tmp), f)) > 0) buf_append(&b, tmp, n);
+	buf_append_byte(&b, 0);
+	return (char *)b.data;
+}
+
 static char *read_file(const char *path) {
+	if (!strcmp(path, "-")) return read_stream(stdin);
 	FILE *f = fopen(path, "rb");
 	if (!f) { perror(path); exit(1); }
+	struct stat st;
+	if (stat(path, &st) == 0 && !S_ISREG(st.st_mode)) { char *s = read_stream(f); fclose(f); return s; }
 	fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
 	char *s = (char *)malloc(n + 1);
 	if (!s) { perror("malloc"); exit(1); }
@@ -147,12 +159,13 @@ typedef enum {
 	T_HASH = '#',
 	T_DOLLAR = '$',
 	T_AT = '@',
+	T_BSLASH = '\\',
 	T_INT = 256, T_RETURN, T_IF, T_ELSE, T_WHILE, T_BREAK, T_CONTINUE,
 	T_CHAR, T_SHORT, T_LONG, T_SIGNED, T_UNSIGNED, T_VOID, T_BOOL,
 	T_STRUCT, T_UNION, T_ENUM, T_TYPEDEF, T_STATIC, T_EXTERN,
 	T_CONST, T_VOLATILE, T_INLINE, T_REGISTER, T_AUTO, T_RESTRICT,
 	T_SIZEOF, T_FOR, T_DO, T_SWITCH, T_CASE, T_DEFAULT, T_GOTO,
-	T_FLOAT, T_DOUBLE, T_TYPEOF, T_ALIGNOF, T_ALIGNAS, T_NORETURN, T_GENERIC, T_THREAD,
+	T_FLOAT, T_DOUBLE, T_TYPEOF, T_ALIGNOF, T_ALIGNAS, T_NORETURN, T_GENERIC, T_THREAD, T_COMPLEX,
 	T_EQ, T_NEQ, T_LEQ, T_GEQ,
 	T_AND,
 	T_OR,
@@ -186,6 +199,11 @@ typedef struct {
 	void *hide;
 	int attrs;
 	Attr *attr;
+	const char *raw;
+	int rawlen;
+	int badnum;
+	int wide;
+	int imag;
 } Tok;
 
 typedef struct {
@@ -195,6 +213,7 @@ typedef struct {
 	const char *file;
 	int bol, space;
 	int as;
+	size_t tstart;
 } Lex;
 
 static const char *kw_names[] = {
@@ -206,6 +225,7 @@ static const char *kw_names[] = {
 	"float", "double", "typeof", "_Alignof", "_Alignas", "_Noreturn", "_Generic", "_Thread_local",
 	"__inline", "__restrict", "__const", "__signed__", "__inline__", "__restrict__",
 	"__typeof__", "__typeof", "__alignof__", "__alignof", "__signed", "__volatile", "__thread",
+	"_Complex", "__complex__",
 	NULL
 };
 static const int kw_kinds[] = {
@@ -217,6 +237,7 @@ static const int kw_kinds[] = {
 	T_FLOAT, T_DOUBLE, T_TYPEOF, T_ALIGNOF, T_ALIGNAS, T_NORETURN, T_GENERIC, T_THREAD,
 	T_INLINE, T_RESTRICT, T_CONST, T_SIGNED, T_INLINE, T_RESTRICT,
 	T_TYPEOF, T_TYPEOF, T_ALIGNOF, T_ALIGNOF, T_SIGNED, T_VOLATILE, T_THREAD,
+	T_COMPLEX, T_COMPLEX,
 	0
 };
 
@@ -235,7 +256,7 @@ static int lex_asm;
 static void skip_ws(Lex *L) {
 	while (L->i < L->n) {
 		char c = L->s[L->i];
-		if (c=='#' && (L->as == 2 || (L->as == 1 && !L->bol))) {
+		if (c=='#' && (L->as == 2 || ((L->as == 1 || L->as == 3) && !L->bol))) {
 			while (L->i<L->n && L->s[L->i]!='\n') L->i++;
 			L->space = 1; continue;
 		}
@@ -291,9 +312,90 @@ static int lex_escape(Lex *L) {
 	return c;
 }
 
+static int lex_ucn(Lex *L) {
+	int n = L->s[L->i++] == 'u' ? 4 : 8, v = 0;
+	for (int k = 0; k < n && L->i < L->n && isxdigit((unsigned char)L->s[L->i]); k++) v = v * 16 + hexval(L->s[L->i++]);
+	return v;
+}
+
+static int lex_utf8(Lex *L) {
+	int c = (unsigned char)L->s[L->i++], n = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
+	int v = n ? c & (0x3F >> n) : c;
+	for (int k = 0; k < n && L->i < L->n && ((unsigned char)L->s[L->i] & 0xC0) == 0x80; k++) v = v << 6 | (L->s[L->i++] & 0x3F);
+	return v;
+}
+
+static void put_utf8(Buf *b, int v) {
+	if (v < 0x80) { buf_append_byte(b, (uint8_t)v); return; }
+	if (v < 0x800) { buf_append_byte(b, (uint8_t)(0xC0 | v >> 6)); }
+	else {
+		if (v < 0x10000) buf_append_byte(b, (uint8_t)(0xE0 | v >> 12));
+		else { buf_append_byte(b, (uint8_t)(0xF0 | v >> 18)); buf_append_byte(b, (uint8_t)(0x80 | (v >> 12 & 0x3F))); }
+		buf_append_byte(b, (uint8_t)(0x80 | (v >> 6 & 0x3F)));
+	}
+	buf_append_byte(b, (uint8_t)(0x80 | (v & 0x3F)));
+}
+
+static int wide_size(int w) { return w == 'L' || w == 'U' ? 4 : w == 'u' ? 2 : 1; }
+
+static void put_wide(Buf *b, int w, int v) {
+	int n = wide_size(w);
+	if (n == 1) { buf_append_byte(b, (uint8_t)v); return; }
+	if (n == 2 && v >= 0x10000) { put_wide(b, w, 0xD800 + ((v - 0x10000) >> 10)); v = 0xDC00 + ((v - 0x10000) & 0x3FF); }
+	for (int i = 0; i < n; i++) buf_append_byte(b, (uint8_t)(v >> (8 * i)));
+}
+
+static int lex_wide(Lex *L, Tok *t, int w) {
+	char q = L->s[L->i];
+	L->i++;
+	if (q == '\'') {
+		int v = 0;
+		while (L->i < L->n && L->s[L->i] != '\'') {
+			if (L->s[L->i] == '\\' && L->i + 1 < L->n && (L->s[L->i+1] == 'u' || L->s[L->i+1] == 'U')) { L->i++; v = lex_ucn(L); }
+			else if (L->s[L->i] == '\\') { L->i++; v = lex_escape(L); }
+			else v = lex_utf8(L);
+		}
+		if (L->i >= L->n) lex_error(L, "unterminated character literal");
+		L->i++;
+		t->kind = T_NUM;
+		t->val = w == 'u' ? (v & 0xFFFF) : w == '8' ? (signed char)v : v;
+		t->is_unsigned = w == 'U';
+		return 1;
+	}
+	Buf b; buf_init(&b);
+	while (L->i < L->n && L->s[L->i] != '"') {
+		if (L->s[L->i] == '\n') lex_error(L, "unterminated string literal");
+		int v, raw = 0;
+		if (L->s[L->i] == '\\' && L->i + 1 < L->n && (L->s[L->i+1] == 'u' || L->s[L->i+1] == 'U')) { L->i++; v = lex_ucn(L); }
+		else if (L->s[L->i] == '\\') { L->i++; v = lex_escape(L); raw = 1; }
+		else v = wide_size(w) == 1 ? (unsigned char)L->s[L->i++] : lex_utf8(L);
+		if (wide_size(w) == 1 && !raw && v >= 0x80 && L->s[L->i - 1] != (char)v) put_utf8(&b, v);
+		else put_wide(&b, w, v);
+	}
+	if (L->i >= L->n) lex_error(L, "unterminated string literal");
+	L->i++;
+	for (int i = 0; i < wide_size(w); i++) buf_append_byte(&b, 0);
+	t->kind = T_STR; t->str = (char *)b.data; t->len = (int)b.len - wide_size(w);
+	t->wide = w == '8' ? 0 : w;
+	return 1;
+}
+
+static int lex_dots(Lex *L, size_t i) {
+	return i + 2 < L->n && L->s[i] == '.' && L->s[i+1] == '.' && L->s[i+2] == '.';
+}
+
+static Tok lex_next1(Lex *L);
+
 static Tok lex_next(Lex *L) {
+	Tok t = lex_next1(L);
+	if (t.kind != T_EOF) { t.raw = L->s + L->tstart; t.rawlen = (int)(L->i - L->tstart); }
+	return t;
+}
+
+static Tok lex_next1(Lex *L) {
 	L->space = 0;
 	skip_ws(L);
+	L->tstart = L->i;
 	Tok t;
 	memset(&t, 0, sizeof(t));
 	t.kind = T_EOF;
@@ -315,10 +417,16 @@ static Tok lex_next(Lex *L) {
 		}
 	}
 
+	if (!L->as && (c == 'L' || c == 'u' || c == 'U') && L->i + 1 < L->n) {
+		char c1 = L->s[L->i + 1];
+		if (c1 == '\'' || c1 == '"') { L->i++; lex_wide(L, &t, c); return t; }
+		if (c == 'u' && c1 == '8' && L->i + 2 < L->n && L->s[L->i + 2] == '"') { L->i += 2; lex_wide(L, &t, '8'); return t; }
+	}
+
 	if (isalpha((unsigned char)c) || c=='_' || (c=='$' && !L->as) ||
-		(c=='.' && L->as && !(L->i+1<L->n && isdigit((unsigned char)L->s[L->i+1])))) {
+		(c=='.' && L->as && !(L->i+1<L->n && isdigit((unsigned char)L->s[L->i+1])) && !lex_dots(L, L->i))) {
 		size_t j=L->i;
-		while (j<L->n && (isalnum((unsigned char)L->s[j]) || L->s[j]=='_' || (L->s[j]=='$' && !L->as) || (L->s[j]=='.' && L->as))) j++;
+		while (j<L->n && (isalnum((unsigned char)L->s[j]) || L->s[j]=='_' || (L->s[j]=='$' && !L->as) || (L->s[j]=='.' && L->as && !lex_dots(L, j)))) j++;
 		Str *e = intern_str(L->s+L->i, (int)(j-L->i));
 		t.kind = e->kw && !L->as ? (TKind)e->kw : T_IDENT;
 		t.str = e->s;
@@ -355,9 +463,11 @@ static Tok lex_next(Lex *L) {
 			buf[len] = 0;
 			char *end;
 			t.fval = strtod(buf, &end);
+			if (*end == 'i' || *end == 'I' || *end == 'j' || *end == 'J') { t.imag = 1; end++; }
 			if (*end == 'f' || *end == 'F') { t.is_float = 1; end++; }
-			else if (*end == 'l' || *end == 'L') end++;
-			if (*end) lex_error(L, "invalid floating constant");
+			else if (*end == 'l' || *end == 'L') { t.is_long = 1; end++; }
+			if (!t.imag && (*end == 'i' || *end == 'I' || *end == 'j' || *end == 'J')) { t.imag = 1; end++; }
+			if (*end) t.badnum = 1;
 			t.kind = T_FNUM;
 			L->i = j;
 			return t;
@@ -383,7 +493,7 @@ static Tok lex_next(Lex *L) {
 			else if (d=='l' || d=='L') { l++; L->i++; }
 			else break;
 		}
-		if (L->i != j) lex_error(L, "invalid number literal");
+		if (L->i != j) { L->i = j; t.kind = T_NUM; t.badnum = 1; return t; }
 		if (!l && !u) {
 			if (v > 0x7fffffffULL) {
 				if (base != 10 && v <= 0xffffffffULL) u = 1;
@@ -463,7 +573,7 @@ static Tok lex_next(Lex *L) {
 	else if (c=='^'&&c2=='=') k2=T_XOR_ASSIGN;
 	if (k2 != T_EOF) { L->i+=2; t.kind=k2; return t; }
 
-	if (strchr("(){}[];,.+-*/%=<>!~&|^?:#", c) || (L->as && (c=='$' || c=='@'))) {
+	if (strchr("(){}[];,.+-*/%=<>!~&|^?:#\\", c) || (L->as && (c=='$' || c=='@'))) {
 		L->i++; t.kind = (TKind)c; return t;
 	}
 	fprintf(stderr,"%s:%d: error: unexpected character '%c'\n", L->file, L->line, c);
@@ -476,7 +586,7 @@ static void lex_init(Lex *L, const char *src, const char *file) {
 }
 
 typedef enum {
-	TY_VOID, TY_BOOL, TY_CHAR, TY_SHORT, TY_INT, TY_LONG, TY_FLOAT, TY_DOUBLE,
+	TY_VOID, TY_BOOL, TY_CHAR, TY_SHORT, TY_INT, TY_LONG, TY_FLOAT, TY_DOUBLE, TY_LDOUBLE, TY_COMPLEX,
 	TY_PTR, TY_ARRAY, TY_FUNC, TY_STRUCT
 } TyKind;
 
@@ -487,7 +597,7 @@ typedef struct Param Param;
 struct Member {
 	char *name;
 	Type *ty;
-	int off;
+	int off, flat;
 	Member *next;
 };
 
@@ -515,11 +625,13 @@ struct Type {
 	int bit_off;
 	int bit_unit;
 	Type *origin;
+	int vla;
+	Type *cplx;
 };
 
 static Type *ty_void, *ty_bool, *ty_char, *ty_uchar, *ty_short, *ty_ushort;
-static Type *ty_int, *ty_uint, *ty_long, *ty_ulong, *ty_float, *ty_double;
-static Type *ty_schar, *ty_llong, *ty_ullong;
+static Type *ty_int, *ty_uint, *ty_long, *ty_ulong, *ty_float, *ty_double, *ty_ldouble;
+static Type *ty_schar, *ty_llong, *ty_ullong, *ty_va_list;
 
 static Type *new_type(TyKind kind, int size, int align) {
 	Type *t = (Type *)calloc(1, sizeof(Type));
@@ -550,6 +662,7 @@ static void types_init(void) {
 	ty_float = new_type(TY_FLOAT, 4, 4);
 	ty_float->is_unsigned = 1;
 	ty_double = new_type(TY_DOUBLE, 8, 8);
+	ty_ldouble = new_type(TY_LDOUBLE, 16, 16);
 }
 
 static Type *ptr_to(Type *base) {
@@ -587,8 +700,19 @@ static Type *bitfield_of(Type *base, int width, int off) {
 
 static int is_integer(Type *t) { return t->kind >= TY_BOOL && t->kind <= TY_LONG; }
 static int is_ptr(Type *t) { return t->kind == TY_PTR; }
-static int is_flonum(Type *t) { return t->kind == TY_FLOAT || t->kind == TY_DOUBLE; }
+static int is_flonum(Type *t) { return t->kind == TY_FLOAT || t->kind == TY_DOUBLE || t->kind == TY_LDOUBLE; }
 static int is_arith(Type *t) { return is_integer(t) || is_flonum(t); }
+static int is_complex(Type *t) { return t->kind == TY_COMPLEX; }
+
+static Type *complex_of(Type *b) {
+	if (b->origin) b = b->origin;
+	if (b->cplx) return b->cplx;
+	Type *t = new_type(TY_COMPLEX, 2 * b->size, b->align);
+	t->base = b;
+	t->complete = 1;
+	b->cplx = t;
+	return t;
+}
 static int is_scalar(Type *t) { return is_arith(t) || is_ptr(t); }
 
 static Type *canon(Type *t) {
@@ -627,6 +751,8 @@ static Type *int_promote(Type *t) {
 }
 
 static Type *arith_conv(Type *a, Type *b) {
+	if (a->kind == TY_COMPLEX || b->kind == TY_COMPLEX) return complex_of(arith_conv(a->kind == TY_COMPLEX ? a->base : a, b->kind == TY_COMPLEX ? b->base : b));
+	if (a->kind == TY_LDOUBLE || b->kind == TY_LDOUBLE) return ty_ldouble;
 	if (a->kind == TY_DOUBLE || b->kind == TY_DOUBLE) return ty_double;
 	if (a->kind == TY_FLOAT || b->kind == TY_FLOAT) return ty_float;
 	a = int_promote(a); b = int_promote(b);
@@ -667,7 +793,7 @@ struct Sym {
 	int interrupt;
 	int naked;
 	int align;
-	int weak, weak_unit, weak_def;
+	int weak, weak_unit, weak_def, strong_ref, strong_unit, strong_multi, twice;
 	char *alias_name;
 	Sym *alias;
 	char *section;
@@ -685,8 +811,56 @@ struct Sym {
 	int ld_out;
 	int piece;
 	int tls;
+	Tok *body;
+	int nbody, always;
+	Sym *gsame;
+	int asm_alias, indirect, inline_only, gregvar, small, kv_valid, addr_taken, noinline, is_inline, used_attr, live, bound;
+	long long kv;
 	Sym *gnext;
 };
+
+typedef struct {
+	char **k;
+	Sym **v;
+	int cap, n;
+} SymMap;
+
+static unsigned symmap_hash(char *k) {
+	uint64_t x = (uint64_t)(uintptr_t)k;
+	x ^= x >> 29;
+	x *= 0x9E3779B97F4A7C15ULL;
+	return (unsigned)(x >> 32);
+}
+
+static Sym *symmap_get(SymMap *m, char *k) {
+	if (!m->cap) return NULL;
+	for (unsigned i = symmap_hash(k) & (unsigned)(m->cap - 1);; i = (i + 1) & (unsigned)(m->cap - 1)) {
+		if (!m->k[i]) return NULL;
+		if (m->k[i] == k) return m->v[i];
+	}
+}
+
+static void symmap_put(SymMap *m, char *k, Sym *v) {
+	if ((m->n + 1) * 2 > m->cap) {
+		SymMap o = *m;
+		m->cap = o.cap ? o.cap * 2 : 1024;
+		m->k = (char **)calloc((size_t)m->cap, sizeof(char *));
+		m->v = (Sym **)calloc((size_t)m->cap, sizeof(Sym *));
+		m->n = 0;
+		if (!m->k || !m->v) { perror("calloc"); exit(1); }
+		for (int i = 0; i < o.cap; i++) if (o.k[i]) symmap_put(m, o.k[i], o.v[i]);
+		free(o.k);
+		free(o.v);
+	}
+	unsigned i = symmap_hash(k) & (unsigned)(m->cap - 1);
+	while (m->k[i] && m->k[i] != k) i = (i + 1) & (unsigned)(m->cap - 1);
+	if (!m->k[i]) { m->k[i] = k; m->n++; }
+	m->v[i] = v;
+}
+
+static void symmap_clear(SymMap *m) {
+	if (m->cap) { memset(m->k, 0, sizeof(char *) * (size_t)m->cap); m->n = 0; }
+}
 
 typedef struct Tag Tag;
 struct Tag {
@@ -696,9 +870,16 @@ struct Tag {
 	Tag *next;
 };
 
+typedef struct {
+	size_t pos;
+	int nrel, sp;
+} Mark;
+
 typedef struct LoopCtx LoopCtx;
 struct LoopCtx {
-	int is_switch;
+	int is_switch, kconst, matched, kdead, tentative, depth;
+	long long kval;
+	Mark tmark;
 	long cont_target;
 	Patches breaks;
 	Patches conts;
@@ -708,7 +889,35 @@ struct LoopCtx {
 	size_t *case_pos;
 	int ncase, capcase;
 	long default_pos;
+	size_t body;
+	int vla_mark;
 	LoopCtx *parent;
+};
+
+typedef struct LLab LLab;
+struct LLab {
+	char *name, *real;
+	int depth;
+	LLab *next;
+};
+
+typedef struct AsMacro AsMacro;
+struct AsMacro {
+	char *name;
+	int n;
+	char **pname, **pdef;
+	int *req, *vararg;
+	char *body;
+	AsMacro *next;
+};
+
+typedef struct Inl Inl;
+struct Inl {
+	Sym *fn;
+	Type *ret;
+	Patches rets;
+	int id, tmp, dead_base;
+	Inl *up;
 };
 
 typedef struct {
@@ -849,6 +1058,13 @@ static void emit_add_rax_imm(Code *c, long long n) {
 	if (n == 0) return;
 	if (n >= -2147483647LL - 1 && n <= 2147483647LL) { C8(c,0x48); C8(c,0x05); C32(c,(uint32_t)n); }
 	else { emit_mov_rcx_imm64(c, (uint64_t)n); emit_add_rax_rcx(c); }
+}
+
+static void emit_scale(Code *c, int reg, int n);
+
+static void scale_by(Code *c, int reg, Type *t) {
+	if (!t->vla) { emit_scale(c, reg, t->size); return; }
+	enc_rex(c, 1, reg, 0, RBP, 0); C8(c,0x0F); C8(c,0xAF); enc_mem(c, reg, RBP, -1, 1, t->vla, 1, 0);
 }
 
 static void emit_scale(Code *c, int reg, int n) {
@@ -1022,24 +1238,21 @@ typedef struct {
 
 typedef struct Ld Ld;
 
-typedef struct {
-	size_t pos;
-	int nrel, sp;
-} Mark;
-
 typedef struct Label Label;
 struct Label {
 	char *name;
 	long pos;
 	Patches patches;
 	Patches abs;
+	Patches xrel;
+	int seen;
 	Label *next;
 };
 
 typedef struct {
 	Sym *sym;
 	Type *ty;
-	int frame;
+	int frame, frame_max;
 	size_t frame_patch;
 	int ret_off;
 	int named_gp;
@@ -1104,7 +1317,34 @@ typedef struct {
 	int in_libc;
 	int nostdlib;
 	int freestanding;
-	int nostart, nostdinc, no_common, omagic;
+	int nostart, nostdinc, no_common, omagic, gnu, fold;
+	int sizeof_vla, nvla, vla_slots[64], vla_block, dead_jdepth, next_jdepth, pack, npack, packs[16];
+	size_t k_start, k_end;
+	long long k_val;
+	int k_nrel, dead, cond_depth, revived;
+	Inl *inl;
+	LLab *llabs;
+	AsMacro *as_macros;
+	int as_mcount;
+	SymMap fsmap, gmap;
+	Sym *gidx_head;
+	int inl_count, inl_depth, decl_inline, nllab, decl_register, name_attrs, xcond, noasm, dead_x, sx_depth, dead_sx, fn_depth, sidefx, jumped, swbody;
+	Sym *lv_local;
+	size_t lv_start;
+	struct Attr *name_attr;
+	size_t dk_start, dk_end;
+	long long dk_val;
+	int dk_nrel, k_ice, dk_ice;
+	size_t revive_jmp[64];
+	int revive_at[64], nrevive;
+	Mark dead_mark;
+	const char *includes[64];
+	int nincludes;
+	const char *undefs[64];
+	int nundefs;
+	const char **deps;
+	int ndeps, capdeps, track_deps;
+	Buf *asm_text;
 	int binary;
 	int image;
 	int multiboot;
@@ -1143,7 +1383,15 @@ typedef struct {
 	size_t fn_lea_end;
 	Sym *fn_lea_sym;
 	Patches init_patches;
-	int in_pp_if;
+	int in_pp_if, counter, ofs_rt, ofs_have, ginit, ncl, emit_relocs, m32, elf32, shared, gnu89, kmodel, no_sse;
+	const char *soname, *map;
+	struct DynSym { Sym *s; int ver; uint32_t gh; uint32_t name; } *dyn;
+	int ndyn, dsec[7];
+	uint32_t dyn_nbucket, dyn_gnb, dyn_soname, *dyn_vname;
+	Buf dynstr;
+	uint64_t max_page;
+	struct PendCL { Sym *g; TokVec v; } *cl;
+	int capcl;
 	int pp_bol;
 	Buf text_home;
 	size_t lv_end;
@@ -1163,11 +1411,11 @@ typedef struct {
 static const char *find_builtin_header(const char *name);
 static const char *builtin_libc_src(void);
 
-static char *id_va_arg;
+static char *id_va_arg, *id_va_end, *id_va_copy, *id_va_list;
 static char *id_main, *id_syscall, *id_va_start, *id_exit, *id_libc_init, *id_environ;
-enum { ATTR_INTERRUPT = 1, ATTR_PACKED = 2, ATTR_WEAK = 4, ATTR_NAKED = 8 };
+enum { ATTR_INTERRUPT = 1, ATTR_PACKED = 2, ATTR_WEAK = 4, ATTR_NAKED = 8, ATTR_ALWAYS_INLINE = 16, ATTR_USED = 32, ATTR_GNU_INLINE = 64, ATTR_NOINLINE = 128, ATTR_TWICE = 256 };
 static char *id_attribute, *id_attribute2, *id_interrupt, *id_packed, *id_aligned, *id_weak, *id_alias, *id_section;
-static char *id_defined, *id_file, *id_line, *id_va_args, *id_func, *id_function, *id_static_assert;
+static char *id_defined, *id_file, *id_line, *id_counter, *id_va_args, *id_func, *id_function, *id_static_assert;
 static char *id_asm, *id_asm2, *id_asm3, *id_naked;
 static char *id_expect, *id_constant_p, *id_types_compatible_p, *id_choose_expr, *id_offsetof, *id_unreachable, *id_trap;
 static char *id_return_address, *id_frame_address;
@@ -1239,6 +1487,18 @@ static void push_file(Ctx *ctx, const char *text, const char *path, int is_built
 	if (depth > 64) { fprintf(stderr, "%s: error: #include nested too deeply\n", path); exit(1); }
 	Src *s = (Src *)calloc(1, sizeof(Src));
 	s->is_file = 1;
+	if (ctx->track_deps && !is_builtin) {
+		char *ip = intern(path);
+		int seen = 0;
+		for (int i = 0; i < ctx->ndeps && !seen; i++) seen = ctx->deps[i] == ip;
+		if (!seen) {
+			if (ctx->ndeps == ctx->capdeps) {
+				ctx->capdeps = ctx->capdeps ? ctx->capdeps * 2 : 64;
+				ctx->deps = (const char **)realloc(ctx->deps, sizeof(char *) * ctx->capdeps);
+			}
+			ctx->deps[ctx->ndeps++] = ip;
+		}
+	}
 	lex_init(&s->L, text, intern(path));
 	s->dir = is_builtin ? NULL : dir_of(path);
 	s->ncond = ctx->ncond;
@@ -1393,6 +1653,11 @@ static void pp_define(Ctx *ctx, Lex *sub) {
 				if (m->nparams >= 127) pp_error(ctx, sub, "too many macro parameters", NULL);
 				params[m->nparams++] = t.str;
 				t = lex_next(sub);
+				if (t.kind == T_ELLIPSIS) {
+					m->variadic = 1;
+					t = lex_next(sub);
+					break;
+				}
 				if (t.kind != T_COMMA) break;
 				t = lex_next(sub);
 			}
@@ -1413,6 +1678,7 @@ static void pp_define(Ctx *ctx, Lex *sub) {
 static void pp_define_str(Ctx *ctx, const char *def) {
 	Lex sub;
 	lex_init(&sub, def, "<command line>");
+	if (sub.as) sub.as = 4;
 	pp_define(ctx, &sub);
 }
 
@@ -1435,7 +1701,7 @@ static long long pp_eval(Ctx *ctx, Lex *sub) {
 			int paren = a.kind == T_LP;
 			if (paren) a = lex_next(sub);
 			if (!a.id) pp_error(ctx, sub, "macro name expected after 'defined'", NULL);
-			int def = a.id->macro != NULL || a.str == id_file || a.str == id_line;
+			int def = a.id->macro != NULL || a.str == id_file || a.str == id_line || a.str == id_counter;
 			if (paren && lex_next(sub).kind != T_RP) pp_error(ctx, sub, "expected ')' after 'defined'", NULL);
 			t.kind = T_NUM; t.val = def; t.id = NULL; t.str = NULL;
 			t.is_unsigned = 0; t.is_long = 0;
@@ -1479,9 +1745,46 @@ static int is_once(Ctx *ctx, const char *path) {
 	return 0;
 }
 
+static Tok pp_next(Ctx *ctx);
+static void tok_spell(Buf *b, Tok *t);
+
+static char *pp_expand_line(Ctx *ctx, Lex *sub) {
+	TokVec v;
+	memset(&v, 0, sizeof(v));
+	for (;;) {
+		Tok t = lex_next(sub);
+		if (t.kind == T_EOF) break;
+		tv_push(&v, t);
+	}
+	Tok end;
+	memset(&end, 0, sizeof(end));
+	end.kind = T_EOF; end.hide = (void *)&pp_sentinel_mark;
+	end.file = sub->file; end.line = sub->line;
+	tv_push(&v, end);
+	Tok saved_tok = ctx->tok, saved_pk = ctx->pk, saved_back = ctx->pp_back;
+	int saved_has_pk = ctx->has_pk, saved_has_back = ctx->has_pp_back;
+	push_tokens(ctx, v.v, v.n, NULL);
+	Src *frame = ctx->src;
+	ctx->has_pk = 0;
+	ctx->has_pp_back = 0;
+	Buf b; buf_init(&b);
+	for (;;) {
+		Tok t = pp_next(ctx);
+		if (is_sentinel(&t) || t.kind == T_EOF) break;
+		if (t.space && b.len) buf_append_byte(&b, ' ');
+		tok_spell(&b, &t);
+	}
+	buf_append_byte(&b, 0);
+	if (ctx->src == frame) ctx->src = frame->parent;
+	ctx->tok = saved_tok; ctx->pk = saved_pk; ctx->pp_back = saved_back;
+	ctx->has_pk = saved_has_pk; ctx->has_pp_back = saved_has_back;
+	return (char *)b.data;
+}
+
 static void pp_include(Ctx *ctx, Src *s, Lex *sub) {
 	const char *p = sub->s + sub->i;
 	while (*p == ' ' || *p == '\t') p++;
+	if (*p != '"' && *p != '<') p = pp_expand_line(ctx, sub);
 	char close;
 	if (*p == '"') close = '"';
 	else if (*p == '<') close = '>';
@@ -1526,6 +1829,7 @@ static void pp_directive(Ctx *ctx, Src *s) {
 	char *text = read_line(L);
 	Lex sub;
 	lex_init(&sub, text, L->file);
+	if (sub.as) sub.as = 4;
 	sub.line = line;
 	Tok d = lex_next(&sub);
 	if (d.kind == T_EOF) return;
@@ -1583,6 +1887,20 @@ static void pp_directive(Ctx *ctx, Src *s) {
 	}
 	if (strcmp(name, "pragma") == 0) {
 		Tok t = lex_next(&sub);
+		if (t.id && !strcmp(t.str, "pack") && !L->as) {
+			Tok u = lex_next(&sub);
+			if (u.kind != T_LP) return;
+			u = lex_next(&sub);
+			if (u.id && !strcmp(u.str, "push")) {
+				if (ctx->npack < 16) ctx->packs[ctx->npack++] = ctx->pack;
+				u = lex_next(&sub);
+				if (u.kind == T_COMMA) { u = lex_next(&sub); if (u.kind == T_NUM) ctx->pack = (int)u.val; }
+			} else if (u.id && !strcmp(u.str, "pop")) {
+				ctx->pack = ctx->npack ? ctx->packs[--ctx->npack] : 0;
+			} else if (u.kind == T_NUM) ctx->pack = (int)u.val;
+			else if (u.kind == T_RP) ctx->pack = 0;
+			return;
+		}
 		if (t.id && strcmp(t.str, "once") == 0) {
 			if (ctx->nonce == ctx->caponce) {
 				ctx->caponce = ctx->caponce ? ctx->caponce * 2 : 16;
@@ -1619,6 +1937,7 @@ static Tok raw_next(Ctx *ctx) {
 		}
 		Tok t = lex_next(&s->L);
 		if (t.kind == T_HASH && t.bol) { pp_directive(ctx, s); continue; }
+		if (t.kind == T_HASHHASH && t.bol && s->L.as) { free(read_line(&s->L)); continue; }
 		if (t.kind == T_EOF) {
 			if (ctx->ncond > s->ncond) pp_error(ctx, &s->L, "unterminated conditional directive", NULL);
 			if (!s->parent) return t;
@@ -1650,6 +1969,7 @@ static const char *punct_str(int k) {
 static void tok_spell(Buf *b, Tok *t) {
 	char tmp[64];
 	if (t->kind == T_EOF) return;
+	if (t->raw && t->kind != T_STR) { buf_append(b, t->raw, (size_t)t->rawlen); return; }
 	if (t->id) { buf_append(b, t->str, strlen(t->str)); return; }
 	if (t->kind == T_NUM) {
 		snprintf(tmp, sizeof(tmp), "%lld%s%s", t->val, t->is_unsigned ? "u" : "", t->is_long > 1 ? "ll" : t->is_long ? "l" : "");
@@ -1831,6 +2151,7 @@ static int expand_macro(Ctx *ctx, Tok *t) {
 	for (int j = 0; j < res.n; j++)
 		if (!is_placemarker(&res.v[j])) res.v[k++] = res.v[j];
 	res.n = k;
+	if (res.n) res.v[0].space = t->space;
 	for (int j = 0; j < res.n; j++) res.v[j].bol = j == 0 && t->bol;
 	if (!res.n && t->bol) ctx->pp_bol = 1;
 	push_tokens(ctx, res.v, res.n, m);
@@ -1842,13 +2163,13 @@ static Tok expand_next(Ctx *ctx) {
 		Tok t = raw_next(ctx);
 		if (ctx->pp_bol) { t.bol = 1; ctx->pp_bol = 0; }
 		if (!t.id) return t;
-		if (t.str == id_line) {
-			t.kind = T_NUM; t.val = t.line; t.id = NULL; t.str = NULL;
-			t.is_unsigned = 0; t.is_long = 0;
+		if (t.str == id_line || t.str == id_counter) {
+			t.kind = T_NUM; t.val = t.str == id_line ? t.line : ctx->counter++; t.id = NULL; t.str = NULL;
+			t.is_unsigned = 0; t.is_long = 0; t.raw = NULL; t.rawlen = 0;
 			return t;
 		}
 		if (t.str == id_file) {
-			t.kind = T_STR; t.str = (char *)t.file; t.len = (int)strlen(t.file); t.id = NULL;
+			t.kind = T_STR; t.str = (char *)t.file; t.len = (int)strlen(t.file); t.id = NULL; t.raw = NULL; t.rawlen = 0;
 			return t;
 		}
 		Macro *m = (Macro *)t.id->macro;
@@ -1865,18 +2186,44 @@ static void pp_begin_unit(Ctx *ctx) {
 		"__unix__ 1", "__unix 1", "__LP64__ 1", "_LP64 1", "__ELF__ 1",
 		"__CHAR_BIT__ 8", "__SIZEOF_INT__ 4", "__SIZEOF_LONG__ 8",
 		"__SIZEOF_POINTER__ 8", "__SIZEOF_SHORT__ 2", "__SIZEOF_LONG_LONG__ 8",
-		"__extension__", "__volatile__ volatile",
+		"__extension__", "__volatile__ volatile", "__SCCC__ 1",
 		NULL
 	};
+	ctx->counter = 0;
 	for (int i = 0; predef[i]; i++) pp_define_str(ctx, predef[i]);
 	if (ctx->freestanding) pp_define_str(ctx, "__STDC_HOSTED__ 0");
+	if (ctx->m32) {
+		static const char *un[] = { "__x86_64__", "__x86_64", "__amd64__", "__LP64__", "_LP64", NULL };
+		for (int i = 0; un[i]; i++) intern_str(un[i], (int)strlen(un[i]))->macro = NULL;
+		pp_define_str(ctx, "__i386__ 1");
+		pp_define_str(ctx, "__i386 1");
+		pp_define_str(ctx, "__SIZEOF_LONG__ 4");
+		pp_define_str(ctx, "__SIZEOF_POINTER__ 4");
+		if (ctx->gnu) pp_define_str(ctx, "i386 1");
+	}
+	if (ctx->gnu) {
+		pp_define_str(ctx, "__GNUC__ 4");
+		pp_define_str(ctx, "__GNUC_MINOR__ 9");
+		pp_define_str(ctx, "__GNUC_PATCHLEVEL__ 0");
+	}
 	for (int i = 0; i < ctx->ndefines; i++) {
 		char buf[1024];
 		snprintf(buf, sizeof(buf), "%s", ctx->defines[i]);
 		char *eq = strchr(buf, '=');
 		if (eq) *eq = ' ';
 		else if (strlen(buf) < sizeof(buf) - 3) strcat(buf, " 1");
-		pp_define_str(ctx, buf);
+		pp_define_str(ctx, intern(buf));
+	}
+	for (int i = 0; i < ctx->nundefs; i++) {
+		Str *id = intern_str(ctx->undefs[i], (int)strlen(ctx->undefs[i]));
+		id->macro = NULL;
+	}
+}
+
+static void push_includes(Ctx *ctx, int as) {
+	for (int i = ctx->nincludes - 1; i >= 0; i--) {
+		push_file(ctx, read_file(ctx->includes[i]), ctx->includes[i], 0);
+		ctx->src->L.as = as;
 	}
 }
 
@@ -1934,6 +2281,11 @@ static int apply_attr(Ctx *ctx, Attr *a, char *name, TokVec *args, int has_args)
 	if (name == id_packed) return ATTR_PACKED;
 	if (name == id_weak) return ATTR_WEAK;
 	if (name == id_naked) return ATTR_NAKED;
+	if (!strcmp(name, "always_inline")) return ATTR_ALWAYS_INLINE;
+	if (!strcmp(name, "used")) return ATTR_USED;
+	if (!strcmp(name, "gnu_inline")) return ATTR_GNU_INLINE;
+	if (!strcmp(name, "noinline")) return ATTR_NOINLINE;
+	if (!strcmp(name, "returns_twice")) return ATTR_TWICE;
 	if (name == id_aligned) {
 		long long v = has_args ? eval_tokens(ctx, args) : 16;
 		if (v <= 0 || (v & (v - 1)) || v > 0x10000000) error_at(ctx, "requested alignment is not a positive power of 2");
@@ -1989,6 +2341,13 @@ static Tok parse_next(Ctx *ctx) {
 	Attr *a = NULL;
 	for (;;) {
 		Tok t = pp_next(ctx);
+		if (t.kind == T_IDENT && !strcmp(t.str, "_Pragma")) {
+			Tok u = pp_next(ctx);
+			if (u.kind != T_LP) error_at(ctx, "expected '(' after _Pragma");
+			do u = pp_next(ctx); while (u.kind == T_STR);
+			if (u.kind != T_RP) error_at(ctx, "_Pragma takes a string literal");
+			continue;
+		}
 		if (t.kind == T_IDENT && (t.str == id_attribute || t.str == id_attribute2)) {
 			if (!a) a = (Attr *)calloc(1, sizeof(Attr));
 			attrs |= skip_attribute(ctx, a);
@@ -2051,10 +2410,117 @@ static void replay(Ctx *ctx, TokVec *v) {
 	next(ctx);
 }
 
+
+static void capture_body(Ctx *ctx, Sym *g) {
+	TokVec v;
+	memset(&v, 0, sizeof(v));
+	int depth = 0;
+	do {
+		Tok t = ctx->tok;
+		if (t.kind == T_EOF) error_at(ctx, "unexpected EOF in function body");
+		if (t.kind == T_LB) depth++;
+		else if (t.kind == T_RB) depth--;
+		t.id = NULL;
+		tv_push(&v, t);
+		next(ctx);
+	} while (depth > 0);
+	g->body = v.v;
+	g->nbody = v.n;
+	g->small = v.n <= (g->is_inline ? 512 : 64) && !g->noinline;
+	for (int i = 0; i < v.n && g->small; i++) {
+		Tok *t = &v.v[i];
+		if (t->kind == T_STATIC) g->small = 0;
+		else if (t->kind == T_IDENT && (!strcmp(t->str, "alloca") || !strcmp(t->str, "__builtin_alloca"))) g->small = 0;
+		else if (t->kind == T_LBRACKET && i >= 2 && v.v[i-1].kind == T_IDENT) {
+			int k = v.v[i-2].kind;
+			if (!(k == T_IDENT || k == T_INT || k == T_CHAR || k == T_SHORT || k == T_LONG || k == T_UNSIGNED || k == T_SIGNED ||
+				k == T_FLOAT || k == T_DOUBLE || k == T_BOOL)) continue;
+			for (int j = i + 1, d = 0; j < v.n && (d || v.v[j].kind != T_RBRACKET); j++) {
+				if (v.v[j].kind == T_LBRACKET) d++;
+				else if (v.v[j].kind == T_RBRACKET) d--;
+				else if (v.v[j].kind == T_IDENT && strcmp(v.v[j].str, "sizeof")) { g->small = 0; break; }
+			}
+		}
+	}
+}
+
+static int toks_write(Tok *b, int n, char *name) {
+	for (int i = 0; i < n; i++) {
+		if (b[i].kind != T_IDENT || b[i].str != name) continue;
+		int j = i + 1, q = i - 1;
+		while (j < n && b[j].kind == T_RP) j++;
+		while (q >= 0 && b[q].kind == T_LP) q--;
+		int nj = j < n ? b[j].kind : T_EOF, pq = q >= 0 ? b[q].kind : T_EOF;
+		if (nj == T_ASSIGN || nj == T_INC || nj == T_DEC || (nj >= T_ADD_ASSIGN && nj <= T_SHR_ASSIGN)) return 1;
+		if (pq == T_AMP || pq == T_INC || pq == T_DEC) return 1;
+		int nk = i + 1 < n ? b[i+1].kind : T_EOF;
+		if (nk == T_ASSIGN || nk == T_INC || nk == T_DEC || (nk >= T_ADD_ASSIGN && nk <= T_SHR_ASSIGN)) return 1;
+		int pk = i > 0 ? b[i-1].kind : T_EOF;
+		if (pk == T_INC || pk == T_DEC) return 1;
+		if (pk == T_AMP) {
+			int ppk = i > 1 ? b[i-2].kind : T_EOF;
+			if (ppk != T_IDENT && ppk != T_NUM && ppk != T_FNUM && ppk != T_RP && ppk != T_RBRACKET && ppk != T_STR) return 1;
+		}
+		if (pk == T_LP && i > 1 && b[i-2].kind == T_STR) {
+			int j = i - 2;
+			while (j > 0 && b[j-1].kind == T_STR) j--;
+			if (b[j].len > 0 && (b[j].str[0] == '=' || b[j].str[0] == '+')) return 1;
+		}
+	}
+	return 0;
+}
+
+static int param_written(Sym *g, char *name) { return toks_write(g->body, g->nbody, name); }
+
+static int rest_written(Ctx *ctx, char *name) {
+	TokVec v;
+	memset(&v, 0, sizeof(v));
+	int depth = 0;
+	for (;;) {
+		int k = ctx->tok.kind;
+		if (k == T_EOF) break;
+		if (k == T_LB) depth++;
+		else if (k == T_RB && !depth--) break;
+		tv_push(&v, ctx->tok);
+		next(ctx);
+	}
+	int w = toks_write(v.v, v.n, name);
+	replay(ctx, &v);
+	free(v.v);
+	return w;
+}
+
 static Sym *lookup(Ctx *ctx, char *name) {
-	for (Sym *s = ctx->scope; s; s = s->next)
+	Sym *s = ctx->scope;
+	for (; s && s->depth > 0; s = s->next)
 		if (s->name == name) return s;
-	return NULL;
+	return s ? symmap_get(&ctx->fsmap, name) : NULL;
+}
+
+static Sym *global_chain(Ctx *ctx, char *name) {
+	Sym *h = ctx->globals;
+	if (h != ctx->gidx_head) {
+		int n = 0, cap = 64;
+		Sym **v = (Sym **)malloc(sizeof(Sym *) * cap);
+		Sym *p = h;
+		for (; p && p != ctx->gidx_head; p = p->gnext) {
+			if (n == cap) v = (Sym **)realloc(v, sizeof(Sym *) * (cap *= 2));
+			v[n++] = p;
+		}
+		if (!p && ctx->gidx_head) {
+			symmap_clear(&ctx->gmap);
+			ctx->gidx_head = NULL;
+			free(v);
+			return global_chain(ctx, name);
+		}
+		for (int i = n - 1; i >= 0; i--) {
+			v[i]->gsame = symmap_get(&ctx->gmap, v[i]->name);
+			symmap_put(&ctx->gmap, v[i]->name, v[i]);
+		}
+		free(v);
+		ctx->gidx_head = h;
+	}
+	return symmap_get(&ctx->gmap, name);
 }
 
 static Sym *push_sym(Ctx *ctx, char *name, SymKind kind, Type *ty) {
@@ -2063,12 +2529,14 @@ static Sym *push_sym(Ctx *ctx, char *name, SymKind kind, Type *ty) {
 	s->depth = ctx->depth;
 	s->next = ctx->scope;
 	ctx->scope = s;
+	if (!s->depth) symmap_put(&ctx->fsmap, name, s);
 	return s;
 }
 
 static void enter_scope(Ctx *ctx) { ctx->depth++; }
 
 static void leave_scope(Ctx *ctx) {
+	while (ctx->llabs && ctx->llabs->depth >= ctx->depth) ctx->llabs = ctx->llabs->next;
 	while (ctx->scope && ctx->scope->depth >= ctx->depth) ctx->scope = ctx->scope->next;
 	while (ctx->tags && ctx->tags->depth >= ctx->depth) ctx->tags = ctx->tags->next;
 	ctx->depth--;
@@ -2088,17 +2556,15 @@ static void push_tag(Ctx *ctx, char *name, Type *ty) {
 }
 
 static Sym *lookup_file_scope(Ctx *ctx, char *name) {
-	for (Sym *s = ctx->scope; s; s = s->next)
-		if (s->name == name && s->depth == 0) return s;
-	return NULL;
+	return ctx->scope ? symmap_get(&ctx->fsmap, name) : NULL;
 }
 
 static Sym *get_global(Ctx *ctx, char *name, SymKind kind, Type *ty, int is_static) {
 	Sym *s = lookup_file_scope(ctx, name);
 	if (s && s->global) s = s->global;
 	if (!s && !is_static) {
-		for (Sym *g = ctx->globals; g; g = g->gnext)
-			if (g->name == name && !g->is_static && (g->kind == SYM_VAR || g->kind == SYM_FUNC)) { s = g; break; }
+		for (Sym *g = global_chain(ctx, name); g; g = g->gsame)
+			if (!g->is_static && (g->kind == SYM_VAR || g->kind == SYM_FUNC)) { s = g; break; }
 	}
 	if (s) {
 		if (s->is_asm) { s->is_asm = 0; s->kind = kind; s->ty = ty; }
@@ -2120,8 +2586,11 @@ static void bind_global(Ctx *ctx, Sym *g) {
 		Sym *s = lookup_file_scope(ctx, g->name);
 		if (s == g) return;
 		g->depth = 0;
-		g->next = ctx->scope;
-		ctx->scope = g;
+		Sym **pp = &ctx->scope;
+		while (*pp && (*pp)->depth > 0) pp = &(*pp)->next;
+		g->next = *pp;
+		*pp = g;
+		symmap_put(&ctx->fsmap, g->name, g);
 		return;
 	}
 	Sym *a = push_sym(ctx, g->name, g->kind, g->ty);
@@ -2159,7 +2628,7 @@ static int section_index(Ctx *ctx, char *name, int kind) {
 	memset(sec, 0, sizeof(Sec));
 	sec->name = name;
 	sec->kind = kind;
-	sec->align = kind == SK_CODE ? 16 : 1;
+	sec->align = kind == SK_CODE && strcmp(name, ".init") && strcmp(name, ".fini") ? 16 : 1;
 	return SEC_NAMED + ctx->nsecs - 1;
 }
 
@@ -2271,6 +2740,15 @@ static void piece_end(Ctx *ctx, const char *file) {
 
 static void emit_lea_rip(Ctx *ctx, int reg, Sym *sym, int sect, long off) {
 	Code *c = &ctx->text;
+	if (ctx->kmodel) {
+		C8(c, (uint8_t)(0x48 | (reg >= 8 ? 1 : 0)));
+		C8(c, 0xC7);
+		C8(c, (uint8_t)(0xC0 | (reg & 7)));
+		add_reloc(ctx, R_ABS32S, Cpos(c), sym, sect, off);
+		ctx->relocs[ctx->nrelocs - 1].in = ctx->cur_text;
+		C32(c, 0);
+		return;
+	}
 	enc_rex(c, 1, reg, 0, 0, 0); C8(c,0x8D);
 	add_reloc(ctx, R_PC32, enc_mem(c, reg, ENC_RIP, -1, 1, 0, 1, 0), sym, sect, off);
 }
@@ -2311,6 +2789,9 @@ static void drop_code(Ctx *ctx, Mark m) {
 			k = 0;
 			for (int i = 0; i < l->abs.n; i++) if ((int)l->abs.v[i] < m.nrel) l->abs.v[k++] = l->abs.v[i];
 			l->abs.n = k;
+			k = 0;
+			for (int i = 0; i < l->xrel.n; i++) if ((int)l->xrel.v[i] < m.nrel) l->xrel.v[k++] = l->xrel.v[i];
+			l->xrel.n = k;
 		}
 	}
 	ctx->text.b.len = m.pos;
@@ -2318,9 +2799,130 @@ static void drop_code(Ctx *ctx, Mark m) {
 	ctx->sp = m.sp;
 	ctx->lv = 0;
 	ctx->fn_lea_sym = NULL;
+	if (ctx->k_end > m.pos) ctx->k_end = (size_t)-1;
+}
+
+static void emit_const(Ctx *ctx, long long v) {
+	ctx->k_start = Cpos(&ctx->text);
+	emit_mov_rax_imm(&ctx->text, v);
+	ctx->k_end = Cpos(&ctx->text);
+	ctx->k_val = v;
+	ctx->k_nrel = ctx->nrelocs;
+	ctx->k_ice = 1;
+}
+
+static int expr_const(Ctx *ctx, long long *v) {
+	if (!ctx->fold || ctx->lv || ctx->k_end != Cpos(&ctx->text) || ctx->k_nrel != ctx->nrelocs) return 0;
+	*v = ctx->k_val;
+	return 1;
+}
+
+static void drop_to(Ctx *ctx, size_t pos, int sp) {
+	Mark m;
+	m.pos = pos;
+	m.nrel = ctx->nrelocs;
+	while (m.nrel > 0 && ctx->relocs[m.nrel - 1].in == ctx->cur_text && ctx->relocs[m.nrel - 1].pos >= pos) m.nrel--;
+	m.sp = sp;
+	drop_code(ctx, m);
+}
+
+static void filter_patches(Patches *p, size_t pos) {
+	int k = 0;
+	for (int i = 0; i < p->n; i++) if (p->v[i] < pos) p->v[k++] = p->v[i];
+	p->n = k;
+}
+
+static void cut_code(Ctx *ctx, Mark m) {
+	for (LoopCtx *l = ctx->loops.top; l; l = l->parent) {
+		filter_patches(&l->breaks, m.pos);
+		filter_patches(&l->conts, m.pos);
+		int k = 0;
+		for (int i = 0; i < l->ncase; i++)
+			if (l->case_pos[i] <= m.pos) { l->case_vals[k] = l->case_vals[i]; l->case_hi[k] = l->case_hi[i]; l->case_pos[k++] = l->case_pos[i]; }
+		l->ncase = k;
+		if (l->default_pos > (long)m.pos) l->default_pos = -1;
+	}
+	if (ctx->fn)
+		for (Label *l = ctx->fn->labels; l; l = l->next)
+			if (l->pos > (long)m.pos) {
+				for (int i = 0; i < l->patches.n; i++)
+					if (l->patches.v[i] < m.pos) error_at(ctx, "a jump to '%s' goes into code left out for a constant condition", l->name);
+				for (int i = 0; i < l->xrel.n; i++)
+					if ((int)l->xrel.v[i] < m.nrel) error_at(ctx, "a jump to '%s' goes into code left out for a constant condition", l->name);
+				l->pos = -1;
+			}
+	filter_patches(&ctx->init_patches, m.pos);
+	for (Inl *in = ctx->inl; in; in = in->up) filter_patches(&in->rets, m.pos);
+	drop_code(ctx, m);
+}
+
+static void dead_begin(Ctx *ctx) {
+	int jd = ctx->next_jdepth;
+	ctx->next_jdepth = 0;
+	if (ctx->dead++) return;
+	ctx->dead_jdepth = jd;
+	ctx->dead_sx = ctx->sx_depth;
+	ctx->dead_mark = mark_code(ctx);
+	ctx->dk_start = ctx->k_start;
+	ctx->dk_end = ctx->k_end;
+	ctx->dk_val = ctx->k_val;
+	ctx->dk_nrel = ctx->k_nrel;
+	ctx->dk_ice = ctx->k_ice;
+}
+
+static void dead_end(Ctx *ctx) {
+	if (!ctx->dead) {
+		ctx->revived--;
+		while (ctx->nrevive && ctx->revive_at[ctx->nrevive - 1] == ctx->revived) {
+			ctx->nrevive--;
+			patch_jmp_to(&ctx->text.b, ctx->revive_jmp[ctx->nrevive], Cpos(&ctx->text));
+		}
+		return;
+	}
+	if (--ctx->dead) return;
+	ctx->dead_jdepth = 0;
+	cut_code(ctx, ctx->dead_mark);
+	ctx->k_start = ctx->dk_start;
+	ctx->k_end = ctx->dk_end;
+	ctx->k_val = ctx->dk_val;
+	ctx->k_nrel = ctx->dk_nrel;
+	ctx->k_ice = ctx->dk_ice;
+}
+
+static void dead_xbegin(Ctx *ctx) {
+	ctx->dead_x++;
+	dead_begin(ctx);
+}
+
+static void dead_xend(Ctx *ctx) {
+	dead_end(ctx);
+	ctx->dead_x--;
+}
+
+static void revive(Ctx *ctx) {
+	if (!ctx->dead || ctx->dead_x || ctx->dead_sx != ctx->sx_depth || (ctx->inl && ctx->inl->dead_base)) return;
+	cut_code(ctx, ctx->dead_mark);
+	if (ctx->nrevive == 64) error_at(ctx, "too many labels in code left out for constant conditions");
+	ctx->revive_at[ctx->nrevive] = ctx->revived;
+	ctx->revive_jmp[ctx->nrevive++] = emit_jmp_placeholder(&ctx->text);
+	ctx->revived += ctx->dead;
+	ctx->dead = 0;
+}
+
+static void case_revive(Ctx *ctx, LoopCtx *lc) {
+	if (!ctx->dead || ctx->dead_mark.pos < lc->body) return;
+	revive(ctx);
+	if (ctx->dead) error_at(ctx, "a case label is inside code left out for a constant condition");
 }
 
 static Label *find_label(Ctx *ctx, char *name) {
+	for (LLab *ll = ctx->llabs; ll; ll = ll->next)
+		if (ll->name == name) { name = ll->real; break; }
+	if (ctx->inl) {
+		char b[256];
+		snprintf(b, sizeof(b), "%s.inl%d", name, ctx->inl->id);
+		name = intern(b);
+	}
 	for (Label *l = ctx->fn->labels; l; l = l->next)
 		if (l->name == name) return l;
 	Label *l = (Label *)calloc(1, sizeof(Label));
@@ -2337,6 +2939,7 @@ static int alloc_local(Ctx *ctx, int size, int align) {
 	if (align < 1) align = 1;
 	f->frame += size;
 	f->frame = (int)align_up((size_t)f->frame, (size_t)align);
+	if (f->frame > f->frame_max) f->frame_max = f->frame;
 	return -f->frame;
 }
 
@@ -2390,11 +2993,28 @@ static void emit_bf_store(Code *c, Type *ty) {
 }
 
 static void emit_load_type(Code *c, Type *ty) {
+	if (ty->kind == TY_LDOUBLE || ty->kind == TY_COMPLEX) return;
 	if (ty->bit_width) emit_bf_load(c, ty);
 	else emit_load(c, ty->size, ty->is_unsigned);
 }
 
 static void emit_store_type(Code *c, Type *ty) {
+	if (ty->kind == TY_COMPLEX) {
+		emit_mov_reg_reg(c, RDX, RAX);
+		emit_mov_reg_reg(c, RSI, RAX);
+		emit_mov_reg_reg(c, RDI, RCX);
+		emit_mov_ecx_imm(c, (uint32_t)ty->size);
+		emit_rep_movsb(c);
+		emit_mov_reg_reg(c, RAX, RDX);
+		return;
+	}
+	if (ty->kind == TY_LDOUBLE) {
+		C8(c,0x48); C8(c,0x8B); C8(c,0x10);
+		C8(c,0x48); C8(c,0x89); C8(c,0x11);
+		C8(c,0x0F); C8(c,0xB7); C8(c,0x50); C8(c,0x08);
+		C8(c,0x66); C8(c,0x89); C8(c,0x51); C8(c,0x08);
+		return;
+	}
 	if (ty->bit_width) emit_bf_store(c, ty);
 	else emit_store(c, ty->size);
 }
@@ -2424,14 +3044,79 @@ static void emit_tls_addr(Ctx *ctx, Sym *g) {
 }
 
 static Sym *tls_lvalue(Ctx *ctx, Type *ty) {
-	if (!ctx->lv || !ctx->tls_sym || ctx->tls_end != Cpos(&ctx->text) || !is_scalar(ty) || ty->bit_width) return NULL;
+	if (!ctx->lv || !ctx->tls_sym || ctx->tls_end != Cpos(&ctx->text) || !is_scalar(ty) || ty->bit_width || ty->kind == TY_LDOUBLE) return NULL;
 	Sym *g = ctx->tls_sym;
 	drop_code(ctx, ctx->tls_mark);
 	ctx->tls_sym = NULL;
 	return g;
 }
 
+static Type *xcond_end(Ctx *ctx, Type *t) {
+	ctx->xcond--;
+	return t;
+}
+
+static Sym *simple_local(Ctx *ctx) {
+	Sym *s = ctx->lv_local;
+	if (!s || !ctx->lv || ctx->lv_end != Cpos(&ctx->text) || ctx->lv_start > ctx->lv_end) return NULL;
+	Code t;
+	code_init(&t);
+	emit_lea_rbp(&t, RAX, s->stack_off);
+	int ok = ctx->lv_end - ctx->lv_start == t.b.len && !memcmp(ctx->text.b.data + ctx->lv_start, t.b.data, t.b.len);
+	free(t.b.data);
+	return ok ? s : NULL;
+}
+
+static void kv_forget_all(Ctx *ctx) {
+	for (Sym *s = ctx->scope; s && s->depth > 0; s = s->next) s->kv_valid = 0;
+}
+
+static int toks_write(Tok *b, int n, char *name);
+
+static void kv_forget_scan(Ctx *ctx, int levels) {
+	int any = 0;
+	for (Sym *s = ctx->scope; s && s->depth > 0 && !any; s = s->next) any = s->kv_valid;
+	if (!any) return;
+	TokVec v;
+	memset(&v, 0, sizeof(v));
+	int depth = 0;
+	for (;;) {
+		int k = ctx->tok.kind;
+		if (k == T_EOF) break;
+		if (k == T_LB) depth++;
+		else if (k == T_RB) {
+			if (depth) depth--;
+			else if (--levels <= 0) break;
+		}
+		tv_push(&v, ctx->tok);
+		next(ctx);
+	}
+	for (Sym *s = ctx->scope; s && s->depth > 0; s = s->next)
+		if (s->kv_valid && (toks_write(v.v, v.n, s->name) || s->addr_taken)) s->kv_valid = 0;
+	replay(ctx, &v);
+	free(v.v);
+}
+
+static void kv_forget_loop(Ctx *ctx) { kv_forget_scan(ctx, 1); }
+
+static void kv_forget(Ctx *ctx, int addr) {
+	Sym *s = simple_local(ctx);
+	if (!s || ctx->dead) return;
+	s->kv_valid = 0;
+	if (addr) s->addr_taken = 1;
+}
+
 static Type *rval(Ctx *ctx, Type *ty) {
+	if (ctx->fold && ctx->lv && (is_integer(ty) || is_ptr(ty)) && !ty->bit_width) {
+		Sym *s = simple_local(ctx);
+		if (s && s->kv_valid && !s->addr_taken) {
+			drop_to(ctx, ctx->lv_start, ctx->sp);
+			emit_const(ctx, s->kv);
+			ctx->k_ice = 0;
+			ctx->lv = 0;
+			return ty->origin ? ty->origin : ty;
+		}
+	}
 	if (ty->kind == TY_ARRAY) { ctx->lv = 0; return ptr_to(ty->base); }
 	if (ty->kind == TY_FUNC) { ctx->lv = 0; return ptr_to(ty); }
 	Sym *tg = tls_lvalue(ctx, ty);
@@ -2447,8 +3132,269 @@ static Type *rval(Ctx *ctx, Type *ty) {
 	return ty;
 }
 
+typedef struct { uint32_t *d; int n, cap; } Big;
+
+static void big_fit(Big *b, int n) {
+	if (n <= b->cap) return;
+	b->d = (uint32_t *)realloc(b->d, sizeof(uint32_t) * (size_t)n);
+	memset(b->d + b->cap, 0, sizeof(uint32_t) * (size_t)(n - b->cap));
+	b->cap = n;
+}
+
+static void big_trim(Big *b) { while (b->n && !b->d[b->n - 1]) b->n--; }
+
+static void big_muladd(Big *b, uint32_t m, uint32_t a) {
+	uint64_t carry = a;
+	for (int i = 0; i < b->n; i++) {
+		uint64_t v = (uint64_t)b->d[i] * m + carry;
+		b->d[i] = (uint32_t)v;
+		carry = v >> 32;
+	}
+	if (carry) { big_fit(b, b->n + 1); b->d[b->n++] = (uint32_t)carry; }
+}
+
+static int big_bits(Big *b) {
+	big_trim(b);
+	if (!b->n) return 0;
+	int k = 32;
+	while (!(b->d[b->n - 1] >> (k - 1))) k--;
+	return 32 * (b->n - 1) + k;
+}
+
+static int big_bit(Big *b, int i) { return i >= 0 && i / 32 < b->n ? (int)(b->d[i / 32] >> (i % 32) & 1) : 0; }
+
+static void big_shl(Big *b, int k) {
+	if (k <= 0 || !b->n) return;
+	int w = k / 32, r = k % 32;
+	big_fit(b, b->n + w + 1);
+	for (int i = b->n + w; i >= 0; i--) {
+		uint64_t hi = i - w >= 0 && i - w < b->n ? b->d[i - w] : 0, lo = i - w - 1 >= 0 && i - w - 1 < b->n ? b->d[i - w - 1] : 0;
+		b->d[i] = r ? (uint32_t)(hi << r | lo >> (32 - r)) : (uint32_t)hi;
+	}
+	b->n += w + 1;
+	big_trim(b);
+}
+
+static int big_cmp(Big *a, Big *b) {
+	big_trim(a); big_trim(b);
+	if (a->n != b->n) return a->n < b->n ? -1 : 1;
+	for (int i = a->n - 1; i >= 0; i--) if (a->d[i] != b->d[i]) return a->d[i] < b->d[i] ? -1 : 1;
+	return 0;
+}
+
+static void big_sub(Big *a, Big *b) {
+	int64_t br = 0;
+	for (int i = 0; i < a->n; i++) {
+		int64_t v = (int64_t)a->d[i] - (i < b->n ? b->d[i] : 0) - br;
+		br = v < 0;
+		a->d[i] = (uint32_t)(v + (br ? ((int64_t)1 << 32) : 0));
+	}
+	big_trim(a);
+}
+
+static void big_div(Big *num, Big *den, Big *q) {
+	int nb = big_bits(num);
+	q->n = 0;
+	big_fit(q, nb / 32 + 2);
+	memset(q->d, 0, sizeof(uint32_t) * (size_t)q->cap);
+	q->n = nb / 32 + 1;
+	Big r = { NULL, 0, 0 };
+	for (int i = nb - 1; i >= 0; i--) {
+		big_shl(&r, 1);
+		if (big_bit(num, i)) { if (!r.n) { big_fit(&r, 1); r.n = 1; r.d[0] = 0; } r.d[0] |= 1; }
+		if (big_cmp(&r, den) >= 0) { big_sub(&r, den); q->d[i / 32] |= 1u << (i % 32); }
+	}
+	big_trim(q);
+	free(num->d);
+	*num = r;
+}
+
+static void ld_round(Big *m, int sticky, uint8_t out[10], int exp2) {
+	int nb = big_bits(m);
+	int e = exp2 + nb - 1;
+	int be = e + 16383, prec = be > 0 ? 64 : 64 - (1 - be);
+	uint64_t mant = 0;
+	if (prec > 0) for (int i = 0; i < prec; i++) mant |= (uint64_t)big_bit(m, nb - 1 - i) << (prec - 1 - i);
+	int rb = prec >= 0 ? big_bit(m, nb - 1 - prec) : 0;
+	if (prec < 0) sticky = 1;
+	for (int i = 0; i < nb - 1 - prec && !sticky; i++) sticky = big_bit(m, i);
+	if (rb && (sticky || (mant & 1))) {
+		mant++;
+		if (prec == 64 && !mant) { mant = 1ULL << 63; be++; }
+		else if (prec < 64 && (mant >> 63)) be = 1;
+	}
+	if (be <= 0) be = 0;
+	if (be >= 0x7FFF) { mant = 1ULL << 63; be = 0x7FFF; }
+	for (int i = 0; i < 8; i++) out[i] = (uint8_t)(mant >> (8 * i));
+	out[8] = (uint8_t)be;
+	out[9] = (uint8_t)(be >> 8);
+}
+
+static void ld_from_text(const char *p, uint8_t out[10]) {
+	memset(out, 0, 10);
+	Big m = { NULL, 0, 0 };
+	int neg = 0, exp = 0, any = 0;
+	if (*p == '-') { neg = 1; p++; } else if (*p == '+') p++;
+	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+		p += 2;
+		int frac = 0, dot = 0;
+		for (;; p++) {
+			if (*p == '.') { dot = 1; continue; }
+			if (!isxdigit((unsigned char)*p)) break;
+			if (!m.n) { big_fit(&m, 1); m.n = 1; m.d[0] = 0; }
+			big_muladd(&m, 16, (uint32_t)hexval(*p));
+			any = 1;
+			if (dot) frac += 4;
+		}
+		if (*p == 'p' || *p == 'P') {
+			p++;
+			int es = 1, ev = 0;
+			if (*p == '-') { es = -1; p++; } else if (*p == '+') p++;
+			while (isdigit((unsigned char)*p)) ev = ev * 10 + (*p++ - '0');
+			exp = es * ev;
+		}
+		if (any && big_bits(&m)) ld_round(&m, 0, out, exp - frac);
+	} else {
+		int frac = 0, dot = 0;
+		for (;; p++) {
+			if (*p == '.') { dot = 1; continue; }
+			if (!isdigit((unsigned char)*p)) break;
+			if (!m.n) { big_fit(&m, 1); m.n = 1; m.d[0] = 0; }
+			big_muladd(&m, 10, (uint32_t)(*p - '0'));
+			if (dot) frac++;
+		}
+		if (*p == 'e' || *p == 'E') {
+			p++;
+			int es = 1, ev = 0;
+			if (*p == '-') { es = -1; p++; } else if (*p == '+') p++;
+			while (isdigit((unsigned char)*p)) ev = ev * 10 + (*p++ - '0');
+			exp = es * ev;
+		}
+		exp -= frac;
+		if (big_bits(&m)) {
+			if (exp >= 0) {
+				for (int i = 0; i < exp; i++) big_muladd(&m, 10, 0);
+				ld_round(&m, 0, out, 0);
+			} else {
+				Big den = { NULL, 0, 0 };
+				big_fit(&den, 1); den.n = 1; den.d[0] = 1;
+				for (int i = 0; i < -exp; i++) big_muladd(&den, 10, 0);
+				int k = 70 + big_bits(&den) - big_bits(&m);
+				if (k < 0) k = 0;
+				big_shl(&m, k);
+				Big q = { NULL, 0, 0 };
+				big_div(&m, &den, &q);
+				ld_round(&q, big_bits(&m) != 0, out, -k);
+				free(den.d); free(q.d);
+			}
+		}
+	}
+	if (neg) out[9] |= 0x80;
+	free(m.d);
+}
+
+static void ld_tok(Tok *t, uint8_t out[10]) {
+	char buf[256];
+	int n = t->raw && t->rawlen < (int)sizeof(buf) ? t->rawlen : 0;
+	if (n) { memcpy(buf, t->raw, (size_t)n); buf[n] = 0; }
+	else snprintf(buf, sizeof(buf), "%.17g", t->fval);
+	ld_from_text(buf, out);
+}
+
+static void emit_x87(Code *c, uint8_t op, int ext, int base, int disp) { enc_rex(c, 0, 0, 0, base, 0); C8(c,op); enc_mem(c, ext, base, -1, 1, disp, 1, 0); }
+
+static void ld_store_temp(Ctx *ctx) {
+	Code *c = &ctx->text;
+	int t = alloc_local(ctx, 16, 16);
+	emit_x87(c, 0xDB, 7, RBP, t);
+	emit_lea_rbp(c, RAX, t);
+}
+
+static void ld_flags_setcc(Code *c, int op) {
+	switch (op) {
+	case T_EQ: emit_setcc_al(c, 0x94); emit_setcc_cl(c, 0x9B); C8(c,0x20); C8(c,0xC8); break;
+	case T_NEQ: emit_setcc_al(c, 0x95); emit_setcc_cl(c, 0x9A); C8(c,0x08); C8(c,0xC8); break;
+	case T_GEQ: emit_setcc_al(c, 0x93); break;
+	default: emit_setcc_al(c, 0x97); break;
+	}
+	emit_movzx_eax_al(c);
+}
+
+static void ld_nonzero(Code *c) {
+	emit_x87(c, 0xDB, 5, RAX, 0);
+	C8(c,0xD9); C8(c,0xEE);
+	C8(c,0xDF); C8(c,0xE9);
+	C8(c,0xDD); C8(c,0xD8);
+	ld_flags_setcc(c, T_NEQ);
+}
+
+static void ld_push_double(Code *c, uint64_t bits) {
+	emit_mov_rax_imm64(c, bits);
+	emit_push(c, RAX);
+	emit_x87(c, 0xDD, 0, RSP, 0);
+	emit_pop(c, RAX);
+}
+
+static void gen_ldcast(Ctx *ctx, Type *from, Type *to) {
+	Code *c = &ctx->text;
+	if (from->kind == TY_LDOUBLE && to->kind == TY_LDOUBLE) return;
+	if (to->kind == TY_LDOUBLE) {
+		emit_push(c, RAX);
+		if (from->kind == TY_DOUBLE) emit_x87(c, 0xDD, 0, RSP, 0);
+		else if (from->kind == TY_FLOAT) emit_x87(c, 0xD9, 0, RSP, 0);
+		else {
+			emit_x87(c, 0xDF, 5, RSP, 0);
+			if (from->size == 8 && from->is_unsigned) {
+				C8(c,0x48); C8(c,0x85); C8(c,0xC0);
+				size_t js = jfwd(c, 0x79);
+				ld_push_double(c, 0x43F0000000000000ULL);
+				C8(c,0xDE); C8(c,0xC1);
+				jland(c, js);
+			}
+		}
+		emit_pop(c, RAX);
+		ld_store_temp(ctx);
+		return;
+	}
+	if (to->kind == TY_BOOL) { ld_nonzero(c); return; }
+	if (is_flonum(to)) {
+		int t = alloc_local(ctx, 8, 8);
+		emit_x87(c, 0xDB, 5, RAX, 0);
+		if (to->kind == TY_DOUBLE) { emit_x87(c, 0xDD, 3, RBP, t); emit_load_rbp(c, RAX, t); }
+		else { emit_x87(c, 0xD9, 3, RBP, t); C8(c,0x8B); enc_mem(c, RAX, RBP, -1, 1, t, 1, 0); }
+		return;
+	}
+	int t = alloc_local(ctx, 16, 16);
+	emit_x87(c, 0xDB, 5, RAX, 0);
+	emit_x87(c, 0xD9, 7, RBP, t);
+	C8(c,0x0F); C8(c,0xB7); enc_mem(c, RAX, RBP, -1, 1, t, 1, 0);
+	C8(c,0x0D); C32(c,0x0C00);
+	C8(c,0x66); C8(c,0x89); enc_mem(c, RAX, RBP, -1, 1, t + 2, 1, 0);
+	emit_x87(c, 0xD9, 5, RBP, t + 2);
+	size_t jbig = 0, jdone = 0;
+	if (to->size == 8 && to->is_unsigned) {
+		ld_push_double(c, 0x43E0000000000000ULL);
+		C8(c,0xDF); C8(c,0xE9);
+		jbig = jfwd(c, 0x76);
+	}
+	emit_x87(c, 0xDF, 7, RBP, t + 8);
+	if (jbig) {
+		jdone = jfwd(c, 0xEB);
+		jland(c, jbig);
+		ld_push_double(c, 0x43E0000000000000ULL);
+		C8(c,0xDE); C8(c,0xE9);
+		emit_x87(c, 0xDF, 7, RBP, t + 8);
+		C8(c,0x80); enc_mem(c, 6, RBP, -1, 1, t + 15, 1, 0); C8(c,0x80);
+		jland(c, jdone);
+	}
+	emit_x87(c, 0xD9, 5, RBP, t);
+	emit_load_rbp(c, RAX, t + 8);
+	if (is_integer(to) && to->size < 8) emit_extend(c, to->size, to->is_unsigned);
+}
+
 static void gen_fnonzero(Ctx *ctx, Type *ty) {
 	Code *c = &ctx->text;
+	if (ty->kind == TY_LDOUBLE) { ld_nonzero(c); return; }
 	emit_movq_xmm0_rax(c);
 	emit_xorpd_xmm1(c);
 	emit_ucomi(c, ty->kind == TY_DOUBLE, 0);
@@ -2458,13 +3404,17 @@ static void gen_fnonzero(Ctx *ctx, Type *ty) {
 	emit_movzx_eax_al(c);
 }
 
+static void gen_cast(Ctx *ctx, Type *from, Type *to);
+
 static void gen_truth(Ctx *ctx, Type *ty) {
-	if (is_flonum(ty)) gen_fnonzero(ctx, ty);
+	if (is_complex(ty)) gen_cast(ctx, ty, ty_bool);
+	else if (is_flonum(ty)) gen_fnonzero(ctx, ty);
 }
 
 static void gen_fcast(Ctx *ctx, Type *from, Type *to) {
 	Code *c = &ctx->text;
 	if (from->kind == to->kind) return;
+	if (from->kind == TY_LDOUBLE || to->kind == TY_LDOUBLE) { gen_ldcast(ctx, from, to); return; }
 	int td = to->kind == TY_DOUBLE;
 	if (is_flonum(from) && is_flonum(to)) {
 		emit_movq_xmm0_rax(c);
@@ -2499,9 +3449,24 @@ static void gen_fcast(Ctx *ctx, Type *from, Type *to) {
 	if (is_integer(to) && to->size < 8) emit_extend(c, to->size, to->is_unsigned);
 }
 
+static void gen_ccast(Ctx *ctx, Type *from, Type *to);
+
 static void gen_cast(Ctx *ctx, Type *from, Type *to) {
 	Code *c = &ctx->text;
 	if (to->kind == TY_VOID) return;
+	if (is_complex(from) || is_complex(to)) {
+		if (!(is_complex(from) || is_arith(from)) || !(is_complex(to) || is_arith(to))) error_at(ctx, "invalid conversion involving a complex type");
+		gen_ccast(ctx, from, to);
+		return;
+	}
+	long long kv;
+	if ((is_integer(from) || is_ptr(from)) && (is_integer(to) || is_ptr(to)) && expr_const(ctx, &kv)) {
+		int ice = ctx->k_ice;
+		drop_to(ctx, ctx->k_start, ctx->sp);
+		emit_const(ctx, const_cast_val(kv, to));
+		ctx->k_ice = ice;
+		return;
+	}
 	if (is_flonum(from) || is_flonum(to)) {
 		if (is_scalar(from) && is_scalar(to)) gen_fcast(ctx, from, to);
 		return;
@@ -2539,10 +3504,38 @@ static int asm_regnum(const char *name);
 
 enum { ST_NONE, ST_TYPEDEF, ST_STATIC, ST_EXTERN };
 
+static int read_strs(Ctx *ctx, Buf *s) {
+	int w = 0;
+	TokVec v;
+	memset(&v, 0, sizeof(v));
+	while (ctx->tok.kind == T_STR) {
+		if (ctx->tok.wide) {
+			if (w && w != ctx->tok.wide) error_at(ctx, "concatenation of different wide string literals");
+			w = ctx->tok.wide;
+		}
+		tv_push(&v, ctx->tok);
+		next(ctx);
+	}
+	for (int i = 0; i < v.n; i++) {
+		Tok *t = &v.v[i];
+		if (t->wide || !w) { buf_append(s, t->str, t->len); continue; }
+		Lex L;
+		memset(&L, 0, sizeof(L));
+		L.s = t->str;
+		L.n = (size_t)t->len;
+		while (L.i < L.n) put_wide(s, w, lex_utf8(&L));
+	}
+	for (int i = 0; i < wide_size(w); i++) buf_append_byte(s, 0);
+	free(v.v);
+	return w;
+}
+
+static Type *wide_type(int w) { return w == 'L' ? ty_int : w == 'U' ? ty_uint : w == 'u' ? ty_ushort : ty_char; }
+
 static int is_typename(Ctx *ctx, Tok *t) {
 	switch (t->kind) {
 	case T_INT: case T_CHAR: case T_SHORT: case T_LONG: case T_SIGNED: case T_UNSIGNED:
-	case T_VOID: case T_BOOL: case T_FLOAT: case T_DOUBLE:
+	case T_VOID: case T_BOOL: case T_FLOAT: case T_DOUBLE: case T_COMPLEX:
 	case T_STRUCT: case T_UNION: case T_ENUM: case T_TYPEDEF:
 	case T_STATIC: case T_EXTERN: case T_CONST: case T_VOLATILE: case T_INLINE:
 	case T_REGISTER: case T_AUTO: case T_RESTRICT: case T_TYPEOF: case T_ALIGNAS: case T_NORETURN: case T_THREAD:
@@ -2578,7 +3571,7 @@ static Type *typeof_operand(Ctx *ctx) {
 }
 
 static Type *declspec(Ctx *ctx, int *storage) {
-	int nlong = 0, nshort = 0, nint = 0, nchar = 0, nvoid = 0, nbool = 0, nfloat = 0, ndouble = 0;
+	int nlong = 0, nshort = 0, nint = 0, nchar = 0, nvoid = 0, nbool = 0, nfloat = 0, ndouble = 0, ncomplex = 0;
 	int is_signed = 0, is_unsigned = 0;
 	Type *user = NULL;
 	int attrs = 0;
@@ -2586,8 +3579,12 @@ static Type *declspec(Ctx *ctx, int *storage) {
 	memset(&da, 0, sizeof(da));
 	if (storage) *storage = ST_NONE;
 	ctx->decl_thread = 0;
+	ctx->decl_inline = 0;
+	ctx->decl_register = 0;
 	for (;;) {
 		int k = ctx->tok.kind;
+		if (k == T_INLINE) ctx->decl_inline = 1;
+		if (k == T_REGISTER) ctx->decl_register = 1;
 		if (k == T_THREAD) {
 			if (!storage) error_at(ctx, "storage class specifier not allowed here");
 			ctx->decl_thread = 1;
@@ -2615,6 +3612,7 @@ static Type *declspec(Ctx *ctx, int *storage) {
 		if ((k == T_FLOAT || k == T_DOUBLE) && ctx->no_float) error_at(ctx, "floating point is disabled by -mgeneral-regs-only");
 		if (k == T_FLOAT) { nfloat++; next(ctx); continue; }
 		if (k == T_DOUBLE) { ndouble++; next(ctx); continue; }
+		if (k == T_COMPLEX) { ncomplex++; next(ctx); continue; }
 		if (k == T_CHAR) { nchar++; next(ctx); continue; }
 		if (k == T_SHORT) { nshort++; next(ctx); continue; }
 		if (k == T_INT) { nint++; next(ctx); continue; }
@@ -2633,11 +3631,15 @@ static Type *declspec(Ctx *ctx, int *storage) {
 	}
 	ctx->decl_attrs = attrs;
 	ctx->decl_attr = da;
+	if (ncomplex) {
+		if (user || nvoid || nbool || nchar || nshort || nint || is_signed || is_unsigned) error_at(ctx, "only floating complex types are supported");
+		return complex_of(nfloat ? ty_float : nlong ? ty_ldouble : ty_double);
+	}
 	if (user) return user;
 	if (nvoid) return ty_void;
 	if (nbool) return ty_bool;
 	if (nfloat) return ty_float;
-	if (ndouble) return ty_double;
+	if (ndouble) return nlong ? ty_ldouble : ty_double;
 	if (nchar) return is_unsigned ? ty_uchar : is_signed ? ty_schar : ty_char;
 	if (nshort) return is_unsigned ? ty_ushort : ty_short;
 	if (nlong > 1) return is_unsigned ? ty_ullong : ty_llong;
@@ -2669,6 +3671,8 @@ static Type *func_params(Ctx *ctx, Type *ret) {
 	return ft;
 }
 
+static int tokens_const(Ctx *ctx, TokVec *v);
+
 static Type *type_suffix(Ctx *ctx, Type *ty) {
 	if (ctx->tok.kind == T_LP) {
 		next(ctx);
@@ -2678,7 +3682,42 @@ static Type *type_suffix(Ctx *ctx, Type *ty) {
 		next(ctx);
 		while (is_qualifier(ctx->tok.kind) || ctx->tok.kind == T_STATIC) next(ctx);
 		int len = -1;
-		if (ctx->tok.kind != T_RBRACKET) len = (int)const_expr(ctx);
+		if (ctx->tok.kind == T_MUL && peek(ctx)->kind == T_RBRACKET) next(ctx);
+		else if (ctx->tok.kind != T_RBRACKET) {
+			TokVec v;
+			memset(&v, 0, sizeof(v));
+			for (int d = 0; ctx->tok.kind != T_EOF && (d || ctx->tok.kind != T_RBRACKET); next(ctx)) {
+				if (ctx->tok.kind == T_LBRACKET || ctx->tok.kind == T_LP) d++;
+				else if (ctx->tok.kind == T_RBRACKET || ctx->tok.kind == T_RP) d--;
+				tv_push(&v, ctx->tok);
+			}
+			int k = tokens_const(ctx, &v);
+			replay(ctx, &v);
+			free(v.v);
+			if (k || !ctx->fn || ctx->noasm) len = (int)const_expr(ctx);
+			else {
+				Code *c = &ctx->text;
+				int cnt = alloc_local(ctx, 8, 8);
+				Type *nt = rval(ctx, parse_assign(ctx));
+				if (!is_integer(nt)) error_at(ctx, "size of array has non-integer type");
+				gen_cast(ctx, nt, ty_long);
+				emit_store_rbp(c, RAX, cnt);
+				expect(ctx, T_RBRACKET);
+				ty = type_suffix(ctx, ty);
+				if (ty->kind == TY_FUNC || (ty->kind == TY_STRUCT && !ty->complete) || ty->kind == TY_VOID) error_at(ctx, "invalid element type of a variable length array");
+				int sz = alloc_local(ctx, 8, 8);
+				emit_load_rbp(c, RAX, cnt);
+				if (ty->vla) { C8(c,0x48); C8(c,0x0F); C8(c,0xAF); enc_mem(c, RAX, RBP, -1, 1, ty->vla, 1, 0); }
+				else emit_scale(c, RAX, ty->size);
+				emit_store_rbp(c, RAX, sz);
+				Type *t = new_type(TY_ARRAY, 0, ty->align);
+				t->base = ty;
+				t->len = 0;
+				t->complete = 1;
+				t->vla = sz;
+				return t;
+			}
+		}
 		expect(ctx, T_RBRACKET);
 		ty = type_suffix(ctx, ty);
 		return array_of(ty, len);
@@ -2703,14 +3742,22 @@ static Type *declarator(Ctx *ctx, Type *ty, char **name) {
 		next(ctx);
 		Type *ph = new_type(TY_VOID, 1, 1);
 		Type *inner = declarator(ctx, ph, name);
+		int na = ctx->name_attrs;
+		Attr *nat = ctx->name_attr;
 		expect(ctx, T_RP);
 		ty = type_suffix(ctx, ty);
 		*ph = *ty;
+		if (name) { ctx->name_attrs = na; ctx->name_attr = nat; }
 		return inner;
 	}
 	if (ctx->tok.kind == T_IDENT) {
+		int na = ctx->tok.attrs;
+		Attr *nat = ctx->tok.attr;
 		if (name) *name = ctx->tok.str;
 		next(ctx);
+		Type *r = type_suffix(ctx, ty);
+		if (name) { ctx->name_attrs = na; ctx->name_attr = nat; }
+		return r;
 	}
 	return type_suffix(ctx, ty);
 }
@@ -2745,13 +3792,16 @@ static void struct_layout(Ctx *ctx, Type *ty, Field *fs, int nf, int packed, int
 	for (int i = 0; i < nf; i++) {
 		Type *mt = fs[i].ty;
 		char *name = fs[i].name;
-		int a = packed ? 1 : mt->align;
+		int a = packed ? 1 : ctx->pack && ctx->pack < mt->align ? ctx->pack : mt->align;
 		if (fs[i].align > a) a = fs[i].align;
 		if (fs[i].width < -1) {
 			int moff = is_union ? 0 : (int)align_up((size_t)((bits + 7) / 8), (size_t)a);
+			Member *am = (Member *)calloc(1, sizeof(Member));
+			am->ty = mt; am->off = moff;
+			cur->next = am; cur = am;
 			for (Member *bm = mt->members; bm; bm = bm->next) {
 				Member *m = (Member *)calloc(1, sizeof(Member));
-				m->name = bm->name; m->ty = bm->ty; m->off = moff + bm->off;
+				m->name = bm->name; m->ty = bm->ty; m->off = moff + bm->off; m->flat = 1;
 				if (packed && bm->ty->bit_width) { m->ty = (Type *)malloc(sizeof(Type)); *m->ty = *bm->ty; }
 				cur->next = m; cur = m;
 			}
@@ -2870,28 +3920,44 @@ static Type *struct_decl(Ctx *ctx) {
 	next(ctx);
 	attrs |= ctx->tok.attrs;
 	attr_merge(&sa, ctx->tok.attr);
-	struct_layout(ctx, ty, fs, nf, (attrs & ATTR_PACKED) != 0, sa.align);
+	struct_layout(ctx, ty, fs, nf, (attrs & ATTR_PACKED) != 0 || ctx->pack == 1, sa.align);
 	free(fs);
 	return ty;
 }
 
 static Type *enum_decl(Ctx *ctx) {
 	next(ctx);
-	if (ctx->tok.kind == T_IDENT) next(ctx);
-	if (ctx->tok.kind != T_LB) return ty_int;
+	char *tag = NULL;
+	if (ctx->tok.kind == T_IDENT) { tag = ctx->tok.str; next(ctx); }
+	if (ctx->tok.kind != T_LB) {
+		Tag *tg = tag ? find_tag(ctx, tag) : NULL;
+		return tg && is_integer(tg->ty) ? tg->ty : ty_int;
+	}
 	next(ctx);
-	long long v = 0;
+	long long v = 0, lo = 0, hi = 0;
+	int n = 0, cap = 16;
+	Sym **cs = (Sym **)malloc(sizeof(Sym *) * (size_t)cap);
 	while (ctx->tok.kind != T_RB) {
 		if (ctx->tok.kind != T_IDENT) error_at(ctx, "expected enumerator name");
 		char *name = ctx->tok.str;
 		next(ctx);
 		if (consume(ctx, T_ASSIGN)) v = const_expr(ctx);
 		Sym *s = push_sym(ctx, name, SYM_ENUMC, ty_int);
+		if (!n || v < lo) lo = v;
+		if (!n || v > hi) hi = v;
+		if (n == cap) cs = (Sym **)realloc(cs, sizeof(Sym *) * (size_t)(cap *= 2));
+		cs[n++] = s;
 		s->val = v++;
 		if (!consume(ctx, T_COMMA)) break;
 	}
 	expect(ctx, T_RB);
-	return ty_int;
+	Type *t = ty_int;
+	if (lo < -2147483647LL - 1 || hi > 2147483647LL)
+		t = lo >= 0 && hi <= 0xFFFFFFFFLL ? ty_uint : lo >= 0 ? ty_ulong : ty_long;
+	for (int i = 0; i < n; i++) cs[i]->ty = t;
+	free(cs);
+	if (tag) push_tag(ctx, tag, t);
+	return t;
 }
 
 static Member *find_member(Type *ty, char *name) {
@@ -2918,13 +3984,21 @@ static int binop_prec(int k) {
 
 static long long sizeof_operand(Ctx *ctx);
 static long long alignof_operand(Ctx *ctx);
-static long long ce_cond(Ctx *ctx);
+
+static int is_builtin_const(char *name);
 
 static int tokens_const(Ctx *ctx, TokVec *v) {
 	for (int i = 0; i < v->n; i++) {
 		Tok *t = &v->v[i];
 		int k = t->kind;
-		if (k == T_IDENT) {
+		if (k == T_IDENT && is_builtin_const(t->str) && i + 1 < v->n && v->v[i+1].kind == T_LP) {
+			int d = 0;
+			do {
+				i++;
+				if (v->v[i].kind == T_LP) d++;
+				else if (v->v[i].kind == T_RP) d--;
+			} while (d > 0 && i + 1 < v->n);
+		} else if (k == T_IDENT) {
 			Sym *s = lookup(ctx, t->str);
 			if (!s || (s->kind != SYM_ENUMC && s->kind != SYM_TYPEDEF)) return 0;
 		} else if (k == T_STRUCT || k == T_UNION || k == T_ENUM) {
@@ -2960,7 +4034,28 @@ static long long offsetof_operand(Ctx *ctx) {
 			ty = m->ty;
 		} else if (consume(ctx, T_LBRACKET)) {
 			if (ty->kind != TY_ARRAY) error_at(ctx, "subscripted value is not an array");
-			off += const_expr(ctx) * ty->base->size;
+			TokVec v;
+			memset(&v, 0, sizeof(v));
+			for (int d = 0; d || ctx->tok.kind != T_RBRACKET; next(ctx)) {
+				if (ctx->tok.kind == T_EOF) error_at(ctx, "unexpected end of file");
+				if (ctx->tok.kind == T_LBRACKET || ctx->tok.kind == T_LP) d++;
+				else if (ctx->tok.kind == T_RBRACKET || ctx->tok.kind == T_RP) d--;
+				tv_push(&v, ctx->tok);
+			}
+			int k = tokens_const(ctx, &v);
+			replay(ctx, &v);
+			free(v.v);
+			if (k || !ctx->ofs_rt) off += const_expr(ctx) * ty->base->size;
+			else {
+				Code *c = &ctx->text;
+				if (ctx->ofs_have) gen_push(ctx);
+				Type *it = rval(ctx, parse_expr(ctx));
+				if (!is_integer(it)) error_at(ctx, "array subscript is not an integer");
+				gen_cast(ctx, it, ty_long);
+				C8(c,0x48); C8(c,0x69); C8(c,0xC0); C32(c,(uint32_t)ty->base->size);
+				if (ctx->ofs_have) { gen_pop(ctx, RCX); C8(c,0x48); C8(c,0x01); C8(c,0xC8); }
+				ctx->ofs_have = 1;
+			}
 			expect(ctx, T_RBRACKET);
 			ty = ty->base;
 		} else break;
@@ -2975,6 +4070,20 @@ static long long builtin_const(Ctx *ctx, char *name) {
 	if (name == id_constant_p) {
 		TokVec t = capture_expr(ctx);
 		v = tokens_const(ctx, &t);
+		if (!v && ctx->fn && ctx->fold) {
+			replay(ctx, &t);
+			Mark m = mark_code(ctx);
+			size_t ro = ctx->rodata.len;
+			int frame = ctx->fn->frame;
+			ctx->noasm++;
+			Type *ty = rval(ctx, parse_assign(ctx));
+			long long kv;
+			v = !is_flonum(ty) && expr_const(ctx, &kv);
+			ctx->noasm--;
+			drop_code(ctx, m);
+			ctx->rodata.len = ro;
+			ctx->fn->frame = frame;
+		}
 		free(t.v);
 	} else if (name == id_types_compatible_p) {
 		Type *a = parse_typename(ctx);
@@ -2989,141 +4098,431 @@ static int is_builtin_const(char *name) {
 	return name == id_constant_p || name == id_types_compatible_p || name == id_offsetof;
 }
 
-static long long ce_unary(Ctx *ctx) {
-	int k = ctx->tok.kind;
-	if (k == T_MINUS) { next(ctx); return -ce_unary(ctx); }
-	if (k == T_PLUS) { next(ctx); return ce_unary(ctx); }
-	if (k == T_TILDE) { next(ctx); return ~ce_unary(ctx); }
-	if (k == T_NOT) { next(ctx); return !ce_unary(ctx); }
-	if (k == T_SIZEOF) { next(ctx); return sizeof_operand(ctx); }
-	if (k == T_ALIGNOF) { next(ctx); return alignof_operand(ctx); }
-	if (k == T_LP) {
-		if (!ctx->in_pp_if && is_typename(ctx, peek(ctx))) {
-			next(ctx);
-			Type *t = parse_typename(ctx);
-			expect(ctx, T_RP);
-			return const_cast_val(ce_unary(ctx), t);
-		}
-		next(ctx);
-		long long v = const_expr(ctx);
-		expect(ctx, T_RP);
-		return v;
+typedef struct {
+	long long v;
+	long double f;
+	Type *ty;
+	Sym *sym;
+	int sect, lv;
+} CV;
+
+static int fold_binop(int op, Type *lt, Type *rt, long long a, long long b, long long *res, Type **rty);
+static CV ce_cast(Ctx *ctx);
+static CV ce_cond(Ctx *ctx);
+
+static CV cv_int(long long v, Type *t) {
+	CV c;
+	memset(&c, 0, sizeof(c));
+	c.ty = t;
+	c.v = const_cast_val(v, t);
+	c.sect = -1;
+	return c;
+}
+
+static int cv_reloc(CV *c) { return c->sym || c->sect >= 0; }
+
+static long double flt_round(long double f, Type *t) {
+	if (t->kind == TY_FLOAT) return (float)f;
+	if (t->kind == TY_DOUBLE) return (double)f;
+	return f;
+}
+
+static CV cv_flt(long double f, Type *t) {
+	CV c = cv_int(0, t);
+	c.f = flt_round(f, t);
+	return c;
+}
+
+static long double cv_f(CV *c) {
+	if (is_flonum(c->ty)) return c->f;
+	if (c->ty->is_unsigned) return (long double)(unsigned long long)c->v;
+	return (long double)c->v;
+}
+
+static long long flt_to_int(long double f, Type *t) {
+	if (t->kind == TY_BOOL) return f != 0;
+	if (t->size == 8 && t->is_unsigned) return (long long)(unsigned long long)f;
+	return const_cast_val((long long)f, t);
+}
+
+static CV cv_convert(CV c, Type *t) {
+	if (is_flonum(t)) return cv_flt(cv_f(&c), t);
+	if (is_flonum(c.ty)) return cv_int(flt_to_int(c.f, t), t);
+	return cv_int(c.v, t);
+}
+
+static int cv_truth(CV *c) { return cv_reloc(c) ? 1 : is_flonum(c->ty) ? c->f != 0 : c->v != 0; }
+
+static CV cv_rval(Ctx *ctx, CV c) {
+	if (c.ty->kind == TY_FUNC) { c.ty = ptr_to(c.ty); c.lv = 0; return c; }
+	if (!c.lv) return c;
+	if (c.ty->kind == TY_ARRAY) { c.ty = ptr_to(c.ty->base); c.lv = 0; return c; }
+	error_at(ctx, "expression must be constant here");
+	return c;
+}
+
+static long long cv_value(Ctx *ctx, CV c) {
+	c = cv_rval(ctx, c);
+	if (cv_reloc(&c)) error_at(ctx, "expression must be constant here");
+	if (is_flonum(c.ty)) return (long long)c.f;
+	return c.v;
+}
+
+static Type *num_type(Ctx *ctx, Tok *t) {
+	if (ctx->in_pp_if) return t->is_unsigned || (t->is_long && t->val < 0) ? ty_ulong : ty_long;
+	return t->is_long > 1 ? (t->is_unsigned ? ty_ullong : ty_llong)
+		: t->is_long ? (t->is_unsigned ? ty_ulong : ty_long)
+		: (t->is_unsigned ? ty_uint : ty_int);
+}
+
+static int bit_builtin(const char *n, long long a, long long *r, Type **t) {
+	unsigned long long u = (unsigned long long)a;
+	int w = 32;
+	char b[32];
+	if (strncmp(n, "__builtin_", 10)) return 0;
+	n += 10;
+	if (!strcmp(n, "bswap16")) { *r = (long long)(((u & 0xFF) << 8) | ((u >> 8) & 0xFF)); *t = ty_ushort; return 1; }
+	if (!strcmp(n, "bswap32") || !strcmp(n, "bswap64")) {
+		int nb = n[5] == '3' ? 4 : 8;
+		unsigned long long v = 0;
+		for (int i = 0; i < nb; i++) v |= ((u >> (8 * i)) & 0xFF) << (8 * (nb - 1 - i));
+		*r = (long long)v;
+		*t = nb == 4 ? ty_uint : ty_ulong;
+		return 1;
 	}
-	if (k == T_NUM) { long long v = ctx->tok.val; next(ctx); return v; }
-	if (k == T_FNUM) { long long v = (long long)ctx->tok.fval; next(ctx); return v; }
-	if (k == T_IDENT) {
-		char *name = ctx->tok.str;
-		if (is_builtin_const(name)) return builtin_const(ctx, name);
-		if (name == id_expect || name == id_choose_expr) {
-			next(ctx);
-			expect(ctx, T_LP);
-			long long v = const_expr(ctx);
-			expect(ctx, T_COMMA);
-			if (name == id_choose_expr) {
-				if (v) { v = const_expr(ctx); expect(ctx, T_COMMA); free(capture_expr(ctx).v); }
-				else { free(capture_expr(ctx).v); expect(ctx, T_COMMA); v = const_expr(ctx); }
-			} else const_expr(ctx);
-			expect(ctx, T_RP);
-			return v;
-		}
-		Sym *s = lookup(ctx, name);
-		if (s && s->kind == SYM_ENUMC) { next(ctx); return s->val; }
-		if (ctx->in_pp_if) { next(ctx); return 0; }
-		error_at(ctx, "'%s' is not a constant", ctx->tok.str);
-	}
-	error_at(ctx, "expected constant expression, got '%s'", tok_desc(&ctx->tok));
+	size_t l = strlen(n);
+	if (l >= 2 && !strcmp(n + l - 2, "ll")) { w = 64; l -= 2; }
+	else if (l >= 1 && n[l - 1] == 'l') { w = 64; l -= 1; }
+	if (l >= sizeof(b)) return 0;
+	memcpy(b, n, l);
+	b[l] = 0;
+	if (w == 32) u &= 0xFFFFFFFFULL;
+	int k = 0;
+	*t = ty_int;
+	if (!strcmp(b, "popcount")) { while (u) { k += (int)(u & 1); u >>= 1; } *r = k; return 1; }
+	if (!strcmp(b, "parity")) { while (u) { k ^= (int)(u & 1); u >>= 1; } *r = k; return 1; }
+	if (!strcmp(b, "ffs")) { if (!u) { *r = 0; return 1; } while (!(u & 1)) { u >>= 1; k++; } *r = k + 1; return 1; }
+	if (!u) return 0;
+	if (!strcmp(b, "ctz")) { while (!(u & 1)) { u >>= 1; k++; } *r = k; return 1; }
+	if (!strcmp(b, "clz")) { while (!(u >> (w - 1))) { u <<= 1; k++; } *r = k; return 1; }
 	return 0;
 }
 
-static long long ce_binary(Ctx *ctx, int minprec) {
-	long long l = ce_unary(ctx);
+static CV ce_primary(Ctx *ctx) {
+	int k = ctx->tok.kind;
+	if (k == T_SIZEOF) { next(ctx); return cv_int(sizeof_operand(ctx), ty_ulong); }
+	if (k == T_ALIGNOF) { next(ctx); return cv_int(alignof_operand(ctx), ty_ulong); }
+	if (k == T_LP) {
+		next(ctx);
+		CV c = ce_cond(ctx);
+		expect(ctx, T_RP);
+		return c;
+	}
+	if (k == T_NUM) {
+		if (ctx->tok.badnum) error_at(ctx, "invalid number literal");
+		Type *t = num_type(ctx, &ctx->tok);
+		long long v = ctx->tok.val;
+		next(ctx);
+		return cv_int(v, t);
+	}
+	if (k == T_FNUM) {
+		if (ctx->tok.badnum) error_at(ctx, "invalid floating constant");
+		if (ctx->tok.imag) error_at(ctx, "imaginary constants are not supported in constant expressions");
+		CV c;
+		if (ctx->tok.is_long) {
+			uint8_t b[16];
+			long double f;
+			memset(b, 0, sizeof(b));
+			ld_tok(&ctx->tok, b);
+			memcpy(&f, b, sizeof(f) < 16 ? sizeof(f) : 16);
+			c = cv_flt(f, ty_ldouble);
+		} else c = cv_flt(ctx->tok.fval, ctx->tok.is_float ? ty_float : ty_double);
+		next(ctx);
+		return c;
+	}
+	if (k == T_STR && !ctx->in_pp_if) {
+		Buf s; buf_init(&s);
+		int w = read_strs(ctx, &s);
+		CV c = cv_int(0, array_of(wide_type(w), (int)s.len / wide_size(w)));
+		c.v = add_rodata(ctx, s.data, s.len);
+		c.sect = SEC_RODATA;
+		c.lv = 1;
+		free(s.data);
+		return c;
+	}
+	if (k == T_IDENT) {
+		char *name = ctx->tok.str;
+		if (is_builtin_const(name)) return cv_int(builtin_const(ctx, name), name == id_offsetof ? ty_ulong : ty_int);
+		if (name == id_expect || name == id_choose_expr) {
+			next(ctx);
+			expect(ctx, T_LP);
+			CV c = ce_cond(ctx);
+			expect(ctx, T_COMMA);
+			if (name == id_choose_expr) {
+				long long v = cv_value(ctx, c);
+				if (v) { c = ce_cond(ctx); expect(ctx, T_COMMA); free(capture_expr(ctx).v); }
+				else { free(capture_expr(ctx).v); expect(ctx, T_COMMA); c = ce_cond(ctx); }
+			} else ce_cond(ctx);
+			expect(ctx, T_RP);
+			return c;
+		}
+		if (ctx->in_pp_if) { next(ctx); return cv_int(0, ty_long); }
+		Sym *s = lookup(ctx, name);
+		long long br;
+		Type *bt;
+		if (!s && peek(ctx)->kind == T_LP && bit_builtin(name, 1, &br, &bt)) {
+			next(ctx);
+			next(ctx);
+			long long a = cv_value(ctx, ce_cond(ctx));
+			expect(ctx, T_RP);
+			if (!bit_builtin(name, a, &br, &bt)) error_at(ctx, "%s of zero is undefined", name);
+			return cv_int(br, bt);
+		}
+		if (s && s->kind == SYM_ENUMC) { next(ctx); return cv_int(s->val, s->ty); }
+		if (s && (s->kind == SYM_VAR || s->kind == SYM_FUNC) && !s->is_local) {
+			Sym *g = s->global ? s->global : s;
+			if (!g->tls) {
+				next(ctx);
+				CV c = cv_int(0, s->ty);
+				c.sym = g;
+				c.lv = 1;
+				return c;
+			}
+		}
+		error_at(ctx, "'%s' is not a constant", name);
+	}
+	error_at(ctx, "expected constant expression, got '%s'", tok_desc(&ctx->tok));
+	return cv_int(0, ty_int);
+}
+
+static CV ce_postfix(Ctx *ctx) {
+	CV c = ce_primary(ctx);
+	for (;;) {
+		if (ctx->tok.kind == T_LBRACKET) {
+			next(ctx);
+			c = cv_rval(ctx, c);
+			CV i = cv_rval(ctx, ce_cond(ctx));
+			expect(ctx, T_RBRACKET);
+			if (!is_ptr(c.ty) || !is_integer(i.ty) || cv_reloc(&i)) error_at(ctx, "expression must be constant here");
+			c.v += i.v * c.ty->base->size;
+			c.ty = c.ty->base;
+			c.lv = 1;
+		} else if (ctx->tok.kind == T_DOT || ctx->tok.kind == T_ARROW) {
+			int arrow = ctx->tok.kind == T_ARROW;
+			next(ctx);
+			if (arrow) {
+				c = cv_rval(ctx, c);
+				if (!is_ptr(c.ty)) error_at(ctx, "member access on non-pointer");
+				c.ty = c.ty->base;
+			} else if (!c.lv) error_at(ctx, "expression must be constant here");
+			if (c.ty->kind != TY_STRUCT) error_at(ctx, "member access on non-struct");
+			if (ctx->tok.kind != T_IDENT) error_at(ctx, "expected member name");
+			Member *m = find_member(c.ty, ctx->tok.str);
+			if (!m) error_at(ctx, "no member named '%s'", ctx->tok.str);
+			next(ctx);
+			c.v += m->off;
+			c.ty = m->ty;
+			c.lv = 1;
+		} else return c;
+	}
+}
+
+static CV ce_unary(Ctx *ctx) {
+	int k = ctx->tok.kind;
+	if (k == T_AMP) {
+		next(ctx);
+		CV c = ce_cast(ctx);
+		if (!c.lv && c.ty->kind != TY_FUNC) error_at(ctx, "lvalue required as unary '&' operand");
+		c.ty = ptr_to(c.ty);
+		c.lv = 0;
+		return c;
+	}
+	if (k == T_MUL) {
+		next(ctx);
+		CV c = cv_rval(ctx, ce_cast(ctx));
+		if (!is_ptr(c.ty)) error_at(ctx, "invalid type argument of unary '*'");
+		c.ty = c.ty->base;
+		c.lv = 1;
+		return c;
+	}
+	if (k == T_MINUS || k == T_PLUS || k == T_TILDE || k == T_NOT) {
+		next(ctx);
+		CV c = cv_rval(ctx, ce_cast(ctx));
+		if (k == T_NOT) return cv_int(!cv_truth(&c), ty_int);
+		if (!cv_reloc(&c) && is_flonum(c.ty) && k != T_TILDE) return k == T_MINUS ? cv_flt(-c.f, c.ty) : c;
+		if (cv_reloc(&c) || !is_integer(c.ty)) error_at(ctx, "expression must be constant here");
+		Type *t = int_promote(c.ty);
+		long long v = const_cast_val(c.v, t);
+		if (k == T_MINUS) v = (long long)(0 - (unsigned long long)v);
+		else if (k == T_TILDE) v = ~v;
+		return cv_int(v, t);
+	}
+	return ce_postfix(ctx);
+}
+
+static CV ce_cast(Ctx *ctx) {
+	if (ctx->tok.kind == T_LP && !ctx->in_pp_if && is_typename(ctx, peek(ctx))) {
+		next(ctx);
+		Type *t = parse_typename(ctx);
+		expect(ctx, T_RP);
+		if (ctx->tok.kind == T_LB) {
+			if (!ctx->ginit) error_at(ctx, "expression must be constant here");
+			static int ncl;
+			char nb[64];
+			snprintf(nb, sizeof(nb), "__compound_literal.%d", ncl++);
+			Sym *g = (Sym *)calloc(1, sizeof(Sym));
+			g->name = intern(nb);
+			g->kind = SYM_VAR;
+			g->ty = t;
+			g->is_static = 1;
+			g->gnext = ctx->globals;
+			ctx->globals = g;
+			TokVec v;
+			memset(&v, 0, sizeof(v));
+			int d = 0;
+			do {
+				if (ctx->tok.kind == T_EOF) error_at(ctx, "unexpected end of file");
+				if (ctx->tok.kind == T_LB) d++;
+				else if (ctx->tok.kind == T_RB) d--;
+				tv_push(&v, ctx->tok);
+				next(ctx);
+			} while (d);
+			if (ctx->ncl == ctx->capcl) {
+				ctx->capcl = ctx->capcl ? ctx->capcl * 2 : 16;
+				ctx->cl = realloc(ctx->cl, sizeof(*ctx->cl) * (size_t)ctx->capcl);
+			}
+			ctx->cl[ctx->ncl].g = g;
+			ctx->cl[ctx->ncl++].v = v;
+			CV c = cv_int(0, t);
+			c.sym = g;
+			c.lv = 1;
+			return c;
+		}
+		CV c = cv_rval(ctx, ce_cast(ctx));
+		if (t->kind == TY_VOID) { c.ty = t; return c; }
+		if (cv_reloc(&c)) {
+			if (t->size != 8 || !(is_integer(t) || is_ptr(t))) error_at(ctx, "expression must be constant here");
+			c.ty = t;
+			return c;
+		}
+		if (t->kind == TY_STRUCT) error_at(ctx, "cast to struct type");
+		return cv_convert(c, t);
+	}
+	return ce_unary(ctx);
+}
+
+static CV ce_binary(Ctx *ctx, int minprec) {
+	CV l = ce_cast(ctx);
 	for (;;) {
 		int k = ctx->tok.kind;
 		int p = binop_prec(k);
 		if (p == 0 || p < minprec) return l;
 		next(ctx);
-		long long r = ce_binary(ctx, p + 1);
-		switch (k) {
-		case T_OR: l = l || r; break;
-		case T_AND: l = l && r; break;
-		case T_PIPE: l = l | r; break;
-		case T_CARET: l = l ^ r; break;
-		case T_AMP: l = l & r; break;
-		case T_EQ: l = l == r; break;
-		case T_NEQ: l = l != r; break;
-		case T_LT: l = l < r; break;
-		case T_GT: l = l > r; break;
-		case T_LEQ: l = l <= r; break;
-		case T_GEQ: l = l >= r; break;
-		case T_SHL: l = (long long)((unsigned long long)l << r); break;
-		case T_SHR: l = l >> r; break;
-		case T_PLUS: l = l + r; break;
-		case T_MINUS: l = l - r; break;
-		case T_MUL: l = l * r; break;
-		case T_DIV: l = r ? l / r : 0; break;
-		case T_MOD: l = r ? l % r : 0; break;
+		l = cv_rval(ctx, l);
+		if (k == T_AND || k == T_OR) {
+			int lv = cv_truth(&l);
+			if (k == T_AND ? !lv : lv) { ce_binary(ctx, p + 1); l = cv_int(k == T_OR, ty_int); continue; }
+			CV r = cv_rval(ctx, ce_binary(ctx, p + 1));
+			l = cv_int(cv_truth(&r), ty_int);
+			continue;
 		}
+		CV r = cv_rval(ctx, ce_binary(ctx, p + 1));
+		if ((is_flonum(l.ty) || is_flonum(r.ty)) && !cv_reloc(&l) && !cv_reloc(&r)) {
+			if (!is_arith(l.ty) || !is_arith(r.ty)) error_at(ctx, "invalid operands to binary operator");
+			Type *t = arith_conv(l.ty, r.ty);
+			long double a = cv_convert(l, t).f, b = cv_convert(r, t).f, f;
+			switch (k) {
+			case T_PLUS: f = t->kind == TY_FLOAT ? (float)a + (float)b : t->kind == TY_DOUBLE ? (double)a + (double)b : a + b; break;
+			case T_MINUS: f = t->kind == TY_FLOAT ? (float)a - (float)b : t->kind == TY_DOUBLE ? (double)a - (double)b : a - b; break;
+			case T_MUL: f = t->kind == TY_FLOAT ? (float)a * (float)b : t->kind == TY_DOUBLE ? (double)a * (double)b : a * b; break;
+			case T_DIV: f = t->kind == TY_FLOAT ? (float)a / (float)b : t->kind == TY_DOUBLE ? (double)a / (double)b : a / b; break;
+			case T_LT: l = cv_int(a < b, ty_int); continue;
+			case T_GT: l = cv_int(a > b, ty_int); continue;
+			case T_LEQ: l = cv_int(a <= b, ty_int); continue;
+			case T_GEQ: l = cv_int(a >= b, ty_int); continue;
+			case T_EQ: l = cv_int(a == b, ty_int); continue;
+			case T_NEQ: l = cv_int(a != b, ty_int); continue;
+			default: error_at(ctx, "invalid operands to binary operator"); f = 0;
+			}
+			l = cv_flt(f, t);
+			continue;
+		}
+		if ((k == T_PLUS || k == T_MINUS) && is_ptr(l.ty) && is_integer(r.ty) && !cv_reloc(&r)) {
+			long long sz = l.ty->base->kind == TY_VOID || l.ty->base->kind == TY_FUNC ? 1 : l.ty->base->size;
+			l.v += (k == T_PLUS ? r.v : -r.v) * sz;
+			continue;
+		}
+		if (k == T_PLUS && is_integer(l.ty) && is_ptr(r.ty) && !cv_reloc(&l)) {
+			long long sz = r.ty->base->kind == TY_VOID || r.ty->base->kind == TY_FUNC ? 1 : r.ty->base->size;
+			r.v += l.v * sz;
+			l = r;
+			continue;
+		}
+		if (cv_reloc(&l) || cv_reloc(&r)) {
+			int same = l.sym == r.sym && l.sect == r.sect;
+			if (k == T_MINUS && same) {
+				long long sz = is_ptr(l.ty) && l.ty->base->size > 0 ? l.ty->base->size : 1;
+				l = cv_int((l.v - r.v) / sz, ty_long);
+				continue;
+			}
+			if ((k == T_PLUS || k == T_MINUS) && cv_reloc(&l) && !cv_reloc(&r) && is_integer(r.ty)) {
+				l.v += k == T_PLUS ? r.v : -r.v;
+				continue;
+			}
+			if ((k == T_EQ || k == T_NEQ) && (same || (!cv_reloc(&r) && !r.v) || (!cv_reloc(&l) && !l.v))) {
+				int eq = same && l.v == r.v;
+				l = cv_int(k == T_EQ ? eq : !eq, ty_int);
+				continue;
+			}
+			error_at(ctx, "expression must be constant here");
+		}
+		Type *lt = is_ptr(l.ty) ? ty_ulong : l.ty, *rt = is_ptr(r.ty) ? ty_ulong : r.ty;
+		long long res;
+		Type *rty;
+		if (fold_binop(k, lt, rt, l.v, r.v, &res, &rty)) { l = cv_int(res, rty); continue; }
+		if ((k == T_DIV || k == T_MOD) && !r.v) error_at(ctx, "division by zero in a constant expression");
+		if (k == T_SHL || k == T_SHR) { l = cv_int(k == T_SHL ? (long long)((unsigned long long)l.v << (r.v & 63)) : l.v >> (r.v & 63), int_promote(lt)); continue; }
+		l = cv_int(k == T_DIV ? l.v / r.v : l.v % r.v, arith_conv(lt, rt));
 	}
 }
 
-static long long ce_cond(Ctx *ctx) {
-	long long c = ce_binary(ctx, 1);
+static void ce_skip(Ctx *ctx) {
+	int d = 0, q = 0;
+	for (;; next(ctx)) {
+		int k = ctx->tok.kind;
+		if (k == T_EOF) error_at(ctx, "unexpected end of expression");
+		if (k == T_LP || k == T_LBRACKET || k == T_LB) d++;
+		else if (k == T_RP || k == T_RBRACKET || k == T_RB) { if (!d) return; d--; }
+		else if (!d && (k == T_COMMA || k == T_SEMI)) return;
+		else if (!d && k == T_QUESTION) q++;
+		else if (!d && k == T_COLON) { if (!q) return; q--; }
+	}
+}
+
+static CV ce_cond(Ctx *ctx) {
+	CV c = ce_binary(ctx, 1);
 	if (!consume(ctx, T_QUESTION)) return c;
-	long long a = const_expr(ctx);
-	expect(ctx, T_COLON);
-	long long b = ce_cond(ctx);
-	return c ? a : b;
-}
-
-static long long const_expr(Ctx *ctx) { return ce_cond(ctx); }
-
-static double fce_add(Ctx *ctx);
-
-static double fce_unary(Ctx *ctx) {
-	int k = ctx->tok.kind;
-	if (k == T_MINUS) { next(ctx); return -fce_unary(ctx); }
-	if (k == T_PLUS) { next(ctx); return fce_unary(ctx); }
-	if (k == T_LP) {
-		if (is_typename(ctx, peek(ctx))) {
-			next(ctx);
-			Type *t = parse_typename(ctx);
-			expect(ctx, T_RP);
-			double v = fce_unary(ctx);
-			if (t->kind == TY_FLOAT) return (float)v;
-			if (is_integer(t)) return (double)const_cast_val((long long)v, t);
-			return v;
-		}
+	c = cv_rval(ctx, c);
+	int t = cv_truth(&c);
+	if (ctx->tok.kind == T_COLON) {
 		next(ctx);
-		double v = fce_add(ctx);
-		expect(ctx, T_RP);
-		return v;
+		CV b = ce_cond(ctx);
+		return t ? c : cv_rval(ctx, b);
 	}
-	if (k == T_FNUM) { double v = ctx->tok.fval; next(ctx); return v; }
-	if (k == T_NUM) {
-		double v = ctx->tok.is_unsigned ? (double)(unsigned long long)ctx->tok.val : (double)ctx->tok.val;
-		next(ctx);
-		return v;
+	CV r;
+	if (t) {
+		r = cv_rval(ctx, ce_cond(ctx));
+		expect(ctx, T_COLON);
+		ce_skip(ctx);
+	} else {
+		ce_skip(ctx);
+		expect(ctx, T_COLON);
+		r = cv_rval(ctx, ce_cond(ctx));
 	}
-	return (double)ce_unary(ctx);
+	return r;
 }
 
-static double fce_mul(Ctx *ctx) {
-	double v = fce_unary(ctx);
-	for (;;) {
-		if (consume(ctx, T_MUL)) v = v * fce_unary(ctx);
-		else if (consume(ctx, T_DIV)) v = v / fce_unary(ctx);
-		else return v;
-	}
-}
-
-static double fce_add(Ctx *ctx) {
-	double v = fce_mul(ctx);
-	for (;;) {
-		if (consume(ctx, T_PLUS)) v = v + fce_mul(ctx);
-		else if (consume(ctx, T_MINUS)) v = v - fce_mul(ctx);
-		else return v;
-	}
-}
+static long long const_expr(Ctx *ctx) { return cv_value(ctx, ce_cond(ctx)); }
 
 static uint64_t float_bits(double v, Type *t) {
 	if (t->kind == TY_FLOAT) {
@@ -3138,6 +4537,7 @@ static uint64_t float_bits(double v, Type *t) {
 }
 
 static long long type_size_checked(Ctx *ctx, Type *t) {
+	ctx->sizeof_vla = t->vla;
 	if (t->kind == TY_STRUCT && !t->complete) error_at(ctx, "invalid application of 'sizeof' to an incomplete type");
 	if (t->bit_width) error_at(ctx, "'sizeof' applied to a bit-field");
 	return t->size;
@@ -3151,7 +4551,10 @@ static long long sizeof_operand(Ctx *ctx) {
 		return type_size_checked(ctx, t);
 	}
 	Mark m = mark_code(ctx);
+	int fold = ctx->fold;
+	ctx->fold = 1;
 	Type *t = parse_unary(ctx);
+	ctx->fold = fold;
 	drop_code(ctx, m);
 	return type_size_checked(ctx, t);
 }
@@ -3176,7 +4579,7 @@ enum { CL_INT = 1, CL_SSE = 2 };
 static int classify_at(Type *t, int off, int *cls) {
 	if (t->kind == TY_STRUCT) {
 		for (Member *m = t->members; m; m = m->next)
-			if (!classify_at(m->ty, off + m->off, cls)) return 0;
+			if (!m->flat && !classify_at(m->ty, off + m->off, cls)) return 0;
 		return 1;
 	}
 	if (t->kind == TY_ARRAY) {
@@ -3185,6 +4588,8 @@ static int classify_at(Type *t, int off, int *cls) {
 		return 1;
 	}
 	if (t->bit_width) { cls[off / 8] |= CL_INT; return 1; }
+	if (t->kind == TY_LDOUBLE) return 0;
+	if (t->kind == TY_COMPLEX) return classify_at(t->base, off, cls) && classify_at(t->base, off + t->base->size, cls);
 	if (t->size == 0) return 1;
 	if (off % t->size || off / 8 > 1) return 0;
 	cls[off / 8] |= is_flonum(t) ? CL_SSE : CL_INT;
@@ -3194,7 +4599,8 @@ static int classify_at(Type *t, int off, int *cls) {
 static int classify(Type *t, int *cls) {
 	cls[0] = cls[1] = 0;
 	if (t->kind == TY_VOID) return 0;
-	if (t->kind != TY_STRUCT) { cls[0] = is_flonum(t) ? CL_SSE : CL_INT; return 1; }
+	if (t->kind == TY_LDOUBLE || (t->kind == TY_COMPLEX && t->base->kind == TY_LDOUBLE)) return -1;
+	if (t->kind != TY_STRUCT && t->kind != TY_COMPLEX) { cls[0] = is_flonum(t) ? CL_SSE : CL_INT; return 1; }
 	if (t->size > 16 || !classify_at(t, 0, cls)) return -1;
 	int n = (t->size + 7) / 8;
 	for (int i = 0; i < n; i++) if (cls[i] & CL_INT) cls[i] = CL_INT;
@@ -3278,6 +4684,9 @@ static const MachBuiltin mach_builtins[] = {
 	{ "__write_cr4", 1, { RAX }, &ty_void, 3, "\x0F\x22\xE0" },
 	{ "__rdmsr", 1, { RCX }, &ty_ulong, 9, "\x0F\x32\x48\xC1\xE2\x20\x48\x09\xD0" },
 	{ "__wrmsr", 2, { RCX, RAX }, &ty_void, 9, "\x48\x89\xC2\x48\xC1\xEA\x20\x0F\x30" },
+	{ "__builtin_bswap16", 1, { RAX }, &ty_ushort, 7, "\x66\xC1\xC0\x08\x0F\xB7\xC0" },
+	{ "__builtin_bswap32", 1, { RAX }, &ty_uint, 2, "\x0F\xC8" },
+	{ "__builtin_bswap64", 1, { RAX }, &ty_ulong, 3, "\x48\x0F\xC8" },
 	{ "__invlpg", 1, { RAX }, &ty_void, 3, "\x0F\x01\x38" },
 	{ "__cpuid", 3, { RAX, RCX, RDI }, &ty_void, 15, "\x53\x0F\xA2\x89\x07\x89\x5F\x04\x89\x4F\x08\x89\x57\x0C\x5B" },
 	{ "__rdtsc", 0, { 0 }, &ty_ulong, 9, "\x0F\x31\x48\xC1\xE2\x20\x48\x09\xD0" },
@@ -3286,6 +4695,7 @@ static const MachBuiltin mach_builtins[] = {
 static char *mach_ids[sizeof(mach_builtins) / sizeof(mach_builtins[0])];
 
 static Type *parse_builtin_mach(Ctx *ctx, const MachBuiltin *b) {
+	ctx->sidefx++;
 	Code *c = &ctx->text;
 	next(ctx);
 	expect(ctx, T_LP);
@@ -3323,6 +4733,24 @@ static Type *parse_builtin_va_start(Ctx *ctx) {
 	return ty_void;
 }
 
+static Type *parse_builtin_va_end(Ctx *ctx, int copy) {
+	Code *c = &ctx->text;
+	next(ctx);
+	expect(ctx, T_LP);
+	rval(ctx, parse_assign(ctx));
+	if (copy) {
+		gen_push(ctx);
+		expect(ctx, T_COMMA);
+		rval(ctx, parse_assign(ctx));
+		emit_mov_reg_reg(c, RSI, RAX);
+		gen_pop(ctx, RDI);
+		emit_memcpy(c, 24);
+	}
+	expect(ctx, T_RP);
+	ctx->lv = 0;
+	return ty_void;
+}
+
 static Type *parse_builtin_va_arg(Ctx *ctx) {
 	Code *c = &ctx->text;
 	int cls[2];
@@ -3349,7 +4777,7 @@ static Type *parse_builtin_va_arg(Ctx *ctx) {
 			C8(c,0x3D); C32(c,(uint32_t)(176 - 16 * ns));
 			C8(c,0x0F); C8(c,0x87); stack[nj++] = Cpos(c); C32(c,0);
 		}
-		int tmp = t->kind == TY_STRUCT ? alloc_local(ctx, 16, 16) : 0;
+		int tmp = t->kind == TY_STRUCT || t->kind == TY_COMPLEX ? alloc_local(ctx, 16, 16) : 0;
 		for (int i = 0; i < n; i++) {
 			if (!cls[i]) continue;
 			int fp = cls[i] == CL_SSE;
@@ -3380,8 +4808,16 @@ static Type *parse_builtin_va_arg(Ctx *ctx) {
 	return t;
 }
 
+static int returns_twice(Sym *g) {
+	static const char *names[] = { "setjmp", "_setjmp", "sigsetjmp", "__sigsetjmp", "savectx", "vfork", "getcontext", NULL };
+	if (g->twice || (g->global && g->global->twice)) return 1;
+	for (int i = 0; names[i]; i++) if (!strcmp(g->name, names[i])) return 1;
+	return 0;
+}
+
 static Type *parse_call(Ctx *ctx, Type *fty) {
 	Code *c = &ctx->text;
+	ctx->sidefx++;
 	Sym *direct = NULL;
 	if (fty->kind == TY_FUNC && ctx->fn_lea_sym && ctx->fn_lea_end == Cpos(c)) {
 		direct = ctx->fn_lea_sym;
@@ -3431,7 +4867,7 @@ static Type *parse_call(Ctx *ctx, Type *fty) {
 			where[a] = -1;
 			gp += ng;
 			sse += ns;
-			if (ats[a]->kind == TY_STRUCT && n > 0) tmp[a] = alloc_local(ctx, 16, 16);
+			if ((ats[a]->kind == TY_STRUCT || ats[a]->kind == TY_COMPLEX) && n > 0) tmp[a] = alloc_local(ctx, 16, 16);
 		} else {
 			if (ats[a]->align > 8) stk = (int)align_up((size_t)stk, 16);
 			where[a] = stk;
@@ -3446,7 +4882,7 @@ static Type *parse_call(Ctx *ctx, Type *fty) {
 	for (int a = 0; a < nargs; a++) {
 		int disp = area + 8 * (nargs - 1 - a);
 		if (where[a] >= 0) {
-			if (ats[a]->kind == TY_STRUCT) {
+			if (ats[a]->kind == TY_STRUCT || ats[a]->kind == TY_LDOUBLE || ats[a]->kind == TY_COMPLEX) {
 				emit_load_rsp(c, RSI, disp);
 				C8(c,0x48); C8(c,0x8D); C8(c,0xBC); C8(c,0x24); C32(c,(uint32_t)where[a]);
 				emit_memcpy(c, ats[a]->size);
@@ -3466,7 +4902,7 @@ static Type *parse_call(Ctx *ctx, Type *fty) {
 		if (where[a] >= 0) continue;
 		int disp = area + 8 * (nargs - 1 - a);
 		int n = classify(ats[a], cls);
-		if (ats[a]->kind != TY_STRUCT) {
+		if (ats[a]->kind != TY_STRUCT && ats[a]->kind != TY_COMPLEX) {
 			if (cls[0] == CL_SSE) emit_movq_xmm_load(c, sse++, RSP, disp);
 			else emit_load_rsp(c, argregs[gp++], disp);
 			continue;
@@ -3476,6 +4912,14 @@ static Type *parse_call(Ctx *ctx, Type *fty) {
 			else if (cls[i] == CL_SSE) emit_movq_xmm_load(c, sse++, RBP, tmp[a] + 8 * i);
 		}
 	}
+	int outer = ctx->sp - nargs - (direct ? 0 : 1), save = 0;
+	if (direct && outer > 0 && returns_twice(direct)) {
+		save = alloc_local(ctx, 8 * outer, 8);
+		for (int j = 0; j < outer; j++) {
+			emit_load_rsp(c, R11, area + 8 * (nargs + j));
+			emit_store_rbp(c, R11, save + 8 * j);
+		}
+	}
 	if (!direct) emit_load_rsp(c, R11, area + 8 * nargs);
 	if (sse) emit_mov_rax_imm(c, sse);
 	else emit_xor_eax_eax(c);
@@ -3483,8 +4927,17 @@ static Type *parse_call(Ctx *ctx, Type *fty) {
 	else emit_call_r11(c);
 	int drop = extra + nargs + (direct ? 0 : 1);
 	if (drop) emit_add_rsp(c, drop * 8);
+	for (int j = 0; save && j < outer; j++) {
+		emit_load_rbp(c, R11, save + 8 * j);
+		C8(c,0x4C); C8(c,0x89); C8(c,0x9C); C8(c,0x24); C32(c,(uint32_t)(8 * j));
+	}
 	ctx->sp -= nargs + (direct ? 0 : 1);
-	if (ret->kind == TY_STRUCT && rn >= 0) {
+	if (ret->kind == TY_COMPLEX && rn < 0) {
+		int t = alloc_local(ctx, 32, 16);
+		emit_x87(c, 0xDB, 7, RBP, t);
+		emit_x87(c, 0xDB, 7, RBP, t + 16);
+		emit_lea_rbp(c, RAX, t);
+	} else if ((ret->kind == TY_STRUCT || ret->kind == TY_COMPLEX) && rn >= 0) {
 		int t = alloc_local(ctx, 16, 16), g = 0, x = 0;
 		static const int retregs[2] = { RAX, RDX };
 		for (int i = 0; i < rn; i++) {
@@ -3492,7 +4945,8 @@ static Type *parse_call(Ctx *ctx, Type *fty) {
 			else if (rcls[i] == CL_SSE) emit_movq_xmm_store(c, x++, RBP, t + 8 * i);
 		}
 		emit_lea_rbp(c, RAX, t);
-	} else if (ret->kind == TY_DOUBLE) emit_movq_rax_xmm0(c);
+	} else if (ret->kind == TY_LDOUBLE) ld_store_temp(ctx);
+	else if (ret->kind == TY_DOUBLE) emit_movq_rax_xmm0(c);
 	else if (ret->kind == TY_FLOAT) emit_movd_eax_xmm0(c);
 	else emit_extend_ret(c, canon(ret));
 	free(ats); free(where); free(tmp);
@@ -3515,15 +4969,19 @@ static int is_expr_stmt(Ctx *ctx) {
 
 static void define_label(Ctx *ctx);
 
+static int local_labels(Ctx *ctx);
+
 static Type *parse_stmt_expr(Ctx *ctx) {
 	if (!ctx->fn) error_at(ctx, "statement expression outside a function");
 	next(ctx);
 	next(ctx);
 	enter_scope(ctx);
+	ctx->sx_depth++;
 	Type *ty = ty_void;
 	while (ctx->tok.kind != T_RB) {
 		if (ctx->tok.kind == T_EOF) error_at(ctx, "unexpected EOF in statement expression");
 		ty = ty_void;
+		if (local_labels(ctx)) continue;
 		if (ctx->tok.kind == T_IDENT && peek(ctx)->kind == T_COLON) { define_label(ctx); continue; }
 		if (is_expr_stmt(ctx)) {
 			Type *t = parse_expr(ctx);
@@ -3532,6 +4990,8 @@ static Type *parse_stmt_expr(Ctx *ctx) {
 			ctx->lv = 0;
 		} else parse_stmt(ctx);
 	}
+	ctx->sx_depth--;
+	ctx->jumped = 0;
 	leave_scope(ctx);
 	next(ctx);
 	expect(ctx, T_RP);
@@ -3547,8 +5007,12 @@ static Type *parse_builtin_expect(Ctx *ctx) {
 	gen_cast(ctx, t, ty_long);
 	expect(ctx, T_COMMA);
 	Mark m = mark_code(ctx);
+	size_t ks = ctx->k_start, ke = ctx->k_end;
+	long long kv = ctx->k_val;
+	int kn = ctx->k_nrel, ki = ctx->k_ice;
 	parse_assign(ctx);
 	drop_code(ctx, m);
+	ctx->k_start = ks; ctx->k_end = ke; ctx->k_val = kv; ctx->k_nrel = kn; ctx->k_ice = ki;
 	expect(ctx, T_RP);
 	return ty_long;
 }
@@ -3633,20 +5097,161 @@ static Type *parse_generic(Ctx *ctx) {
 	return res;
 }
 
+static int libc_builtin(const char *n) {
+	static const char *names[] = {
+		"memcpy", "memmove", "memset", "memchr", "strcpy", "strncpy", "strcat", "strncat", "strchr", "strrchr",
+		"strstr", "malloc", "calloc", NULL,
+		"strlen", "strnlen", NULL,
+		"memcmp", "strcmp", "strncmp", "abort", "abs", "labs", "printf", "sprintf", "snprintf", "puts",
+		"putchar", "free", NULL
+	};
+	int k = 2;
+	for (int i = 0; k < 5; i++) {
+		if (!names[i]) { k++; continue; }
+		if (!strcmp(n, names[i])) return k == 4 ? 1 : k;
+	}
+	return 0;
+}
+
+static Type *inline_call(Ctx *ctx, Sym *g) {
+	Code *c = &ctx->text;
+	Type *fty = g->ty;
+	int n = fty->nparams;
+	Sym *ps = (Sym *)calloc((size_t)n + 1, sizeof(Sym));
+	next(ctx);
+	int i = 0;
+	for (Param *p = fty->params; p; p = p->next, i++) {
+		if (i) expect(ctx, T_COMMA);
+		if (ctx->tok.kind == T_RP) error_at(ctx, "wrong number of arguments (expected %d, got %d)", n, i);
+		Type *pt = p->ty;
+		size_t pos = Cpos(c);
+		int sp = ctx->sp, fx = ctx->sidefx, used = 0;
+		for (int b = 0; b < g->nbody && !used; b++) used = g->body[b].kind == T_IDENT && g->body[b].str == p->name;
+		int off = alloc_local(ctx, pt->size > 0 ? pt->size : 8, pt->align > 0 ? pt->align : 8);
+		emit_lea_rbp(c, RAX, off);
+		gen_push(ctx);
+		Type *at = rval(ctx, parse_assign(ctx));
+		long long kv;
+		ps[i].name = p->name;
+		ps[i].ty = pt;
+		if (p->name && !used && fx == ctx->sidefx) {
+			drop_to(ctx, pos, sp);
+			ps[i].kind = SYM_ENUMC;
+			ps[i].val = 0;
+			continue;
+		}
+		if ((is_integer(pt) || is_ptr(pt)) && (is_integer(at) || is_ptr(at)) && p->name && !param_written(g, p->name) && expr_const(ctx, &kv)) {
+			drop_to(ctx, pos, sp);
+			ps[i].kind = SYM_ENUMC;
+			ps[i].val = const_cast_val(kv, pt);
+			continue;
+		}
+		ps[i].kind = SYM_VAR;
+		ps[i].stack_off = off;
+		if (pt->kind == TY_STRUCT) {
+			gen_pop(ctx, RDI);
+			gen_struct_copy_to_rdi(ctx, pt->size);
+		} else {
+			if (is_scalar(pt) && is_scalar(at)) gen_cast(ctx, at, pt);
+			gen_pop(ctx, RCX);
+			emit_store_type(c, pt);
+		}
+	}
+	if (i != n) error_at(ctx, "wrong number of arguments (expected %d, got %d)", n, i);
+	if (ctx->tok.kind == T_COMMA) error_at(ctx, "too many arguments to '%s'", g->name);
+	expect(ctx, T_RP);
+	Inl in;
+	memset(&in, 0, sizeof(in));
+	in.fn = g;
+	in.ret = fty->base;
+	in.id = ++ctx->inl_count;
+	in.dead_base = ctx->dead;
+	in.up = ctx->inl;
+	if (in.ret->kind == TY_STRUCT || in.ret->kind == TY_COMPLEX) in.tmp = alloc_local(ctx, in.ret->size, in.ret->align);
+	Sym *scope = ctx->scope;
+	Tag *tags = ctx->tags;
+	LoopCtx *loops = ctx->loops.top;
+	int cond_depth = ctx->cond_depth;
+	while (ctx->scope && ctx->scope->depth > 0) ctx->scope = ctx->scope->next;
+	while (ctx->tags && ctx->tags->depth > 0) ctx->tags = ctx->tags->next;
+	ctx->loops.top = NULL;
+	ctx->inl = &in;
+	ctx->inl_depth++;
+	enter_scope(ctx);
+	for (i = 0; i < n; i++) {
+		if (!ps[i].name) continue;
+		Sym *s = push_sym(ctx, ps[i].name, (SymKind)ps[i].kind, ps[i].ty);
+		s->bound = 1;
+		s->is_local = ps[i].kind == SYM_VAR;
+		s->stack_off = ps[i].stack_off;
+		s->val = ps[i].val;
+	}
+	free(ps);
+	TokVec v;
+	v.v = g->body;
+	v.n = v.cap = g->nbody;
+	replay(ctx, &v);
+	parse_stmt(ctx);
+	leave_scope(ctx);
+	if (in.rets.n && in.rets.v[in.rets.n - 1] + 4 == Cpos(c)) {
+		c->b.len -= 5;
+		in.rets.n--;
+	}
+	if (in.rets.n) ctx->k_end = (size_t)-1;
+	for (i = 0; i < in.rets.n; i++) patch_jmp_to(&c->b, in.rets.v[i], Cpos(c));
+	ctx->k_ice = 0;
+	free(in.rets.v);
+	ctx->inl_depth--;
+	ctx->jumped = 0;
+	ctx->inl = in.up;
+	ctx->scope = scope;
+	ctx->tags = tags;
+	ctx->loops.top = loops;
+	ctx->cond_depth = cond_depth;
+	ctx->lv = 0;
+	ctx->fn_lea_sym = NULL;
+	return in.ret;
+}
+
 static Type *parse_primary(Ctx *ctx) {
 	Code *c = &ctx->text;
 	ctx->lv = 0;
 	if (ctx->tok.kind == T_GENERIC) return parse_generic(ctx);
 	if (ctx->tok.kind == T_NUM) {
+		if (ctx->tok.badnum) error_at(ctx, "invalid number literal");
 		Type *ty = ctx->tok.is_long > 1 ? (ctx->tok.is_unsigned ? ty_ullong : ty_llong)
 			: ctx->tok.is_long ? (ctx->tok.is_unsigned ? ty_ulong : ty_long)
 			: (ctx->tok.is_unsigned ? ty_uint : ty_int);
-		emit_mov_rax_imm(c, ctx->tok.val);
+		emit_const(ctx, ctx->tok.val);
 		next(ctx);
 		return ty;
 	}
 	if (ctx->tok.kind == T_FNUM) {
+		if (ctx->tok.badnum) error_at(ctx, "invalid floating constant");
 		if (ctx->no_float) error_at(ctx, "floating point is disabled by -mgeneral-regs-only");
+		if (ctx->tok.imag) {
+			Type *bt = ctx->tok.is_long ? ty_ldouble : ctx->tok.is_float ? ty_float : ty_double;
+			uint8_t b[32];
+			memset(b, 0, sizeof(b));
+			if (bt == ty_ldouble) ld_tok(&ctx->tok, b + 16);
+			else {
+				uint64_t bits = float_bits(ctx->tok.fval, bt);
+				memcpy(b + bt->size, &bits, (size_t)bt->size);
+			}
+			emit_lea_rodata(ctx, RAX, add_rodata(ctx, b, (size_t)(2 * bt->size)));
+			next(ctx);
+			ctx->lv = 0;
+			return complex_of(bt);
+		}
+		if (ctx->tok.is_long) {
+			uint8_t b[16];
+			memset(b, 0, sizeof(b));
+			ld_tok(&ctx->tok, b);
+			emit_lea_rodata(ctx, RAX, add_rodata(ctx, b, 16));
+			next(ctx);
+			ctx->lv = 0;
+			return ty_ldouble;
+		}
 		Type *ty = ctx->tok.is_float ? ty_float : ty_double;
 		uint64_t bits = float_bits(ctx->tok.fval, ty);
 		if (bits <= 0xFFFFFFFFULL) emit_mov_rax_imm(c, (long long)bits);
@@ -3656,14 +5261,13 @@ static Type *parse_primary(Ctx *ctx) {
 	}
 	if (ctx->tok.kind == T_STR) {
 		Buf s; buf_init(&s);
-		while (ctx->tok.kind == T_STR) { buf_append(&s, ctx->tok.str, ctx->tok.len); next(ctx); }
-		buf_append_byte(&s, 0);
+		int w = read_strs(ctx, &s);
 		long off = add_rodata(ctx, s.data, s.len);
 		emit_lea_rodata(ctx, RAX, off);
-		int n = (int)s.len;
+		int n = (int)s.len / wide_size(w);
 		free(s.data);
 		ctx->lv = 1;
-		return array_of(ty_char, n);
+		return array_of(wide_type(w), n);
 	}
 	if (ctx->tok.kind == T_LP && peek(ctx)->kind == T_LB) return parse_stmt_expr(ctx);
 	if (ctx->tok.kind == T_LP) {
@@ -3677,8 +5281,38 @@ static Type *parse_primary(Ctx *ctx) {
 		if (name == id_syscall) return parse_builtin_syscall(ctx);
 		if (name == id_va_start) return parse_builtin_va_start(ctx);
 		if (name == id_va_arg) return parse_builtin_va_arg(ctx);
+		if (name == id_va_end || name == id_va_copy) return parse_builtin_va_end(ctx, name == id_va_copy);
+		if (!strcmp(name, "__builtin_alloca") && peek(ctx)->kind == T_LP && !lookup(ctx, name)) {
+			if (!ctx->fn) error_at(ctx, "alloca outside a function");
+			next(ctx);
+			next(ctx);
+			Type *nt = rval(ctx, parse_assign(ctx));
+			expect(ctx, T_RP);
+			if (!is_integer(nt)) error_at(ctx, "alloca needs an integer size");
+			emit_add_rax_imm(c, 15);
+			C8(c,0x48); C8(c,0x83); C8(c,0xE0); C8(c,0xF0);
+			emit_mov_reg_reg(c, RSI, RSP);
+			C8(c,0x48); C8(c,0x29); C8(c,0xC4);
+			emit_mov_reg_reg(c, RDI, RSP);
+			emit_mov_ecx_imm(c, (uint32_t)ctx->sp);
+			C8(c,0xF3); C8(c,0x48); C8(c,0xA5);
+			emit_mov_reg_reg(c, RAX, RDI);
+			ctx->sidefx++;
+			ctx->lv = 0;
+			return ptr_to(ty_void);
+		}
+		if (name == id_offsetof && ctx->fn) {
+			ctx->ofs_rt = 1;
+			ctx->ofs_have = 0;
+			long long off = builtin_const(ctx, name);
+			ctx->ofs_rt = 0;
+			if (ctx->ofs_have) emit_add_rax_imm(c, off);
+			else emit_const(ctx, off);
+			ctx->lv = 0;
+			return ty_ulong;
+		}
 		if (is_builtin_const(name)) {
-			emit_mov_rax_imm(c, builtin_const(ctx, name));
+			emit_const(ctx, builtin_const(ctx, name));
 			return name == id_offsetof ? ty_ulong : ty_int;
 		}
 		if (name == id_expect) return parse_builtin_expect(ctx);
@@ -3701,11 +5335,74 @@ static Type *parse_primary(Ctx *ctx) {
 			if (name == id_return_address) { C8(c,0x48); C8(c,0x8B); C8(c,0x40); C8(c,0x08); }
 			return ptr_to(ty_void);
 		}
-		if (name[0] == '_' && name[1] == '_')
+		if ((!strcmp(name, "__builtin_prefetch") || !strcmp(name, "__builtin_extract_return_addr")) && !lookup(ctx, name)) {
+			int pf = name[10] == 'p';
+			next(ctx);
+			expect(ctx, T_LP);
+			Type *at = rval(ctx, parse_assign(ctx));
+			while (consume(ctx, T_COMMA)) {
+				gen_push(ctx);
+				rval(ctx, parse_assign(ctx));
+				gen_pop(ctx, RAX);
+			}
+			expect(ctx, T_RP);
+			ctx->lv = 0;
+			return pf ? ty_void : at;
+		}
+		if (!strcmp(name, "__builtin_object_size") && !lookup(ctx, name)) {
+			next(ctx);
+			expect(ctx, T_LP);
+			Mark m = mark_code(ctx);
+			rval(ctx, parse_assign(ctx));
+			drop_code(ctx, m);
+			expect(ctx, T_COMMA);
+			long long kind = const_expr(ctx);
+			expect(ctx, T_RP);
+			emit_const(ctx, kind < 2 ? -1 : 0);
+			return ty_ulong;
+		}
+		long long br;
+		Type *bt;
+		if (name[0] == '_' && name[1] == '_' && !lookup(ctx, name) && peek(ctx)->kind == T_LP && bit_builtin(name, 1, &br, &bt)) {
+			next(ctx);
+			next(ctx);
+			Type *at = rval(ctx, parse_assign(ctx));
+			expect(ctx, T_RP);
+			if (!is_integer(at)) error_at(ctx, "%s needs an integer argument", name);
+			long long kv;
+			if (expr_const(ctx, &kv) && bit_builtin(name, kv, &br, &bt)) {
+				drop_to(ctx, ctx->k_start, ctx->sp);
+				emit_const(ctx, br);
+				return bt;
+			}
+			const char *b = name + 10;
+			int w64 = b[strlen(b) - 1] == 'l';
+			if (!strncmp(b, "bswap", 5)) {
+				w64 = b[5] == '6';
+				if (b[5] == '1') { C8(c,0x66); C8(c,0xC1); C8(c,0xC0); C8(c,0x08); C8(c,0x0F); C8(c,0xB7); C8(c,0xC0); }
+				else { if (w64) C8(c,0x48); C8(c,0x0F); C8(c,0xC8); }
+				ctx->lv = 0;
+				return bt;
+			}
+			if (!w64) { C8(c,0x89); C8(c,0xC0); }
+			if (!strncmp(b, "ctz", 3)) { C8(c,0x48); C8(c,0x0F); C8(c,0xBC); C8(c,0xC0); }
+			else if (!strncmp(b, "clz", 3)) {
+				C8(c,0x48); C8(c,0x0F); C8(c,0xBD); C8(c,0xC0);
+				C8(c,0x83); C8(c,0xF0); C8(c,w64 ? 63 : 31);
+			} else if (!strncmp(b, "ffs", 3)) {
+				C8(c,0x48); C8(c,0x0F); C8(c,0xBC); C8(c,0xC8);
+				C8(c,0xBA); C32(c,0xFFFFFFFFu);
+				C8(c,0x0F); C8(c,0x44); C8(c,0xCA);
+				C8(c,0x8D); C8(c,0x41); C8(c,0x01);
+			} else error_at(ctx, "%s is only supported on constants", name);
+			ctx->lv = 0;
+			return ty_int;
+		}
+		if (name[0] == '_' && name[1] == '_' && !lookup(ctx, name))
 			for (int i = 0; mach_ids[i]; i++)
 				if (name == mach_ids[i]) return parse_builtin_mach(ctx, &mach_builtins[i]);
 		if ((name == id_func || name == id_function) && ctx->fn) {
-			const char *fname = ctx->fn->sym->name;
+			const char *fname = ctx->inl ? ctx->inl->fn->name : ctx->fn->sym->name;
 			long off = add_rodata(ctx, fname, strlen(fname) + 1);
 			emit_lea_rodata(ctx, RAX, off);
 			next(ctx);
@@ -3713,11 +5410,16 @@ static Type *parse_primary(Ctx *ctx) {
 			return array_of(ty_char, (int)strlen(fname) + 1);
 		}
 		Sym *s = lookup(ctx, name);
+		int bi = 0;
+		if (!s && !strncmp(name, "__builtin_", 10) && (bi = libc_builtin(name + 10))) {
+			name = intern(name + 10);
+			s = lookup(ctx, name);
+		}
 		next(ctx);
 		if (!s) {
 			if (ctx->tok.kind != T_LP) error_at(ctx, "undeclared variable '%s'", name);
-			warn_at(ctx, "implicit declaration of function '%s'", name);
-			Type *ft = func_type(ty_int);
+			if (!bi) warn_at(ctx, "implicit declaration of function '%s'", name);
+			Type *ft = func_type(bi == 2 ? ptr_to(ty_void) : bi == 3 ? ty_ulong : ty_int);
 			ft->oldstyle = 1;
 			Sym *g = get_global(ctx, name, SYM_FUNC, ft, 0);
 			int d = ctx->depth;
@@ -3726,16 +5428,22 @@ static Type *parse_primary(Ctx *ctx) {
 			ctx->depth = d;
 			s = g;
 		}
-		if (s->kind == SYM_ENUMC) { emit_mov_rax_imm(c, s->val); return ty_int; }
+		if (s->kind == SYM_ENUMC) { emit_const(ctx, s->val); if (s->bound) ctx->k_ice = 0; return s->ty; }
 		if (s->kind == SYM_TYPEDEF) error_at(ctx, "unexpected type name '%s'", name);
 		if (s->kind == SYM_FUNC) {
 			Sym *g = s->global ? s->global : s;
+			if ((g->always || g->small) && g->body && ctx->fn && ctx->tok.kind == T_LP && ctx->inl_depth < 16 && !g->ty->variadic && !g->ty->oldstyle)
+				return inline_call(ctx, g);
 			emit_lea_sym(ctx, g);
 			ctx->fn_lea_end = Cpos(c);
 			ctx->fn_lea_sym = g;
 			return g->ty;
 		}
 		Sym *gs = s->global ? s->global : s;
+		if (s->is_local && s->indirect) { emit_load_rbp(c, RAX, s->stack_off); ctx->lv = 1; return s->ty; }
+		if (s->gregvar) { emit_mov_reg_reg(c, RAX, s->gregvar - 1); ctx->lv = 0; return s->ty; }
+		ctx->lv_start = Cpos(c);
+		ctx->lv_local = s->is_local ? s : NULL;
 		if (s->is_local) emit_lea_rbp(c, RAX, s->stack_off);
 		else if (gs->tls) emit_tls_addr(ctx, gs);
 		else emit_lea_sym(ctx, gs);
@@ -3753,15 +5461,25 @@ static Type *gen_binop(Ctx *ctx, int op, Type *lt, Type *rt);
 
 static Type *gen_incdec(Ctx *ctx, Type *ty, int delta, int post) {
 	Code *c = &ctx->text;
+	ctx->sidefx++;
 	if (!ctx->lv) error_at(ctx, "lvalue required as increment/decrement operand");
+	kv_forget(ctx, 0);
 	if (!is_scalar(ty)) error_at(ctx, "invalid operand to increment/decrement");
 	ctx->lv = 0;
 	int step = is_ptr(ty) ? ty->base->size : 1;
 	gen_push(ctx);
 	emit_load_type(c, ty);
+	if (post && ty->kind == TY_LDOUBLE) { emit_x87(c, 0xDB, 5, RAX, 0); ld_store_temp(ctx); }
 	if (post) gen_push(ctx);
 	if (ty->kind == TY_BOOL) emit_mov_rax_imm(c, delta > 0 ? 1 : 0);
-	else if (is_flonum(ty)) {
+	else if (is_ptr(ty) && ty->base->vla) {
+		C8(c,0x48); C8(c,(uint8_t)(delta > 0 ? 0x03 : 0x2B)); enc_mem(c, RAX, RBP, -1, 1, ty->base->vla, 1, 0);
+	} else if (ty->kind == TY_LDOUBLE) {
+		emit_mov_reg_reg(c, RCX, RAX);
+		C8(c,0xD9); C8(c,0xE8);
+		ld_store_temp(ctx);
+		gen_binop(ctx, delta > 0 ? T_PLUS : T_MINUS, ty, ty);
+	} else if (is_flonum(ty)) {
 		emit_mov_reg_reg(c, RCX, RAX);
 		emit_mov_rax_imm64(c, float_bits(1.0, ty));
 		gen_binop(ctx, delta > 0 ? T_PLUS : T_MINUS, ty, ty);
@@ -3788,9 +5506,12 @@ static Type *member_access(Ctx *ctx, Type *ty) {
 	return m->ty;
 }
 
-static Type *parse_postfix(Ctx *ctx) {
+static Type *postfix_ops(Ctx *ctx, Type *ty);
+
+static Type *parse_postfix(Ctx *ctx) { return postfix_ops(ctx, parse_primary(ctx)); }
+
+static Type *postfix_ops(Ctx *ctx, Type *ty) {
 	Code *c = &ctx->text;
-	Type *ty = parse_primary(ctx);
 	for (;;) {
 		int k = ctx->tok.kind;
 		if (k == T_LBRACKET) {
@@ -3801,10 +5522,10 @@ static Type *parse_postfix(Ctx *ctx) {
 			expect(ctx, T_RBRACKET);
 			gen_pop(ctx, RCX);
 			if (is_ptr(ty) && is_integer(it)) {
-				emit_scale(c, RAX, ty->base->size);
+				scale_by(c, RAX, ty->base);
 				ty = ty->base;
 			} else if (is_integer(ty) && is_ptr(it)) {
-				emit_scale(c, RCX, it->base->size);
+				scale_by(c, RCX, it->base);
 				ty = it->base;
 			} else error_at(ctx, "subscripted value is not an array or pointer");
 			emit_add_rax_rcx(c);
@@ -3829,21 +5550,48 @@ static Type *parse_postfix(Ctx *ctx) {
 	}
 }
 
+static void c_part(Ctx *ctx, int slot, Type *t, int p);
+static void c_neg(Ctx *ctx, Type *bt);
+static void c_store(Ctx *ctx, int tmp, Type *bt, int p);
+
 static Type *parse_unary(Ctx *ctx) {
 	Code *c = &ctx->text;
 	int k = ctx->tok.kind;
 	if (k == T_PLUS || k == T_MINUS || k == T_TILDE) {
 		next(ctx);
 		Type *ty = rval(ctx, parse_cast(ctx));
+		if (is_complex(ty)) {
+			if (k == T_PLUS) return ty;
+			int tmp = alloc_local(ctx, ty->size, ty->align);
+			gen_push(ctx);
+			int slot = ctx->sp;
+			for (int p = 0; p < 2; p++) {
+				c_part(ctx, slot, ty, p);
+				if (k == T_MINUS || p) c_neg(ctx, ty->base);
+				c_store(ctx, tmp, ty->base, p);
+			}
+			gen_pop(ctx, RCX);
+			emit_lea_rbp(c, RAX, tmp);
+			return ty;
+		}
 		if (is_flonum(ty) && k != T_TILDE) {
 			if (k == T_MINUS) {
-				if (ty->kind == TY_DOUBLE) { emit_mov_rcx_imm64(c, 0x8000000000000000ULL); emit_xor_rax_rcx(c); }
+				if (ty->kind == TY_LDOUBLE) { emit_x87(c, 0xDB, 5, RAX, 0); C8(c,0xD9); C8(c,0xE0); ld_store_temp(ctx); }
+				else if (ty->kind == TY_DOUBLE) { emit_mov_rcx_imm64(c, 0x8000000000000000ULL); emit_xor_rax_rcx(c); }
 				else { C8(c,0x35); C32(c,0x80000000u); }
 			}
 			return ty;
 		}
 		if (!is_integer(ty)) error_at(ctx, "invalid operand to unary operator");
 		ty = int_promote(ty);
+		long long kv;
+		if (expr_const(ctx, &kv)) {
+			int ice = ctx->k_ice;
+			drop_to(ctx, ctx->k_start, ctx->sp);
+			emit_const(ctx, const_cast_val(k == T_MINUS ? (long long)(0 - (unsigned long long)kv) : k == T_TILDE ? ~kv : kv, ty));
+			ctx->k_ice = ice;
+			return ty;
+		}
 		if (k == T_MINUS) emit_neg_rax(c);
 		if (k == T_TILDE) emit_not_rax(c);
 		if (ty->size == 4) emit_extend(c, 4, ty->is_unsigned);
@@ -3864,7 +5612,16 @@ static Type *parse_unary(Ctx *ctx) {
 	}
 	if (k == T_NOT) {
 		next(ctx);
-		gen_truth(ctx, rval(ctx, parse_cast(ctx)));
+		Type *ty = rval(ctx, parse_cast(ctx));
+		long long kv;
+		if (!is_flonum(ty) && expr_const(ctx, &kv)) {
+			int ice = ctx->k_ice;
+			drop_to(ctx, ctx->k_start, ctx->sp);
+			emit_const(ctx, !kv);
+			ctx->k_ice = ice;
+			return ty_int;
+		}
+		gen_truth(ctx, ty);
 		emit_logical_not(c);
 		return ty_int;
 	}
@@ -3874,6 +5631,7 @@ static Type *parse_unary(Ctx *ctx) {
 		if (ty->kind == TY_FUNC) { ctx->lv = 0; ctx->fn_lea_sym = NULL; return ptr_to(ty); }
 		if (!ctx->lv) error_at(ctx, "lvalue required as unary '&' operand");
 		if (ty->bit_width) error_at(ctx, "cannot take address of bit-field");
+		kv_forget(ctx, 1);
 		ctx->lv = 0;
 		return ptr_to(ty);
 	}
@@ -3891,10 +5649,30 @@ static Type *parse_unary(Ctx *ctx) {
 		Type *ty = parse_unary(ctx);
 		return gen_incdec(ctx, ty, k == T_INC ? 1 : -1, 0);
 	}
+	if (k == T_IDENT && (!strcmp(ctx->tok.str, "__real__") || !strcmp(ctx->tok.str, "__imag__") || !strcmp(ctx->tok.str, "__real") || !strcmp(ctx->tok.str, "__imag"))) {
+		int im = ctx->tok.str[2] == 'i';
+		next(ctx);
+		Type *ty = parse_cast(ctx);
+		if (is_complex(ty)) {
+			if (!ctx->lv) ctx->lv = 1;
+			if (im) emit_add_rax_imm(c, ty->base->size);
+			return ty->base;
+		}
+		ty = rval(ctx, ty);
+		if (!is_arith(ty)) error_at(ctx, "invalid operand to __real__ or __imag__");
+		if (im) {
+			emit_const(ctx, 0);
+			gen_cast(ctx, ty_int, ty);
+		}
+		return ty;
+	}
 	if (k == T_SIZEOF || k == T_ALIGNOF) {
 		next(ctx);
+		ctx->sizeof_vla = 0;
 		long long n = k == T_SIZEOF ? sizeof_operand(ctx) : alignof_operand(ctx);
-		emit_mov_rax_imm(c, n);
+		if (k == T_SIZEOF && ctx->sizeof_vla) emit_load_rbp(&ctx->text, RAX, ctx->sizeof_vla);
+		else emit_const(ctx, n);
+		ctx->sizeof_vla = 0;
 		ctx->lv = 0;
 		return ty_ulong;
 	}
@@ -3923,10 +5701,22 @@ static Type *parse_cast(Ctx *ctx) {
 			ctx->init_patches = saved;
 			emit_lea_rbp(&ctx->text, RAX, off);
 			ctx->lv = 1;
+			return postfix_ops(ctx, t);
+		}
+		if (t->kind == TY_VOID && ctx->fold && ctx->fn) {
+			Mark m = mark_code(ctx);
+			int fx = ctx->sidefx;
+			rval(ctx, parse_cast(ctx));
+			if (fx == ctx->sidefx) drop_code(ctx, m);
+			ctx->lv = 0;
 			return t;
 		}
 		Type *from = rval(ctx, parse_cast(ctx));
-		if (t->kind == TY_STRUCT) error_at(ctx, "cast to struct type");
+		if (t->kind == TY_STRUCT) {
+			if (!same_type(from, t)) error_at(ctx, "cast to struct type");
+			ctx->lv = 0;
+			return t;
+		}
 		gen_cast(ctx, from, t);
 		ctx->lv = 0;
 		return t;
@@ -3953,6 +5743,29 @@ static Type *gen_fbinop(Ctx *ctx, int op, Type *lt, Type *rt) {
 	Type *t = arith_conv(lt, rt);
 	int d = t->kind == TY_DOUBLE;
 	gen_operands_to(ctx, lt, rt, t);
+	if (t->kind == TY_LDOUBLE) {
+		int cmp = op == T_GT || op == T_GEQ || op == T_LT || op == T_LEQ || op == T_EQ || op == T_NEQ;
+		if (cmp) {
+			int sw = op == T_LT || op == T_LEQ;
+			emit_x87(c, 0xDB, 5, sw ? RCX : RAX, 0);
+			emit_x87(c, 0xDB, 5, sw ? RAX : RCX, 0);
+			C8(c,0xDF); C8(c,0xE9);
+			C8(c,0xDD); C8(c,0xD8);
+			ld_flags_setcc(c, op == T_LT ? T_GT : op == T_LEQ ? T_GEQ : op);
+			return ty_int;
+		}
+		emit_x87(c, 0xDB, 5, RCX, 0);
+		emit_x87(c, 0xDB, 5, RAX, 0);
+		switch (op) {
+		case T_PLUS: C8(c,0xDE); C8(c,0xC1); break;
+		case T_MINUS: C8(c,0xDE); C8(c,0xE9); break;
+		case T_MUL: C8(c,0xDE); C8(c,0xC9); break;
+		case T_DIV: C8(c,0xDE); C8(c,0xF9); break;
+		default: error_at(ctx, "invalid operands to binary operator");
+		}
+		ld_store_temp(ctx);
+		return t;
+	}
 	emit_movq_xmm0_rcx(c);
 	emit_movq_xmm1_rax(c);
 	switch (op) {
@@ -3981,18 +5794,197 @@ static Type *gen_fbinop(Ctx *ctx, int op, Type *lt, Type *rt) {
 	return t;
 }
 
+static Type *gen_binop(Ctx *ctx, int op, Type *lt, Type *rt);
+
+static void c_part(Ctx *ctx, int slot, Type *t, int p) {
+	Code *c = &ctx->text;
+	emit_load_rsp(c, RAX, (ctx->sp - slot) * 8);
+	if (t->kind == TY_COMPLEX) {
+		if (p) emit_add_rax_imm(c, t->base->size);
+		emit_load_type(c, t->base);
+	}
+}
+
+static void c_neg(Ctx *ctx, Type *bt) {
+	Code *c = &ctx->text;
+	if (bt->kind == TY_LDOUBLE) { emit_x87(c, 0xDB, 5, RAX, 0); C8(c,0xD9); C8(c,0xE0); ld_store_temp(ctx); }
+	else if (bt->kind == TY_DOUBLE) { emit_mov_rcx_imm64(c, 0x8000000000000000ULL); emit_xor_rax_rcx(c); }
+	else { C8(c,0x35); C32(c,0x80000000u); }
+}
+
+static void c_op(Ctx *ctx, int op, int ls, Type *lt, int lp, int rs, Type *rtt, int rp, Type *bt) {
+	c_part(ctx, ls, lt, lp);
+	gen_push(ctx);
+	c_part(ctx, rs, rtt, rp);
+	gen_pop(ctx, RCX);
+	gen_binop(ctx, op, bt, bt);
+}
+
+static void c_store(Ctx *ctx, int tmp, Type *bt, int p) {
+	Code *c = &ctx->text;
+	emit_lea_rbp(c, RCX, tmp + p * bt->size);
+	emit_store_type(c, bt);
+}
+
+static void c_zero(Ctx *ctx, int tmp, Type *bt, int p) {
+	Code *c = &ctx->text;
+	emit_xor_eax_eax(c);
+	emit_store_rbp(c, RAX, tmp + p * bt->size);
+	if (bt->size > 8) emit_store_rbp(c, RAX, tmp + p * bt->size + 8);
+}
+
+static void gen_ccast(Ctx *ctx, Type *from, Type *to) {
+	Code *c = &ctx->text;
+	if (from->kind == TY_COMPLEX && to->kind == TY_COMPLEX && from->base->kind == to->base->kind) return;
+	if (to->kind == TY_COMPLEX) {
+		int tmp = alloc_local(ctx, to->size, to->align);
+		gen_push(ctx);
+		int slot = ctx->sp;
+		for (int p = 0; p < 2; p++) {
+			if (from->kind != TY_COMPLEX && p) { c_zero(ctx, tmp, to->base, 1); break; }
+			if (from->kind == TY_COMPLEX) c_part(ctx, slot, from, p);
+			else emit_load_rsp(c, RAX, (ctx->sp - slot) * 8);
+			gen_cast(ctx, from->kind == TY_COMPLEX ? from->base : from, to->base);
+			c_store(ctx, tmp, to->base, p);
+		}
+		gen_pop(ctx, RCX);
+		emit_lea_rbp(c, RAX, tmp);
+		return;
+	}
+	if (to->kind == TY_BOOL) {
+		gen_push(ctx);
+		int slot = ctx->sp;
+		c_part(ctx, slot, from, 0);
+		gen_cast(ctx, from->base, ty_bool);
+		gen_push(ctx);
+		c_part(ctx, slot, from, 1);
+		gen_cast(ctx, from->base, ty_bool);
+		gen_pop(ctx, RCX);
+		C8(c,0x09); C8(c,0xC8);
+		gen_pop(ctx, RCX);
+		return;
+	}
+	emit_load_type(c, from->base);
+	gen_cast(ctx, from->base, to);
+}
+
+static Type *gen_cbinop(Ctx *ctx, int op, Type *lt, Type *rt) {
+	Code *c = &ctx->text;
+	Type *t = arith_conv(lt, rt), *bt = t->base;
+	int lc = lt->kind == TY_COMPLEX, rc = rt->kind == TY_COMPLEX;
+	gen_push(ctx);
+	int rs = ctx->sp;
+	emit_mov_reg_reg(c, RAX, RCX);
+	gen_cast(ctx, lt, lc ? t : bt);
+	gen_push(ctx);
+	int ls = ctx->sp;
+	emit_load_rsp(c, RAX, (ctx->sp - rs) * 8);
+	gen_cast(ctx, rt, rc ? t : bt);
+	emit_store_rsp_rax(c, (ctx->sp - rs) * 8);
+	Type *L = lc ? t : bt, *R = rc ? t : bt;
+	if (op == T_EQ || op == T_NEQ) {
+		c_op(ctx, T_EQ, ls, L, 0, rs, R, 0, bt);
+		gen_push(ctx);
+		if (lc && rc) c_op(ctx, T_EQ, ls, L, 1, rs, R, 1, bt);
+		else {
+			c_part(ctx, lc ? ls : rs, t, 1);
+			gen_cast(ctx, bt, ty_bool);
+			C8(c,0x83); C8(c,0xF0); C8(c,0x01);
+		}
+		gen_pop(ctx, RCX);
+		C8(c,0x21); C8(c,0xC8);
+		if (op == T_NEQ) { C8(c,0x83); C8(c,0xF0); C8(c,0x01); }
+		gen_pop(ctx, RCX);
+		gen_pop(ctx, RCX);
+		return ty_int;
+	}
+	int tmp = alloc_local(ctx, t->size, t->align);
+	if (op == T_PLUS || op == T_MINUS) {
+		c_op(ctx, op, ls, L, 0, rs, R, 0, bt);
+		c_store(ctx, tmp, bt, 0);
+		if (lc && rc) c_op(ctx, op, ls, L, 1, rs, R, 1, bt);
+		else if (lc) c_part(ctx, ls, L, 1);
+		else { c_part(ctx, rs, R, 1); if (op == T_MINUS) c_neg(ctx, bt); }
+		c_store(ctx, tmp, bt, 1);
+	} else if (op == T_MUL) {
+		if (lc && rc) {
+			c_op(ctx, T_MUL, ls, L, 0, rs, R, 0, bt);
+			gen_push(ctx);
+			c_op(ctx, T_MUL, ls, L, 1, rs, R, 1, bt);
+			gen_pop(ctx, RCX);
+			gen_binop(ctx, T_MINUS, bt, bt);
+			c_store(ctx, tmp, bt, 0);
+			c_op(ctx, T_MUL, ls, L, 0, rs, R, 1, bt);
+			gen_push(ctx);
+			c_op(ctx, T_MUL, ls, L, 1, rs, R, 0, bt);
+			gen_pop(ctx, RCX);
+			gen_binop(ctx, T_PLUS, bt, bt);
+			c_store(ctx, tmp, bt, 1);
+		} else {
+			for (int p = 0; p < 2; p++) {
+				c_op(ctx, T_MUL, ls, L, lc ? p : 0, rs, R, rc ? p : 0, bt);
+				c_store(ctx, tmp, bt, p);
+			}
+		}
+	} else if (op == T_DIV) {
+		if (!rc) {
+			for (int p = 0; p < 2; p++) {
+				c_op(ctx, T_DIV, ls, L, p, rs, R, 0, bt);
+				c_store(ctx, tmp, bt, p);
+			}
+		} else {
+			int den = alloc_local(ctx, 16, 16);
+			c_op(ctx, T_MUL, rs, R, 0, rs, R, 0, bt);
+			gen_push(ctx);
+			c_op(ctx, T_MUL, rs, R, 1, rs, R, 1, bt);
+			gen_pop(ctx, RCX);
+			gen_binop(ctx, T_PLUS, bt, bt);
+			emit_lea_rbp(c, RCX, den);
+			emit_store_type(c, bt);
+			for (int p = 0; p < 2; p++) {
+				c_op(ctx, T_MUL, ls, L, lc ? p : 0, rs, R, 0, bt);
+				gen_push(ctx);
+				if (lc) {
+					c_op(ctx, T_MUL, ls, L, 1 - p, rs, R, 1, bt);
+					if (p) c_neg(ctx, bt);
+					gen_pop(ctx, RCX);
+					gen_binop(ctx, T_PLUS, bt, bt);
+				} else {
+					gen_pop(ctx, RCX);
+					emit_mov_reg_reg(c, RAX, RCX);
+					if (p) {
+						c_op(ctx, T_MUL, ls, L, 0, rs, R, 1, bt);
+						c_neg(ctx, bt);
+					}
+				}
+				gen_push(ctx);
+				emit_lea_rbp(c, RAX, den);
+				emit_load_type(c, bt);
+				gen_pop(ctx, RCX);
+				gen_binop(ctx, T_DIV, bt, bt);
+				c_store(ctx, tmp, bt, p);
+			}
+		}
+	} else error_at(ctx, "invalid operands to binary operator");
+	gen_pop(ctx, RCX);
+	gen_pop(ctx, RCX);
+	emit_lea_rbp(c, RAX, tmp);
+	return t;
+}
+
 static Type *gen_binop(Ctx *ctx, int op, Type *lt, Type *rt) {
 	Code *c = &ctx->text;
+	if (is_complex(lt) || is_complex(rt)) return gen_cbinop(ctx, op, lt, rt);
 	if (is_flonum(lt) || is_flonum(rt)) return gen_fbinop(ctx, op, lt, rt);
 	if (op == T_PLUS || op == T_MINUS) {
 		if (is_ptr(lt) && is_integer(rt)) {
-			emit_scale(c, RAX, lt->base->size);
+			scale_by(c, RAX, lt->base);
 			if (op == T_PLUS) emit_add_rax_rcx(c);
 			else { emit_xchg_rax_rcx(c); emit_sub_rax_rcx(c); }
 			return lt;
 		}
 		if (is_integer(lt) && is_ptr(rt) && op == T_PLUS) {
-			emit_scale(c, RCX, rt->base->size);
+			scale_by(c, RCX, rt->base);
 			emit_add_rax_rcx(c);
 			return rt;
 		}
@@ -4000,7 +5992,8 @@ static Type *gen_binop(Ctx *ctx, int op, Type *lt, Type *rt) {
 			emit_xchg_rax_rcx(c);
 			emit_sub_rax_rcx(c);
 			int sz = lt->base->size;
-			if (sz > 1) { emit_mov_ecx_imm(c, (uint32_t)sz); emit_cqo(c); emit_idiv_rcx(c); }
+			if (lt->base->vla) { emit_load_rbp(c, RCX, lt->base->vla); emit_cqo(c); emit_idiv_rcx(c); }
+			else if (sz > 1) { emit_mov_ecx_imm(c, (uint32_t)sz); emit_cqo(c); emit_idiv_rcx(c); }
 			return ty_long;
 		}
 	}
@@ -4052,8 +6045,62 @@ static Type *gen_binop(Ctx *ctx, int op, Type *lt, Type *rt) {
 	return t;
 }
 
+static int fold_binop(int op, Type *lt, Type *rt, long long a, long long b, long long *res, Type **rty) {
+	if (!is_integer(lt) || !is_integer(rt)) return 0;
+	if (op == T_EQ || op == T_NEQ || op == T_LT || op == T_GT || op == T_LEQ || op == T_GEQ) {
+		Type *ct = arith_conv(lt, rt);
+		a = const_cast_val(a, ct);
+		b = const_cast_val(b, ct);
+		int u = ct->is_unsigned;
+		unsigned long long ua = (unsigned long long)a, ub = (unsigned long long)b;
+		int r = op == T_EQ ? a == b : op == T_NEQ ? a != b :
+			op == T_LT ? (u ? ua < ub : a < b) : op == T_GT ? (u ? ua > ub : a > b) :
+			op == T_LEQ ? (u ? ua <= ub : a <= b) : (u ? ua >= ub : a >= b);
+		*res = r;
+		*rty = ty_int;
+		return 1;
+	}
+	if (op == T_SHL || op == T_SHR) {
+		Type *t = int_promote(lt);
+		if (b < 0 || b >= t->size * 8) return 0;
+		a = const_cast_val(a, t);
+		if (op == T_SHL) *res = const_cast_val((long long)((unsigned long long)a << b), t);
+		else if (t->is_unsigned) *res = const_cast_val((long long)((t->size == 4 ? (unsigned long long)(uint32_t)a : (unsigned long long)a) >> b), t);
+		else *res = a >> b;
+		*rty = t;
+		return 1;
+	}
+	Type *t = arith_conv(lt, rt);
+	a = const_cast_val(a, t);
+	b = const_cast_val(b, t);
+	unsigned long long ua = (unsigned long long)a, ub = (unsigned long long)b, r;
+	if (t->size == 4 && t->is_unsigned) { ua = (uint32_t)ua; ub = (uint32_t)ub; }
+	switch (op) {
+	case T_PLUS: r = ua + ub; break;
+	case T_MINUS: r = ua - ub; break;
+	case T_MUL: r = ua * ub; break;
+	case T_DIV: case T_MOD:
+		if (!b) return 0;
+		if (t->is_unsigned) r = op == T_DIV ? ua / ub : ua % ub;
+		else {
+			if (b == -1 && a == (t->size == 4 ? (long long)INT32_MIN : (long long)INT64_MIN)) return 0;
+			r = (unsigned long long)(op == T_DIV ? a / b : a % b);
+		}
+		break;
+	case T_AMP: r = ua & ub; break;
+	case T_PIPE: r = ua | ub; break;
+	case T_CARET: r = ua ^ ub; break;
+	default: return 0;
+	}
+	*res = const_cast_val((long long)r, t);
+	*rty = t;
+	return 1;
+}
+
 static Type *parse_binary(Ctx *ctx, int minprec) {
 	Code *c = &ctx->text;
+	size_t m0 = Cpos(c);
+	int sp0 = ctx->sp, fx0 = ctx->sidefx;
 	Type *lt = parse_cast(ctx);
 	for (;;) {
 		int k = ctx->tok.kind;
@@ -4061,11 +6108,46 @@ static Type *parse_binary(Ctx *ctx, int minprec) {
 		if (p == 0 || p < minprec) return lt;
 		next(ctx);
 		lt = rval(ctx, lt);
+		long long lv = 0;
+		int lc = !is_flonum(lt) && expr_const(ctx, &lv);
+		int lice = lc && ctx->k_ice;
+		size_t ls = ctx->k_start;
+		if (lc && (k == T_AND || k == T_OR)) {
+			drop_to(ctx, ls, ctx->sp);
+			if (k == T_AND ? !lv : lv != 0) {
+				dead_xbegin(ctx);
+				rval(ctx, parse_binary(ctx, p + 1));
+				dead_xend(ctx);
+				emit_const(ctx, k == T_OR);
+				ctx->k_ice = lice;
+			} else {
+				size_t rs = Cpos(c);
+				Type *rt = rval(ctx, parse_binary(ctx, p + 1));
+				long long rv;
+				if (!is_flonum(rt) && expr_const(ctx, &rv)) { int rice = ctx->k_ice; drop_to(ctx, rs, ctx->sp); emit_const(ctx, rv != 0); ctx->k_ice = lice && rice; }
+				else { gen_truth(ctx, rt); emit_to_bool(c); }
+			}
+			lt = ty_int;
+			continue;
+		}
 		if (k == T_AND || k == T_OR) {
+			size_t lpos = Cpos(c);
+			int lsp = ctx->sp;
 			gen_truth(ctx, lt);
 			emit_test_rax_rax(c);
 			size_t sc = k == T_AND ? emit_jz_placeholder(c) : emit_jnz_placeholder(c);
-			gen_truth(ctx, rval(ctx, parse_binary(ctx, p + 1)));
+			size_t rs = Cpos(c);
+			Type *rt = (ctx->xcond++, xcond_end(ctx, rval(ctx, parse_binary(ctx, p + 1))));
+			long long rv;
+			if (ctx->fold && !is_flonum(rt) && rs > m0 && expr_const(ctx, &rv) && (k == T_AND ? !rv : rv != 0)) {
+				if (fx0 == ctx->sidefx) drop_to(ctx, m0, sp0);
+				else drop_to(ctx, lpos, lsp);
+				emit_const(ctx, k == T_OR);
+				ctx->k_ice = 0;
+				lt = ty_int;
+				continue;
+			}
+			gen_truth(ctx, rt);
 			emit_to_bool(c);
 			size_t done = emit_jmp_placeholder(c);
 			patch_jmp_to(&c->b, sc, Cpos(c));
@@ -4076,9 +6158,33 @@ static Type *parse_binary(Ctx *ctx, int minprec) {
 		}
 		gen_push(ctx);
 		Type *rt = rval(ctx, parse_binary(ctx, p + 1));
+		long long rv, res;
+		Type *rty;
+		int rc = expr_const(ctx, &rv);
+		if (ctx->fold && (k == T_AMP || k == T_MUL) && is_integer(lt) && is_integer(rt) && fx0 == ctx->sidefx &&
+			!(lc && rc) && ((rc && !rv) || (lc && !lv))) {
+			drop_to(ctx, m0, sp0);
+			emit_const(ctx, 0);
+			ctx->k_ice = 0;
+			lt = arith_conv(lt, rt);
+			continue;
+		}
+		if (lc && expr_const(ctx, &rv) && fold_binop(k, lt, rt, lv, rv, &res, &rty)) {
+			int rice = ctx->k_ice;
+			drop_to(ctx, ls, ctx->sp - 1);
+			emit_const(ctx, res);
+			ctx->k_ice = lice && rice;
+			lt = rty;
+			continue;
+		}
 		gen_pop(ctx, RCX);
 		lt = gen_binop(ctx, k, lt, rt);
 	}
+}
+
+static int null_const(Ctx *ctx, Type *t) {
+	long long v;
+	return is_ptr(t) && t->base->kind == TY_VOID && expr_const(ctx, &v) && !v && ctx->k_ice;
 }
 
 static Type *parse_cond(Ctx *ctx) {
@@ -4086,17 +6192,75 @@ static Type *parse_cond(Ctx *ctx) {
 	Type *ty = parse_binary(ctx, 1);
 	if (ctx->tok.kind != T_QUESTION) return ty;
 	next(ctx);
-	gen_truth(ctx, rval(ctx, ty));
+	ty = rval(ctx, ty);
+	long long kv;
+	if (consume(ctx, T_COLON)) {
+		if (!is_scalar(ty)) error_at(ctx, "scalar required before '?:'");
+		if (!is_flonum(ty) && expr_const(ctx, &kv)) {
+			if (kv) {
+				dead_xbegin(ctx);
+				rval(ctx, parse_cond(ctx));
+				dead_xend(ctx);
+				return ty;
+			}
+			drop_to(ctx, ctx->k_start, ctx->sp);
+			return rval(ctx, parse_cond(ctx));
+		}
+		gen_push(ctx);
+		gen_truth(ctx, ty);
+		emit_test_rax_rax(c);
+		size_t jelse = emit_jz_placeholder(c);
+		gen_pop(ctx, RAX);
+		size_t jend = emit_jmp_placeholder(c);
+		patch_jmp_to(&c->b, jelse, Cpos(c));
+		ctx->sp++;
+		gen_pop(ctx, RCX);
+		Type *b = (ctx->xcond++, xcond_end(ctx, rval(ctx, parse_cond(ctx))));
+		ctx->lv = 0;
+		Type *t = ty;
+		if (is_arith(ty) && is_arith(b)) t = arith_conv(ty, b);
+		if (is_arith(t)) gen_cast(ctx, b, t);
+		if (is_arith(t) && ty != t) {
+			size_t jskip = emit_jmp_placeholder(c);
+			patch_jmp_to(&c->b, jend, Cpos(c));
+			gen_cast(ctx, ty, t);
+			patch_jmp_to(&c->b, jskip, Cpos(c));
+		} else patch_jmp_to(&c->b, jend, Cpos(c));
+		ctx->k_end = (size_t)-1;
+		return t;
+	}
+	if (!is_flonum(ty) && expr_const(ctx, &kv)) {
+		drop_to(ctx, ctx->k_start, ctx->sp);
+		if (!kv) dead_xbegin(ctx);
+		Type *a = rval(ctx, parse_expr(ctx));
+		int an = null_const(ctx, a);
+		if (!kv) dead_xend(ctx);
+		expect(ctx, T_COLON);
+		if (kv) dead_xbegin(ctx);
+		Type *b = rval(ctx, parse_cond(ctx));
+		if (kv) dead_xend(ctx);
+		ctx->lv = 0;
+		Type *t = a;
+		if (is_arith(a) && is_arith(b)) t = arith_conv(a, b);
+		else if (is_ptr(a) && is_ptr(b)) t = an ? b : a;
+		else if (is_ptr(a)) t = a;
+		else if (is_ptr(b)) t = b;
+		if (is_arith(t)) gen_cast(ctx, kv ? a : b, t);
+		return t;
+	}
+	gen_truth(ctx, ty);
 	emit_test_rax_rax(c);
 	size_t jelse = emit_jz_placeholder(c);
-	Type *a = rval(ctx, parse_expr(ctx));
+	Type *a = (ctx->xcond++, xcond_end(ctx, rval(ctx, parse_expr(ctx))));
+	int an = null_const(ctx, a);
 	expect(ctx, T_COLON);
 	size_t jend = emit_jmp_placeholder(c);
 	patch_jmp_to(&c->b, jelse, Cpos(c));
-	Type *b = rval(ctx, parse_cond(ctx));
+	Type *b = (ctx->xcond++, xcond_end(ctx, rval(ctx, parse_cond(ctx))));
 	ctx->lv = 0;
 	Type *t = a;
 	if (is_arith(a) && is_arith(b)) t = arith_conv(a, b);
+	else if (is_ptr(a) && is_ptr(b) && an) t = b;
 	else if (is_ptr(a)) t = a;
 	else if (is_ptr(b)) t = b;
 	if (is_arith(t)) gen_cast(ctx, b, t);
@@ -4106,6 +6270,7 @@ static Type *parse_cond(Ctx *ctx) {
 		gen_cast(ctx, a, t);
 		patch_jmp_to(&c->b, jskip, Cpos(c));
 	} else patch_jmp_to(&c->b, jend, Cpos(c));
+	ctx->k_end = (size_t)-1;
 	return t;
 }
 
@@ -4129,6 +6294,7 @@ static Type *parse_assign(Ctx *ctx) {
 	Code *c = &ctx->text;
 	Type *lt = parse_cond(ctx);
 	int k = ctx->tok.kind;
+	if (k == T_ASSIGN || compound_op(k)) ctx->sidefx++;
 	Sym *tg = k == T_ASSIGN || compound_op(k) ? tls_lvalue(ctx, lt) : NULL;
 	if (tg) {
 		int op = compound_op(k);
@@ -4152,6 +6318,7 @@ static Type *parse_assign(Ctx *ctx) {
 	if (k == T_ASSIGN) {
 		if (!ctx->lv) error_at(ctx, "lvalue required as left operand of assignment");
 		if (lt->kind == TY_ARRAY || lt->kind == TY_FUNC) error_at(ctx, "assignment to array or function");
+		Sym *tl = ctx->fold ? simple_local(ctx) : NULL;
 		next(ctx);
 		ctx->lv = 0;
 		gen_push(ctx);
@@ -4164,27 +6331,38 @@ static Type *parse_assign(Ctx *ctx) {
 			return lt;
 		}
 		gen_cast(ctx, rt, lt);
+		long long kv;
+		int isk = tl && (is_integer(lt) || is_ptr(lt)) && !lt->bit_width && expr_const(ctx, &kv);
 		gen_pop(ctx, RCX);
 		emit_store_type(c, lt);
+		if (tl && !ctx->dead) {
+			tl->kv_valid = isk && !ctx->cond_depth && !ctx->xcond && !tl->addr_taken;
+			if (tl->kv_valid) tl->kv = const_cast_val(kv, lt);
+		}
 		ctx->lv = 0;
 		return lt->origin ? lt->origin : lt;
 	}
 	int op = compound_op(k);
 	if (op) {
 		if (!ctx->lv) error_at(ctx, "lvalue required as left operand of assignment");
-		if (!is_scalar(lt)) error_at(ctx, "invalid compound assignment");
+		if (!is_scalar(lt) && !is_complex(lt)) error_at(ctx, "invalid compound assignment");
+		Sym *tl = ctx->fold ? simple_local(ctx) : NULL;
+		kv_forget(ctx, 0);
 		next(ctx);
 		ctx->lv = 0;
 		gen_push(ctx);
 		emit_load_type(c, lt);
 		gen_push(ctx);
 		Type *rt = rval(ctx, parse_assign(ctx));
+		long long rv;
+		int zero = tl && is_integer(lt) && !lt->bit_width && (op == T_AMP || op == T_MUL) && is_integer(rt) && expr_const(ctx, &rv) && !rv;
 		gen_pop(ctx, RCX);
 		Type *vt = lt->origin ? lt->origin : lt;
 		Type *res = gen_binop(ctx, op, vt, rt);
 		gen_cast(ctx, res, vt);
 		gen_pop(ctx, RCX);
 		emit_store_type(c, lt);
+		if (zero && !ctx->cond_depth && !ctx->xcond && !tl->addr_taken) { tl->kv_valid = 1; tl->kv = 0; }
 		ctx->lv = 0;
 		return vt;
 	}
@@ -4203,7 +6381,7 @@ static Type *parse_expr(Ctx *ctx) {
 
 static void parse_cond_expr(Ctx *ctx) {
 	Type *ty = rval(ctx, parse_expr(ctx));
-	if (!is_scalar(ty)) error_at(ctx, "scalar required in condition");
+	if (!is_scalar(ty) && !is_complex(ty)) error_at(ctx, "scalar required in condition");
 	gen_truth(ctx, ty);
 }
 
@@ -4214,16 +6392,15 @@ static void emit_lea_init(Ctx *ctx, int reg, int rel) {
 }
 
 static int is_string_init(Ctx *ctx, Type *ty) {
-	if (ty->kind != TY_ARRAY || ty->base->size != 1 || !is_integer(ty->base)) return 0;
-	if (ctx->tok.kind == T_STR) return 1;
-	return ctx->tok.kind == T_LB && peek(ctx)->kind == T_STR;
+	if (ty->kind != TY_ARRAY || !is_integer(ty->base)) return 0;
+	Tok *t = ctx->tok.kind == T_STR ? &ctx->tok : ctx->tok.kind == T_LB && peek(ctx)->kind == T_STR ? peek(ctx) : NULL;
+	return t && ty->base->size == wide_size(t->wide);
 }
 
 static Buf read_string_lit(Ctx *ctx) {
 	Buf s; buf_init(&s);
 	int braced = consume(ctx, T_LB);
-	while (ctx->tok.kind == T_STR) { buf_append(&s, ctx->tok.str, ctx->tok.len); next(ctx); }
-	buf_append_byte(&s, 0);
+	read_strs(ctx, &s);
 	if (braced) { consume(ctx, T_COMMA); expect(ctx, T_RB); }
 	return s;
 }
@@ -4236,49 +6413,13 @@ static void data_write(Ctx *ctx, long off, long long v, int size) {
 }
 
 static int global_addr_init(Ctx *ctx, long off) {
-	int amp = 0;
-	Tok *t = &ctx->tok;
-	if (t->kind == T_AND && ctx->fn && peek(ctx)->kind == T_IDENT) {
-		next(ctx);
-		Label *l = find_label(ctx, ctx->tok.str);
-		next(ctx);
-		data_write(ctx, off, 0, 8);
-		if (l->pos < 0) patches_push(&l->abs, (size_t)ctx->nrelocs);
-		add_reloc(ctx, R_ABS64, (size_t)off, NULL, ctx->cur_text, l->pos);
-		return 1;
-	}
-	if (t->kind == T_AMP) amp = 1;
-	else if (t->kind != T_IDENT) return 0;
-	Tok *id = amp ? peek(ctx) : t;
-	if (id->kind != T_IDENT) return 0;
-	Sym *s = lookup(ctx, id->str);
-	if (!s || (s->kind != SYM_VAR && s->kind != SYM_FUNC) || s->is_local) return 0;
-	if (!amp && s->kind == SYM_VAR && s->ty->kind != TY_ARRAY) return 0;
-	if (amp) next(ctx);
+	if (ctx->tok.kind != T_AND || !ctx->fn || peek(ctx)->kind != T_IDENT) return 0;
 	next(ctx);
-	Sym *g = s->global ? s->global : s;
-	Type *ty = s->ty;
-	long long addend = 0;
-	for (;;) {
-		if (ctx->tok.kind == T_LBRACKET && ty->kind == TY_ARRAY) {
-			next(ctx);
-			addend += const_expr(ctx) * ty->base->size;
-			expect(ctx, T_RBRACKET);
-			ty = ty->base;
-		} else if (ctx->tok.kind == T_DOT && ty->kind == TY_STRUCT) {
-			next(ctx);
-			Member *m = find_member(ty, ctx->tok.str);
-			if (!m) error_at(ctx, "no member named '%s'", ctx->tok.str);
-			next(ctx);
-			addend += m->off;
-			ty = m->ty;
-		} else break;
-	}
-	int esz = ty->kind == TY_ARRAY && !amp ? ty->base->size : 1;
-	if (ctx->tok.kind == T_PLUS) { next(ctx); addend += const_expr(ctx) * esz; }
-	else if (ctx->tok.kind == T_MINUS) { next(ctx); addend -= const_expr(ctx) * esz; }
+	Label *l = find_label(ctx, ctx->tok.str);
+	next(ctx);
 	data_write(ctx, off, 0, 8);
-	add_reloc(ctx, R_ABS64, (size_t)off, g, SEC_TEXT, addend);
+	if (l->pos < 0) patches_push(&l->abs, (size_t)ctx->nrelocs);
+	add_reloc(ctx, R_ABS64, (size_t)off, NULL, ctx->cur_text, l->pos);
 	return 1;
 }
 
@@ -4292,16 +6433,17 @@ static void init_scalar(Ctx *ctx, Type *ty, long off, int global) {
 		emit_store_type(&ctx->text, ty);
 		return;
 	}
-	if (ctx->tok.kind == T_STR && is_ptr(ty)) {
-		Buf s; buf_init(&s);
-		while (ctx->tok.kind == T_STR) { buf_append(&s, ctx->tok.str, ctx->tok.len); next(ctx); }
-		buf_append_byte(&s, 0);
-		long ro = add_rodata(ctx, s.data, s.len);
-		free(s.data);
-		data_write(ctx, off, 0, 8);
-		add_reloc(ctx, R_ABS64, (size_t)off, NULL, SEC_RODATA, ro);
-	} else if (is_flonum(ty)) {
-		data_write(ctx, off, (long long)float_bits(fce_add(ctx), ty), ty->size);
+	if (is_flonum(ty)) {
+		CV r = cv_rval(ctx, ce_cond(ctx));
+		if (cv_reloc(&r) || !is_arith(r.ty)) error_at(ctx, "initializer element is not a constant");
+		long double f = cv_convert(r, ty).f;
+		if (ty->kind == TY_LDOUBLE) {
+			uint8_t b[16];
+			memset(b, 0, sizeof(b));
+			memcpy(b, &f, 10);
+			buf_zero_to(&ctx->data, (size_t)(off + 16));
+			memcpy(ctx->data.data + off, b, 16);
+		} else data_write(ctx, off, (long long)float_bits((double)f, ty), ty->size);
 	} else if (ty->bit_width) {
 		uint64_t mask = ty->bit_width >= 64 ? ~0ULL : (1ULL << ty->bit_width) - 1;
 		uint64_t v = ((uint64_t)const_expr(ctx) & mask) << ty->bit_off;
@@ -4310,16 +6452,20 @@ static void init_scalar(Ctx *ctx, Type *ty, long off, int global) {
 		for (int i = 0; i < ty->bit_unit; i++) cur |= (uint64_t)ctx->data.data[off + i] << (8 * i);
 		cur = (cur & ~(mask << ty->bit_off)) | v;
 		data_write(ctx, off, (long long)cur, ty->bit_unit);
-	} else if (!(is_ptr(ty) || ty->size == 8) || !global_addr_init(ctx, off)) {
-		long long v = const_expr(ctx);
-		data_write(ctx, off, const_cast_val(v, ty), ty->size);
+	} else if (!global_addr_init(ctx, off)) {
+		CV r = cv_rval(ctx, ce_cond(ctx));
+		if (cv_reloc(&r)) {
+			if (ty->size != 8) error_at(ctx, "initializer element is not computable at load time");
+			data_write(ctx, off, 0, 8);
+			add_reloc(ctx, R_ABS64, (size_t)off, r.sym, r.sym ? SEC_TEXT : r.sect, r.v);
+		} else data_write(ctx, off, const_cast_val(r.v, ty), ty->size);
 	}
 }
 
 static Type *init_string(Ctx *ctx, Type *ty, long off, int global) {
 	Buf s = read_string_lit(ctx);
-	if (ty->len < 0) ty = array_of(ty->base, (int)s.len);
-	int n = (int)s.len < ty->len ? (int)s.len : ty->len;
+	if (ty->len < 0) ty = array_of(ty->base, (int)s.len / ty->base->size);
+	int n = (int)s.len < ty->size ? (int)s.len : ty->size;
 	if (global) {
 		buf_zero_to(&ctx->data, (size_t)(off + ty->size));
 		memcpy(ctx->data.data + off, s.data, n);
@@ -4432,6 +6578,7 @@ static int init_elems(Ctx *ctx, Type *ty, long off, int global, int braced) {
 		return maxi;
 	}
 	Member *m = ty->members;
+	while (m && m->flat) m = m->next;
 	for (;;) {
 		int chained = 0;
 		if (ctx->tok.kind == T_DOT) {
@@ -4450,7 +6597,8 @@ static int init_elems(Ctx *ctx, Type *ty, long off, int global, int braced) {
 		}
 		if (chained) init_designated(ctx, m->ty, off + m->off, global);
 		else init_value(ctx, m->ty, off + m->off, global, 0);
-		m = ty->is_union ? NULL : m->next;
+		if (ty->is_union) m = NULL;
+		else do m = m->next; while (m && m->flat);
 		if (!braced && !m) break;
 		if (!init_continue(ctx, braced)) break;
 	}
@@ -4458,6 +6606,26 @@ static int init_elems(Ctx *ctx, Type *ty, long off, int global, int braced) {
 }
 
 static Type *init_value(Ctx *ctx, Type *ty, long off, int global, int top) {
+	if (ty->kind == TY_COMPLEX) {
+		int braced = consume(ctx, T_LB);
+		if (global) {
+			CV r = cv_rval(ctx, ce_cond(ctx));
+			if (cv_reloc(&r) || !is_arith(r.ty)) error_at(ctx, "initializer element is not a constant");
+			long double f = cv_convert(r, ty->base).f;
+			buf_zero_to(&ctx->data, (size_t)(off + ty->size));
+			if (ty->base->kind == TY_LDOUBLE) memcpy(ctx->data.data + off, &f, 10);
+			else data_write(ctx, off, (long long)float_bits((double)f, ty->base), ty->base->size);
+		} else {
+			emit_lea_init(ctx, RAX, (int)off);
+			gen_push(ctx);
+			Type *rt = rval(ctx, parse_assign(ctx));
+			gen_cast(ctx, rt, ty);
+			gen_pop(ctx, RCX);
+			emit_store_type(&ctx->text, ty);
+		}
+		if (braced) { consume(ctx, T_COMMA); expect(ctx, T_RB); }
+		return ty;
+	}
 	if (ty->kind == TY_ARRAY) {
 		if (is_string_init(ctx, ty)) return init_string(ctx, ty, off, global);
 		int braced = consume(ctx, T_LB);
@@ -4474,6 +6642,51 @@ static Type *init_value(Ctx *ctx, Type *ty, long off, int global, int top) {
 			emit_lea_init(ctx, RDI, (int)off);
 			gen_struct_copy_to_rdi(ctx, ty->size);
 			return ty;
+		}
+		if (ctx->tok.kind != T_LB && ctx->tok.kind != T_STR && ctx->tok.kind != T_NUM && ctx->tok.kind != T_FNUM && !global) {
+			TokVec v = capture_expr(ctx);
+			replay(ctx, &v);
+			Mark m = mark_code(ctx);
+			size_t ro = ctx->rodata.len;
+			int frame = ctx->fn ? ctx->fn->frame : 0;
+			Type *rt = parse_assign(ctx);
+			if (rt->kind == TY_STRUCT && same_type(rt, ty)) {
+				rval(ctx, rt);
+				emit_lea_init(ctx, RDI, (int)off);
+				gen_struct_copy_to_rdi(ctx, ty->size);
+				free(v.v);
+				return ty;
+			}
+			drop_code(ctx, m);
+			ctx->rodata.len = ro;
+			if (ctx->fn) ctx->fn->frame = frame;
+			ctx->lv = 0;
+			replay(ctx, &v);
+			free(v.v);
+		}
+		if (global && ctx->tok.kind == T_LP && peek(ctx)->kind == T_LP) {
+			TokVec v = capture_expr(ctx);
+			int a = 0, b = v.n;
+			for (;;) {
+				if (b - a < 2 || v.v[a].kind != T_LP || v.v[b-1].kind != T_RP) break;
+				int d = 0, i = a;
+				for (; i < b; i++) {
+					if (v.v[i].kind == T_LP) d++;
+					else if (v.v[i].kind == T_RP && !--d) break;
+				}
+				if (i != b - 1 || v.v[a+1].kind != T_LP) break;
+				a++;
+				b--;
+			}
+			TokVec r = { v.v + a, b - a, b - a };
+			replay(ctx, &r);
+			free(v.v);
+		}
+		if (global && ctx->tok.kind == T_LP && is_typename(ctx, peek(ctx))) {
+			next(ctx);
+			Type *ct = parse_typename(ctx);
+			expect(ctx, T_RP);
+			if (!same_type(ct, ty) || ctx->tok.kind != T_LB) error_at(ctx, "incompatible struct initializer");
 		}
 		int braced = consume(ctx, T_LB);
 		if (!braced && top) error_at(ctx, "struct initializer must be a brace-enclosed list");
@@ -4506,7 +6719,9 @@ static Type *local_init(Ctx *ctx, Type *ty, int rel) {
 }
 
 static Type *global_init(Ctx *ctx, Type *ty, long off) {
+	ctx->ginit++;
 	ty = init_value(ctx, ty, off, 1, 1);
+	ctx->ginit--;
 	buf_zero_to(&ctx->data, (size_t)(off + ty->size));
 	return ty;
 }
@@ -4526,7 +6741,17 @@ static int weak_here(Ctx *ctx, Sym *g, int attrs) {
 }
 
 static void decl_attrs(Ctx *ctx, Sym *g, int attrs, Attr *a) {
-	if (attrs & ATTR_WEAK) { g->weak = 1; g->weak_unit = ctx->unit; }
+	if (attrs & ATTR_TWICE) g->twice = 1;
+	if (attrs & ATTR_WEAK) {
+		g->weak = 1;
+		g->weak_unit = ctx->unit;
+		if (g->strong_ref && g->strong_unit == ctx->unit && !g->strong_multi) g->strong_ref = 0;
+	} else if (!weak_here(ctx, g, 0)) {
+		if (g->strong_ref && g->strong_unit != ctx->unit) g->strong_multi = 1;
+		g->strong_ref = 1;
+		g->strong_unit = ctx->unit;
+	}
+	if (attrs & ATTR_USED) g->used_attr = 1;
 	if (a->section) g->section = a->section;
 	if (a->align > g->align) g->align = a->align;
 	if (a->alias) {
@@ -4548,14 +6773,16 @@ static int var_align(Sym *g, Type *ty, int min) {
 }
 
 static void define_global_var(Ctx *ctx, Sym *g, Type *ty, int has_init) {
-	int sect = SEC_DATA;
+	int sect = SEC_DATA, named = 0;
 	if (g->tls) {
 		if (!has_init && g->defined) return;
 		sect = section_index(ctx, intern(has_init ? ".tdata" : ".tbss"), SK_DATA);
 		ctx->secs[sect - SEC_NAMED].tls = has_init ? 1 : 2;
-	} else if (g->section && (has_init || strcmp(g->section, ".bss") != 0))
+	} else if (g->section && (has_init || strcmp(g->section, ".bss") != 0)) {
 		sect = section_index(ctx, g->section, strncmp(g->section, ".rodata", 7) == 0 ? SK_RO : SK_DATA);
-	if (has_init || sect != SEC_DATA) {
+		named = 1;
+	}
+	if (has_init || named || sect != SEC_DATA) {
 		if (g->defined && g->sect != SEC_BSS) error_at(ctx, "redefinition of '%s'", g->name);
 		Buf saved = ctx->data;
 		if (sect != SEC_DATA) { ctx->data = *sec_buf(ctx, sect); ctx->cur_data = sect; }
@@ -4570,8 +6797,14 @@ static void define_global_var(Ctx *ctx, Sym *g, Type *ty, int has_init) {
 		g->off = off;
 		g->size = ty->size;
 		g->defined = 1;
-		buf_zero_to(&ctx->data, (size_t)(off + ty->size));
+		buf_zero_to(&ctx->data, (size_t)(off + (ty->size ? ty->size : 1)));
 		if (sect != SEC_DATA) { *sec_buf(ctx, sect) = ctx->data; ctx->data = saved; ctx->cur_data = SEC_DATA; }
+		while (ctx->ncl && !ctx->ginit) {
+			struct PendCL p = ctx->cl[--ctx->ncl];
+			replay(ctx, &p.v);
+			free(p.v.v);
+			define_global_var(ctx, p.g, p.g->ty, 1);
+		}
 		return;
 	}
 	if (g->defined) return;
@@ -4584,22 +6817,70 @@ static void define_global_var(Ctx *ctx, Sym *g, Type *ty, int has_init) {
 	g->size = ty->size;
 	g->defined = 1;
 	g->tentative = !g->is_static;
-	ctx->bss_size += ty->size;
+	ctx->bss_size += ty->size ? ty->size : 1;
 }
 
 static void parse_block(Ctx *ctx);
 
+static int label_needed(Ctx *ctx, TokVec *v, char *raw);
+
+static int label_used_later(Ctx *ctx, char *name, int levels) {
+	TokVec v;
+	memset(&v, 0, sizeof(v));
+	int depth = 0, used = 0;
+	for (;;) {
+		int k = ctx->tok.kind;
+		if (k == T_EOF) break;
+		if (k == T_LB) depth++;
+		else if (k == T_RB) {
+			if (depth) depth--;
+			else if (--levels <= 0) break;
+		}
+		tv_push(&v, ctx->tok);
+		next(ctx);
+	}
+	used = label_needed(ctx, &v, name);
+	replay(ctx, &v);
+	free(v.v);
+	return used;
+}
+
 static void define_label(Ctx *ctx) {
 	Code *c = &ctx->text;
-	Label *l = find_label(ctx, ctx->tok.str);
+	char *raw = ctx->tok.str;
+	Label *l = find_label(ctx, raw);
+	if (l->patches.n || l->xrel.n || l->abs.n || ctx->inl) kv_forget_all(ctx);
+	int live = !ctx->dead || l->abs.n;
+	for (int i = 0; i < l->patches.n && !live; i++) live = l->patches.v[i] < ctx->dead_mark.pos;
+	for (int i = 0; i < l->xrel.n && !live; i++) live = (int)l->xrel.v[i] < ctx->dead_mark.nrel;
+	if (!live && ctx->dead && !ctx->dead_x) {
+		next(ctx);
+		Tok colon = ctx->tok;
+		next(ctx);
+		live = label_used_later(ctx, raw, ctx->depth - ctx->fn_depth + 1);
+		TokVec b;
+		memset(&b, 0, sizeof(b));
+		Tok id = colon;
+		id.kind = T_IDENT;
+		id.str = raw;
+		tv_push(&b, id);
+		tv_push(&b, colon);
+		replay(ctx, &b);
+		free(b.v);
+	}
+	if (live) revive(ctx);
 	if (l->pos >= 0) error_at(ctx, "duplicate label '%s'", ctx->tok.str);
 	next(ctx);
 	next(ctx);
+	if (!(l->patches.n || l->xrel.n || l->abs.n || ctx->inl)) kv_forget_scan(ctx, ctx->depth - ctx->fn_depth + 1);
+	l->seen = 1;
 	l->pos = (long)Cpos(c);
 	for (int i = 0; i < l->patches.n; i++)
 		patch_jmp_to(&c->b, l->patches.v[i], (size_t)l->pos);
 	for (int i = 0; i < l->abs.n; i++)
 		ctx->relocs[l->abs.v[i]].addend = l->pos;
+	for (int i = 0; i < l->xrel.n; i++)
+		ctx->relocs[l->xrel.v[i]].addend += l->pos;
 }
 
 static int parse_static_assert(Ctx *ctx) {
@@ -4629,11 +6910,16 @@ static void parse_local_decl(Ctx *ctx) {
 	if (ctx->tok.kind == T_SEMI) { next(ctx); return; }
 	for (;;) {
 		char *name = NULL;
+		ctx->name_attrs = 0;
+		ctx->name_attr = NULL;
 		Type *ty = declarator(ctx, base, &name);
 		if (!name) error_at(ctx, "expected identifier in declaration");
+		int nattrs = ctx->name_attrs;
+		Attr *nattr = ctx->name_attr;
 		char *label = parse_asm_label(ctx);
-		int attrs = battrs | ctx->tok.attrs;
+		int attrs = battrs | ctx->tok.attrs | nattrs;
 		Attr da = battr;
+		attr_merge(&da, nattr);
 		attr_merge(&da, ctx->tok.attr);
 		if (da.alias || (da.section && storage != ST_STATIC))
 			error_at(ctx, "attribute '%s' is not allowed on a local declaration", da.alias ? "alias" : "section");
@@ -4652,6 +6938,7 @@ static void parse_local_decl(Ctx *ctx) {
 			g->tls = thread;
 			g->align = da.align;
 			g->section = da.section;
+			if (attrs & ATTR_USED) g->used_attr = 1;
 			g->gnext = ctx->globals;
 			ctx->globals = g;
 			Sym *a = push_sym(ctx, name, SYM_VAR, ty);
@@ -4664,15 +6951,76 @@ static void parse_local_decl(Ctx *ctx) {
 				if (s->name == name) error_at(ctx, "redeclaration of '%s'", name);
 			if (ty->kind == TY_VOID) error_at(ctx, "variable '%s' declared void", name);
 			if (da.align > ty->align) ty = aligned_type(ty, da.align);
-			if (ty->align > 16) error_at(ctx, "local variable '%s' is aligned to more than 16 bytes", name);
 			Sym *s = push_sym(ctx, name, SYM_VAR, ty);
 			s->is_local = 1;
+			if (ty->vla) {
+				Code *c = &ctx->text;
+				if (ctx->tok.kind == T_ASSIGN) error_at(ctx, "variable length array '%s' cannot have an initializer", name);
+				if (ctx->sp) error_at(ctx, "variable length array '%s' inside an expression is not supported", name);
+				if (!ctx->vla_block) {
+					if (ctx->nvla == 64) error_at(ctx, "too many nested blocks with variable length arrays");
+					ctx->vla_block = alloc_local(ctx, 8, 8);
+					emit_store_rbp(c, RSP, ctx->vla_block);
+					ctx->vla_slots[ctx->nvla++] = ctx->vla_block;
+				}
+				s->stack_off = alloc_local(ctx, 8, 8);
+				s->indirect = 1;
+				emit_load_rbp(c, RAX, ty->vla);
+				emit_add_rax_imm(c, 15);
+				C8(c,0x48); C8(c,0x83); C8(c,0xE0); C8(c,0xF0);
+				C8(c,0x48); C8(c,0x29); C8(c,0xC4);
+				emit_store_rbp(c, RSP, s->stack_off);
+				if (!consume(ctx, T_COMMA)) break;
+				continue;
+			}
+			if (ty->align > 16) {
+				if (ty->kind == TY_ARRAY && ty->len < 0) error_at(ctx, "local variable '%s' needs a size", name);
+				if (ctx->tok.kind == T_ASSIGN) error_at(ctx, "local variable '%s' aligned to more than 16 bytes cannot have an initializer", name);
+				Code *c = &ctx->text;
+				int base = alloc_local(ctx, ty->size + ty->align, 16);
+				s->stack_off = alloc_local(ctx, 8, 8);
+				s->indirect = 1;
+				emit_lea_rbp(c, RAX, base);
+				emit_add_rax_imm(c, ty->align - 1);
+				C8(c,0x48); C8(c,0x25); C32(c,(uint32_t)-ty->align);
+				emit_store_rbp(c, RAX, s->stack_off);
+				if (!consume(ctx, T_COMMA)) break;
+				continue;
+			}
 			if (label) {
 				int r = asm_regnum(label);
 				if (r < 0 || r == RSP || r == RBP) error_at(ctx, "invalid register '%s' for '%s'", label, name);
 				s->asm_reg = r + 1;
 			}
-			if (consume(ctx, T_ASSIGN)) {
+			if (ctx->tok.kind == T_ASSIGN && ctx->fold && (is_integer(ty) || is_ptr(ty)) && !ty->bit_width && !s->asm_reg && peek(ctx)->kind != T_LB) {
+				next(ctx);
+				size_t pos = Cpos(&ctx->text);
+				int sp = ctx->sp;
+				Type *rt = rval(ctx, parse_assign(ctx));
+				long long kv;
+				if ((is_integer(rt) || is_ptr(rt)) && expr_const(ctx, &kv)) {
+					drop_to(ctx, pos, sp);
+					kv = const_cast_val(kv, ty);
+					if (!rest_written(ctx, name)) {
+						s->bound = 1;
+						s->kind = SYM_ENUMC;
+						s->is_local = 0;
+						s->val = kv;
+					} else {
+						s->stack_off = alloc_local(ctx, ty->size, ty->align);
+						emit_mov_rax_imm(&ctx->text, kv);
+						emit_lea_rbp(&ctx->text, RCX, s->stack_off);
+						emit_store_type(&ctx->text, ty);
+						if (!ctx->cond_depth && !ctx->xcond) { s->kv_valid = 1; s->kv = kv; }
+					}
+				} else {
+					if (is_scalar(rt)) gen_cast(ctx, rt, ty);
+					else if (!(is_ptr(ty) && (rt->kind == TY_ARRAY || rt->kind == TY_FUNC))) error_at(ctx, "invalid initializer for '%s'", name);
+					s->stack_off = alloc_local(ctx, ty->size, ty->align);
+					emit_lea_rbp(&ctx->text, RCX, s->stack_off);
+					emit_store_type(&ctx->text, ty);
+				}
+			} else if (consume(ctx, T_ASSIGN)) {
 				Patches saved = ctx->init_patches;
 				memset(&ctx->init_patches, 0, sizeof(Patches));
 				int known = !(ty->kind == TY_ARRAY && ty->len < 0);
@@ -4702,14 +7050,215 @@ static void parse_local_decl(Ctx *ctx) {
 	expect(ctx, T_SEMI);
 }
 
+static void after_jump(Ctx *ctx) {
+	LoopCtx *lc = loopstack_switch(&ctx->loops);
+	if (lc && lc->kconst && !lc->kdead && ctx->cond_depth == lc->depth) {
+		dead_begin(ctx);
+		lc->kdead = 1;
+	}
+}
+
+static void parse_body(Ctx *ctx) {
+	ctx->cond_depth++;
+	parse_stmt(ctx);
+	ctx->cond_depth--;
+}
+
+static void parse_stmt1(Ctx *ctx);
+
+static int tok_group_end(TokVec *v, int i) {
+	int d = 0;
+	for (; i < v->n; i++) {
+		int k = v->v[i].kind;
+		if (k == T_LP || k == T_LBRACKET || k == T_LB) d++;
+		else if ((k == T_RP || k == T_RBRACKET || k == T_RB) && --d == 0) return i + 1;
+	}
+	return v->n;
+}
+
+static int tok_stmt_end(TokVec *v, int i) {
+	if (i >= v->n) return v->n;
+	int k = v->v[i].kind;
+	if (k == T_LB) return tok_group_end(v, i);
+	if (k == T_IF) {
+		i = tok_stmt_end(v, tok_group_end(v, i + 1));
+		if (i < v->n && v->v[i].kind == T_ELSE) i = tok_stmt_end(v, i + 1);
+		return i;
+	}
+	if (k == T_WHILE || k == T_SWITCH || k == T_FOR) return tok_stmt_end(v, tok_group_end(v, i + 1));
+	if (k == T_DO) {
+		i = tok_stmt_end(v, i + 1);
+		if (i < v->n && v->v[i].kind == T_WHILE) i = tok_group_end(v, i + 1);
+		return i < v->n ? i + 1 : v->n;
+	}
+	if (k == T_IDENT && i + 1 < v->n && v->v[i+1].kind == T_COLON) return tok_stmt_end(v, i + 2);
+	if (k == T_DEFAULT) return tok_stmt_end(v, i + 2);
+	if (k == T_CASE) {
+		while (i < v->n && v->v[i].kind != T_COLON) i++;
+		return tok_stmt_end(v, i + 1);
+	}
+	int d = 0;
+	for (; i < v->n; i++) {
+		k = v->v[i].kind;
+		if (k == T_LP || k == T_LBRACKET || k == T_LB) d++;
+		else if (k == T_RP || k == T_RBRACKET || k == T_RB) d--;
+		else if (k == T_SEMI && !d) return i + 1;
+	}
+	return v->n;
+}
+
+static int label_defined_at(TokVec *v, int i) {
+	if (v->v[i].kind != T_IDENT || i + 1 >= v->n || v->v[i+1].kind != T_COLON) return 0;
+	int pk = i ? v->v[i-1].kind : T_SEMI;
+	return pk == T_SEMI || pk == T_LB || pk == T_RB || pk == T_COLON || pk == T_RP || pk == T_ELSE || pk == T_DO;
+}
+
+static int label_refd_live(Ctx *ctx, char *raw);
+
+static int label_needed(Ctx *ctx, TokVec *v, char *raw) {
+	int re = 0;
+	if (ctx->dead_jdepth) {
+		int cur = ctx->depth;
+		re = v->n;
+		for (int i = 0; i < v->n; i++) {
+			if (v->v[i].kind == T_LB) cur++;
+			else if (v->v[i].kind == T_RB) {
+				if (cur == ctx->dead_jdepth - 1) { re = i; break; }
+				cur--;
+			}
+		}
+	}
+	int cap = 16, n = 0;
+	char **need = (char **)malloc(sizeof(char *) * (size_t)cap);
+	for (int j = re; j + 1 < v->n; j++)
+		if ((v->v[j].kind == T_GOTO || v->v[j].kind == T_AND) && v->v[j+1].kind == T_IDENT) {
+			if (n == cap) need = (char **)realloc(need, sizeof(char *) * (size_t)(cap *= 2));
+			need[n++] = v->v[j+1].str;
+		}
+	for (int i = 0; i < re; i++) if (label_defined_at(v, i) && label_refd_live(ctx, v->v[i].str)) {
+		if (n == cap) need = (char **)realloc(need, sizeof(char *) * (size_t)(cap *= 2));
+		need[n++] = v->v[i].str;
+	}
+	for (int changed = 1; changed;) {
+		changed = 0;
+		for (int i = 0; i < re; i++) {
+			if (!label_defined_at(v, i)) continue;
+			int in = 0;
+			for (int k = 0; k < n && !in; k++) in = need[k] == v->v[i].str;
+			if (!in) continue;
+			for (int j = i; j + 1 < re; j++) {
+				if (!((v->v[j].kind == T_GOTO || v->v[j].kind == T_AND) && v->v[j+1].kind == T_IDENT)) continue;
+				int have = 0;
+				for (int k = 0; k < n && !have; k++) have = need[k] == v->v[j+1].str;
+				if (have) continue;
+				if (n == cap) need = (char **)realloc(need, sizeof(char *) * (size_t)(cap *= 2));
+				need[n++] = v->v[j+1].str;
+				changed = 1;
+			}
+		}
+	}
+	int r = 0;
+	for (int k = 0; k < n && !r; k++) r = need[k] == raw;
+	free(need);
+	return r;
+}
+
+static int label_refd_live(Ctx *ctx, char *raw) {
+	char *name = raw;
+	for (LLab *ll = ctx->llabs; ll; ll = ll->next) if (ll->name == raw) { name = ll->real; break; }
+	if (ctx->inl) {
+		char b[256];
+		snprintf(b, sizeof(b), "%s.inl%d", name, ctx->inl->id);
+		name = intern(b);
+	}
+	for (Label *l = ctx->fn->labels; l; l = l->next) {
+		if (l->name != name) continue;
+		if (l->abs.n) return 1;
+		for (int j = 0; j < l->patches.n; j++) if (l->patches.v[j] < ctx->dead_mark.pos) return 1;
+		for (int j = 0; j < l->xrel.n; j++) if ((int)l->xrel.v[j] < ctx->dead_mark.nrel) return 1;
+	}
+	return 0;
+}
+
+static int label_tok_live(Ctx *ctx, TokVec *v, int i) {
+	char *raw = v->v[i].str, *name = raw;
+	for (LLab *ll = ctx->llabs; ll; ll = ll->next) if (ll->name == raw) { name = ll->real; break; }
+	if (ctx->inl) {
+		char b[256];
+		snprintf(b, sizeof(b), "%s.inl%d", name, ctx->inl->id);
+		name = intern(b);
+	}
+	for (Label *l = ctx->fn->labels; l; l = l->next) {
+		if (l->name != name) continue;
+		if (l->abs.n) return 1;
+		for (int j = 0; j < l->patches.n; j++) if (l->patches.v[j] < ctx->dead_mark.pos) return 1;
+		for (int j = 0; j < l->xrel.n; j++) if ((int)l->xrel.v[j] < ctx->dead_mark.nrel) return 1;
+	}
+	return label_needed(ctx, v, raw);
+}
+
+static void stmt_revive(Ctx *ctx) {
+	if (!ctx->dead || !ctx->fn || ctx->dead_x || ctx->dead_sx != ctx->sx_depth) return;
+	TokVec v;
+	memset(&v, 0, sizeof(v));
+	int depth = 0, levels = ctx->depth - ctx->fn_depth + 1;
+	for (;;) {
+		int k = ctx->tok.kind;
+		if (k == T_EOF) break;
+		if (k == T_LB) depth++;
+		else if (k == T_RB) {
+			if (depth) depth--;
+			else if (--levels <= 0) break;
+		}
+		tv_push(&v, ctx->tok);
+		next(ctx);
+	}
+	int e = tok_stmt_end(&v, 0), live = 0;
+	for (int i = 0; i + 1 < e && !live; i++) {
+		if (v.v[i].kind != T_IDENT || v.v[i+1].kind != T_COLON) continue;
+		int pk = i ? v.v[i-1].kind : T_SEMI;
+		if (pk != T_SEMI && pk != T_LB && pk != T_RB && pk != T_COLON && pk != T_RP && pk != T_ELSE && pk != T_DO) continue;
+		live = label_tok_live(ctx, &v, i);
+	}
+	replay(ctx, &v);
+	free(v.v);
+	if (live) revive(ctx);
+}
+
 static void parse_stmt(Ctx *ctx) {
+	int k = ctx->tok.kind;
+	if (k == T_WHILE || k == T_DO || k == T_FOR || k == T_IF || k == T_SWITCH || k == T_LB) stmt_revive(ctx);
+	parse_stmt1(ctx);
+	if (k == T_WHILE || k == T_DO || k == T_FOR || k == T_SWITCH) ctx->jumped = 0;
+}
+
+static void parse_stmt1(Ctx *ctx) {
 	Code *c = &ctx->text;
 	int k = ctx->tok.kind;
 
 	if (k == T_LB) { parse_block(ctx); return; }
 	if (k == T_SEMI) { next(ctx); return; }
+	if (local_labels(ctx)) return;
 	if (is_asm_kw(ctx)) { asm_statement(ctx, 0); return; }
 
+	if (k == T_RETURN && ctx->inl) {
+		Inl *in = ctx->inl;
+		next(ctx);
+		if (ctx->tok.kind != T_SEMI) {
+			Type *t = rval(ctx, parse_expr(ctx));
+			if (in->ret->kind == TY_COMPLEX) gen_cast(ctx, t, in->ret);
+			if (in->ret->kind == TY_STRUCT || in->ret->kind == TY_COMPLEX) {
+				if (!in->tmp) in->tmp = alloc_local(ctx, in->ret->size, in->ret->align);
+				emit_copy_to_rbp(c, RAX, in->tmp, in->ret->size);
+				emit_lea_rbp(c, RAX, in->tmp);
+			} else if (in->ret->kind != TY_VOID) gen_cast(ctx, t, in->ret);
+		}
+		expect(ctx, T_SEMI);
+		patches_push(&in->rets, emit_jmp_placeholder(c));
+		after_jump(ctx);
+		ctx->jumped = 1;
+		return;
+	}
 	if (k == T_RETURN) {
 		next(ctx);
 		if (ctx->tok.kind != T_SEMI) {
@@ -4717,10 +7266,14 @@ static void parse_stmt(Ctx *ctx) {
 			Type *rt = ctx->fn->ty->base;
 			int cls[2];
 			int n = classify(rt, cls);
-			if (rt->kind == TY_STRUCT && n < 0) {
+			if (rt->kind == TY_COMPLEX) gen_cast(ctx, t, rt);
+			if (rt->kind == TY_COMPLEX && n < 0) {
+				emit_x87(c, 0xDB, 5, RAX, 16);
+				emit_x87(c, 0xDB, 5, RAX, 0);
+			} else if (rt->kind == TY_STRUCT && n < 0) {
 				emit_load_rbp(c, RDI, ctx->fn->ret_off);
 				gen_struct_copy_to_rdi(ctx, rt->size);
-			} else if (rt->kind == TY_STRUCT) {
+			} else if (rt->kind == TY_STRUCT || rt->kind == TY_COMPLEX) {
 				int tmp = alloc_local(ctx, 16, 16), g = 0, x = 0;
 				static const int retregs[2] = { RAX, RDX };
 				emit_copy_to_rbp(c, RAX, tmp, rt->size);
@@ -4730,6 +7283,7 @@ static void parse_stmt(Ctx *ctx) {
 				}
 			} else if (rt->kind != TY_VOID) {
 				gen_cast(ctx, t, rt);
+				if (rt->kind == TY_LDOUBLE) emit_x87(c, 0xDB, 5, RAX, 0);
 				if (rt->kind == TY_DOUBLE) emit_movq_xmm0_rax(c);
 				else if (rt->kind == TY_FLOAT) { C8(c,0x66); C8(c,0x0F); C8(c,0x6E); C8(c,0xC0); }
 			}
@@ -4737,26 +7291,51 @@ static void parse_stmt(Ctx *ctx) {
 		expect(ctx, T_SEMI);
 		emit_leave(c);
 		emit_ret(c);
+		after_jump(ctx);
+		ctx->jumped = 1;
 		return;
 	}
 
 	if (k == T_IF) {
 		next(ctx);
 		expect(ctx, T_LP);
-		parse_cond_expr(ctx);
+		Type *ct = rval(ctx, parse_expr(ctx));
+		if (!is_scalar(ct) && !is_complex(ct)) error_at(ctx, "scalar required in condition");
+		long long kv;
+		if (!is_flonum(ct) && expr_const(ctx, &kv)) {
+			drop_to(ctx, ctx->k_start, ctx->sp);
+			expect(ctx, T_RP);
+			if (!kv) { ctx->next_jdepth = ctx->tok.kind == T_LB ? ctx->depth + 2 : 0; dead_begin(ctx); }
+			ctx->jumped = 0;
+			parse_body(ctx);
+			if (!kv) dead_end(ctx);
+			int jt = kv ? ctx->jumped : 0;
+			ctx->jumped = 0;
+			if (ctx->tok.kind == T_ELSE) {
+				next(ctx);
+				if (kv) { ctx->next_jdepth = ctx->tok.kind == T_LB ? ctx->depth + 2 : 0; dead_begin(ctx); }
+				parse_body(ctx);
+				if (kv) dead_end(ctx);
+				if (!kv) jt = ctx->jumped;
+			}
+			ctx->jumped = jt;
+			return;
+		}
+		gen_truth(ctx, ct);
 		expect(ctx, T_RP);
 		emit_test_rax_rax(c);
 		size_t jz_patch = emit_jz_placeholder(c);
-		parse_stmt(ctx);
+		parse_body(ctx);
 		if (ctx->tok.kind == T_ELSE) {
 			next(ctx);
 			size_t jmp_patch = emit_jmp_placeholder(c);
 			patch_jmp_to(&c->b, jz_patch, Cpos(c));
-			parse_stmt(ctx);
+			parse_body(ctx);
 			patch_jmp_to(&c->b, jmp_patch, Cpos(c));
 		} else {
 			patch_jmp_to(&c->b, jz_patch, Cpos(c));
 		}
+		ctx->jumped = 0;
 		return;
 	}
 
@@ -4765,7 +7344,10 @@ static void parse_stmt(Ctx *ctx) {
 		expect(ctx, T_SEMI);
 		LoopCtx *lc = loopstack_cur(&ctx->loops);
 		if (!lc) error_at(ctx, "'break' outside loop");
+		if (ctx->nvla > lc->vla_mark) emit_load_rbp(c, RSP, ctx->vla_slots[lc->vla_mark]);
 		patches_push(&lc->breaks, emit_jmp_placeholder(c));
+		after_jump(ctx);
+		if (!lc->is_switch) ctx->jumped = 1;
 		return;
 	}
 
@@ -4774,21 +7356,39 @@ static void parse_stmt(Ctx *ctx) {
 		expect(ctx, T_SEMI);
 		LoopCtx *lc = loopstack_loop(&ctx->loops);
 		if (!lc) error_at(ctx, "'continue' outside loop");
+		if (ctx->nvla > lc->vla_mark) emit_load_rbp(c, RSP, ctx->vla_slots[lc->vla_mark]);
 		if (lc->cont_target >= 0) emit_jmp_to(c, (size_t)lc->cont_target);
 		else patches_push(&lc->conts, emit_jmp_placeholder(c));
+		after_jump(ctx);
+		ctx->jumped = 1;
 		return;
 	}
 
 	if (k == T_WHILE) {
+		kv_forget_loop(ctx);
 		next(ctx);
 		size_t loop_top = Cpos(c);
 		expect(ctx, T_LP);
-		parse_cond_expr(ctx);
+		Type *ct = rval(ctx, parse_expr(ctx));
+		if (!is_scalar(ct) && !is_complex(ct)) error_at(ctx, "scalar required in condition");
+		long long kv;
+		if (!is_flonum(ct) && expr_const(ctx, &kv) && !kv) {
+			drop_to(ctx, ctx->k_start, ctx->sp);
+			expect(ctx, T_RP);
+			loopstack_push(&ctx->loops, (long)loop_top, 0)->vla_mark = ctx->nvla;
+			dead_begin(ctx);
+			parse_body(ctx);
+			dead_end(ctx);
+			loopstack_pop(&ctx->loops);
+			return;
+		}
+		gen_truth(ctx, ct);
 		expect(ctx, T_RP);
 		emit_test_rax_rax(c);
 		size_t jz_patch = emit_jz_placeholder(c);
 		LoopCtx *lc = loopstack_push(&ctx->loops, (long)loop_top, 0);
-		parse_stmt(ctx);
+		lc->vla_mark = ctx->nvla;
+		parse_body(ctx);
 		loopstack_pop(&ctx->loops);
 		emit_jmp_to(c, loop_top);
 		size_t loop_end = Cpos(c);
@@ -4799,10 +7399,12 @@ static void parse_stmt(Ctx *ctx) {
 	}
 
 	if (k == T_DO) {
+		kv_forget_loop(ctx);
 		next(ctx);
 		size_t loop_top = Cpos(c);
 		LoopCtx *lc = loopstack_push(&ctx->loops, -1, 0);
-		parse_stmt(ctx);
+		lc->vla_mark = ctx->nvla;
+		parse_body(ctx);
 		loopstack_pop(&ctx->loops);
 		for (int i = 0; i < lc->conts.n; i++)
 			patch_jmp_to(&c->b, lc->conts.v[i], Cpos(c));
@@ -4827,6 +7429,7 @@ static void parse_stmt(Ctx *ctx) {
 			if (is_typename(ctx, &ctx->tok)) parse_local_decl(ctx);
 			else { parse_expr(ctx); ctx->lv = 0; expect(ctx, T_SEMI); }
 		} else next(ctx);
+		kv_forget_loop(ctx);
 		size_t top = Cpos(c);
 		int has_cond = ctx->tok.kind != T_SEMI;
 		size_t jz_end = 0;
@@ -4838,12 +7441,20 @@ static void parse_stmt(Ctx *ctx) {
 		expect(ctx, T_SEMI);
 		size_t jbody = emit_jmp_placeholder(c);
 		size_t step = Cpos(c);
+		int nkv = 0;
+		for (Sym *s = ctx->scope; s && s->depth > 0; s = s->next) nkv++;
+		Sym **unk = calloc(nkv + 1, sizeof(Sym *));
+		nkv = 0;
+		for (Sym *s = ctx->scope; s && s->depth > 0; s = s->next) if (!s->kv_valid) unk[nkv++] = s;
 		if (ctx->tok.kind != T_RP) { parse_expr(ctx); ctx->lv = 0; }
+		for (int i = 0; i < nkv; i++) unk[i]->kv_valid = 0;
+		free(unk);
 		expect(ctx, T_RP);
 		emit_jmp_to(c, top);
 		patch_jmp_to(&c->b, jbody, Cpos(c));
 		LoopCtx *lc = loopstack_push(&ctx->loops, (long)step, 0);
-		parse_stmt(ctx);
+		lc->vla_mark = ctx->nvla;
+		parse_body(ctx);
 		loopstack_pop(&ctx->loops);
 		emit_jmp_to(c, step);
 		size_t end = Cpos(c);
@@ -4860,13 +7471,39 @@ static void parse_stmt(Ctx *ctx) {
 		Type *t = rval(ctx, parse_expr(ctx));
 		expect(ctx, T_RP);
 		if (!is_integer(t)) error_at(ctx, "switch quantity not an integer");
+		long long kv;
+		if (expr_const(ctx, &kv)) {
+			drop_to(ctx, ctx->k_start, ctx->sp);
+			LoopCtx *lc = loopstack_push(&ctx->loops, -1, 1);
+			lc->vla_mark = ctx->nvla;
+			lc->sw_type = int_promote(t);
+			lc->kconst = 1;
+			lc->kval = const_cast_val(kv, lc->sw_type);
+			lc->depth = ctx->cond_depth;
+			dead_begin(ctx);
+			lc->kdead = 1;
+			ctx->swbody = 1;
+			parse_stmt(ctx);
+			ctx->swbody = 0;
+			if (lc->kdead) dead_end(ctx);
+			loopstack_pop(&ctx->loops);
+			kv_forget_all(ctx);
+			for (int i = 0; i < lc->breaks.n; i++)
+				patch_jmp_to(&c->b, lc->breaks.v[i], Cpos(c));
+			return;
+		}
 		int tmp = alloc_local(ctx, 8, 8);
 		emit_store_rbp(c, RAX, tmp);
 		size_t jdispatch = emit_jmp_placeholder(c);
 		LoopCtx *lc = loopstack_push(&ctx->loops, -1, 1);
+		lc->vla_mark = ctx->nvla;
 		lc->sw_type = int_promote(t);
+		lc->body = Cpos(c);
+		ctx->swbody = 1;
 		parse_stmt(ctx);
+		ctx->swbody = 0;
 		loopstack_pop(&ctx->loops);
+		kv_forget_all(ctx);
 		size_t jend = emit_jmp_placeholder(c);
 		patch_jmp_to(&c->b, jdispatch, Cpos(c));
 		emit_load_rbp(c, RAX, tmp);
@@ -4894,6 +7531,7 @@ static void parse_stmt(Ctx *ctx) {
 	}
 
 	if (k == T_CASE) {
+		kv_forget_all(ctx);
 		next(ctx);
 		LoopCtx *lc = loopstack_switch(&ctx->loops);
 		if (!lc) error_at(ctx, "'case' outside switch");
@@ -4907,9 +7545,19 @@ static void parse_stmt(Ctx *ctx) {
 			lc->case_hi = (long long *)realloc(lc->case_hi, sizeof(long long) * lc->capcase);
 			lc->case_pos = (size_t *)realloc(lc->case_pos, sizeof(size_t) * lc->capcase);
 		}
-		if (lc->sw_type->is_unsigned ? (unsigned long long)hi < (unsigned long long)v : hi < v)
+		if (lc->kconst) {
+			int u = lc->sw_type->is_unsigned;
+			int hit = u ? (unsigned long long)v <= (unsigned long long)lc->kval && (unsigned long long)lc->kval <= (unsigned long long)hi :
+				v <= lc->kval && lc->kval <= hi;
+			if (hit) {
+				if (lc->kdead) { dead_end(ctx); lc->kdead = 0; }
+				if (lc->tentative) { cut_code(ctx, lc->tmark); lc->tentative = 0; }
+				lc->matched = 1;
+			}
+		} else if (lc->sw_type->is_unsigned ? (unsigned long long)hi < (unsigned long long)v : hi < v)
 			warn_at(ctx, "empty range specified");
 		else {
+			case_revive(ctx, lc);
 			lc->case_vals[lc->ncase] = v;
 			lc->case_hi[lc->ncase] = hi;
 			lc->case_pos[lc->ncase] = Cpos(c);
@@ -4922,8 +7570,16 @@ static void parse_stmt(Ctx *ctx) {
 	if (k == T_DEFAULT) {
 		next(ctx);
 		expect(ctx, T_COLON);
+		kv_forget_all(ctx);
 		LoopCtx *lc = loopstack_switch(&ctx->loops);
 		if (!lc) error_at(ctx, "'default' outside switch");
+		if (lc->kconst && lc->kdead && !lc->matched) {
+			dead_end(ctx);
+			lc->kdead = 0;
+			lc->tentative = 1;
+			lc->tmark = mark_code(ctx);
+		}
+		if (!lc->kconst) case_revive(ctx, lc);
 		lc->default_pos = (long)Cpos(c);
 		if (ctx->tok.kind != T_RB) parse_stmt(ctx);
 		return;
@@ -4944,6 +7600,8 @@ static void parse_stmt(Ctx *ctx) {
 		expect(ctx, T_SEMI);
 		if (l->pos >= 0) emit_jmp_to(c, (size_t)l->pos);
 		else patches_push(&l->patches, emit_jmp_placeholder(c));
+		after_jump(ctx);
+		ctx->jumped = 1;
 		return;
 	}
 
@@ -4961,13 +7619,57 @@ static void parse_stmt(Ctx *ctx) {
 	expect(ctx, T_SEMI);
 }
 
+static int local_labels(Ctx *ctx) {
+	if (ctx->tok.kind != T_IDENT || strcmp(ctx->tok.str, "__label__")) return 0;
+	next(ctx);
+	do {
+		if (ctx->tok.kind != T_IDENT) error_at(ctx, "expected a label name after __label__");
+		LLab *ll = (LLab *)calloc(1, sizeof(LLab));
+		char b[256];
+		snprintf(b, sizeof(b), "%s.ll%d", ctx->tok.str, ++ctx->nllab);
+		ll->name = ctx->tok.str;
+		ll->real = intern(b);
+		ll->depth = ctx->depth;
+		ll->next = ctx->llabs;
+		ctx->llabs = ll;
+		next(ctx);
+	} while (consume(ctx, T_COMMA));
+	expect(ctx, T_SEMI);
+	return 1;
+}
+
+static void parse_stmts(Ctx *ctx, const char *what) {
+	int sw = ctx->swbody, started = 0, d0 = 0, jumped = 0;
+	ctx->swbody = 0;
+	while (ctx->tok.kind != T_RB) {
+		if (ctx->tok.kind == T_EOF) error_at(ctx, "unexpected EOF in %s", what);
+		ctx->jumped = 0;
+		parse_stmt(ctx);
+		if (ctx->jumped && !started && !sw && ctx->fold) {
+			d0 = ctx->dead;
+			ctx->next_jdepth = ctx->depth + 1;
+			dead_begin(ctx);
+			started = 1;
+		}
+	}
+	if (started) {
+		jumped = ctx->dead > d0;
+		dead_end(ctx);
+	}
+	ctx->jumped = jumped;
+}
+
 static void parse_block(Ctx *ctx) {
 	expect(ctx, T_LB);
 	enter_scope(ctx);
-	while (ctx->tok.kind != T_RB) {
-		if (ctx->tok.kind == T_EOF) error_at(ctx, "unexpected EOF in block");
-		parse_stmt(ctx);
-	}
+	int vb = ctx->vla_block, nv = ctx->nvla;
+	int frame = ctx->fn ? ctx->fn->frame : 0;
+	ctx->vla_block = 0;
+	parse_stmts(ctx, "block");
+	if (ctx->vla_block) emit_load_rbp(&ctx->text, RSP, ctx->vla_block);
+	ctx->vla_block = vb;
+	ctx->nvla = nv;
+	if (ctx->fn) ctx->fn->frame = frame;
 	leave_scope(ctx);
 	expect(ctx, T_RB);
 }
@@ -5036,13 +7738,14 @@ static void parse_func_body(Ctx *ctx, Sym *fs, Type *fty) {
 	C32(c, 0);
 
 	enter_scope(ctx);
+	ctx->fn_depth = ctx->depth;
 	int cls[2];
 	int sret = fty->base->kind == TY_STRUCT && classify(fty->base, cls) < 0;
 	int gp = 0, sse = 0, stk = 16;
 	if (fty->variadic) {
 		f.save_off = alloc_local(ctx, 176, 16);
 		for (int i = 0; i < 6; i++) emit_store_rbp(c, argregs[i], f.save_off + 8 * i);
-		if (!ctx->no_float) {
+		if (!ctx->no_float && !ctx->no_sse) {
 			C8(c,0x84); C8(c,0xC0);
 			size_t skip = jfwd(c, 0x74);
 			for (int i = 0; i < 8; i++) emit_movq_xmm_store(c, i, RBP, f.save_off + 48 + 16 * i);
@@ -5081,10 +7784,7 @@ static void parse_func_body(Ctx *ctx, Sym *fs, Type *fty) {
 	f.named_stack = stk - 16;
 
 	expect(ctx, T_LB);
-	while (ctx->tok.kind != T_RB) {
-		if (ctx->tok.kind == T_EOF) error_at(ctx, "unexpected EOF in function body");
-		parse_stmt(ctx);
-	}
+	parse_stmts(ctx, "function body");
 	next(ctx);
 	leave_scope(ctx);
 
@@ -5093,9 +7793,9 @@ static void parse_func_body(Ctx *ctx, Sym *fs, Type *fty) {
 	emit_ret(c);
 
 	for (Label *l = f.labels; l; l = l->next)
-		if (l->pos < 0) error_at(ctx, "label '%s' used but not defined", l->name);
+		if (l->pos < 0 && (!l->seen || l->patches.n || l->xrel.n || l->abs.n)) error_at(ctx, "label '%s' used but not defined", l->name);
 
-	uint32_t frame_size = (uint32_t)align_up((size_t)f.frame, 16);
+	uint32_t frame_size = (uint32_t)align_up((size_t)f.frame_max, 16);
 	buf_patch32_at(&c->b, f.frame_patch, frame_size);
 	fs->size = (long)Cpos(c) - fs->off;
 	ctx->fn = NULL;
@@ -5118,20 +7818,29 @@ static void parse_toplevel(Ctx *ctx) {
 	if (parse_static_assert(ctx)) return;
 	if (is_asm_kw(ctx)) { asm_statement(ctx, 1); return; }
 	Type *base = declspec(ctx, &storage);
-	int attrs = ctx->decl_attrs, thread = ctx->decl_thread;
+	int attrs = ctx->decl_attrs, thread = ctx->decl_thread, inl = ctx->decl_inline, reg = ctx->decl_register;
 	Attr battr = ctx->decl_attr;
 	if (consume(ctx, T_SEMI)) return;
 	for (;;) {
 		char *name = NULL;
+		ctx->name_attrs = 0;
+		ctx->name_attr = NULL;
 		Type *ty = declarator(ctx, base, &name);
 		if (!name) error_at(ctx, "expected identifier in declaration");
+		int nattrs = ctx->name_attrs;
+		Attr *nattr = ctx->name_attr;
 		char *label = parse_asm_label(ctx);
-		attrs |= ctx->tok.attrs;
+		attrs |= ctx->tok.attrs | nattrs;
 		Attr da = battr;
+		attr_merge(&da, nattr);
 		attr_merge(&da, ctx->tok.attr);
 		if ((attrs & ATTR_INTERRUPT) && (ty->kind != TY_FUNC || storage == ST_TYPEDEF)) error_at(ctx, "interrupt attribute applies only to functions");
 		if (storage == ST_TYPEDEF) {
 			push_sym(ctx, name, SYM_TYPEDEF, aligned_type(ty, da.align));
+		} else if (reg && label && ty->kind != TY_FUNC) {
+			int r = asm_regnum(label);
+			if (r < 0) error_at(ctx, "invalid register '%s' for '%s'", label, name);
+			push_sym(ctx, name, SYM_VAR, ty)->gregvar = r + 1;
 		} else if (ty->kind == TY_FUNC) {
 			if (thread) error_at(ctx, "function '%s' declared thread-local", name);
 			Sym *g = get_global(ctx, label ? label : name, SYM_FUNC, ty, storage == ST_STATIC);
@@ -5142,6 +7851,8 @@ static void parse_toplevel(Ctx *ctx) {
 			if (attrs & ATTR_NAKED) g->naked = 1;
 			if (ctx->tok.kind == T_LB) {
 				int weak = weak_here(ctx, g, attrs);
+				if (g->body && !g->inline_only) error_at(ctx, "redefinition of '%s'", name);
+				if (g->inline_only) { g->body = NULL; g->inline_only = 0; }
 				if (g->defined) {
 					if (ctx->in_libc || (weak && !g->alias_name)) {
 						Sym *d = discard_sym(name, SYM_FUNC);
@@ -5155,6 +7866,20 @@ static void parse_toplevel(Ctx *ctx) {
 				}
 				g->weak_def = weak;
 				g->ty = ty;
+				if (attrs & ATTR_ALWAYS_INLINE) g->always = 1;
+				if (storage == ST_EXTERN && inl && (ctx->gnu89 || (attrs & ATTR_GNU_INLINE)) && !g->body && !g->defined) {
+					g->is_inline = 1;
+					capture_body(ctx, g);
+					g->inline_only = 1;
+					return;
+				}
+				if (attrs & ATTR_NOINLINE) g->noinline = 1;
+				if (inl) g->is_inline = 1;
+				if (ctx->fold && storage == ST_STATIC && !g->body &&
+					!(attrs & (ATTR_USED | ATTR_NAKED | ATTR_INTERRUPT)) && !g->alias_name) {
+					capture_body(ctx, g);
+					return;
+				}
 				parse_func_in(ctx, g, ty);
 				return;
 			}
@@ -5195,24 +7920,116 @@ static void resolve_aliases(Ctx *ctx, const char *file) {
 			exit(1);
 		}
 		g->alias = t;
+		if (g->asm_alias) g->kind = t->kind;
 	}
 }
 
+static void prune_statics(Ctx *ctx, Sym *g0, int rel0) {
+	int n = 0, cap = 0;
+	Sym **cand = NULL;
+	for (Sym *g = ctx->globals; g && g != g0; g = g->gnext) {
+		if (!g->is_static || g->kind != SYM_VAR || !g->defined || g->used_attr || g->tls || g->sect == SEC_ABS || g->sect == SEC_BSS || g->size <= 0) continue;
+		if (n == cap) cand = (Sym **)realloc(cand, sizeof(Sym *) * (size_t)(cap = cap ? cap * 2 : 32));
+		g->live = 0;
+		cand[n++] = g;
+	}
+	if (!n) return;
+	int nr = ctx->nrelocs - rel0;
+	int *in = (int *)malloc(sizeof(int) * (size_t)(nr + 1)), *tg = (int *)malloc(sizeof(int) * (size_t)(nr + 1));
+	for (int i = 0; i < nr; i++) {
+		Reloc *r = &ctx->relocs[rel0 + i];
+		in[i] = tg[i] = -1;
+		for (int k = 0; k < n; k++) {
+			Sym *g = cand[k];
+			if (r->in == g->sect && (long)r->pos >= g->off && (long)r->pos < g->off + g->size) in[i] = k;
+			if (r->sym == g || (!r->sym && r->sect == g->sect && r->addend >= g->off && r->addend < g->off + g->size)) tg[i] = k;
+		}
+	}
+	for (Sym *a = ctx->globals; a; a = a->gnext) {
+		if (!a->alias_name || a->alias) continue;
+		Sym *t = lookup_file_scope(ctx, a->alias_name);
+		if (t) t->live = 1;
+	}
+	for (int changed = 1; changed;) {
+		changed = 0;
+		for (int i = 0; i < nr; i++)
+			if (tg[i] >= 0 && !cand[tg[i]]->live && (in[i] < 0 || cand[in[i]]->live)) { cand[tg[i]]->live = 1; changed = 1; }
+	}
+	for (int i = 0; i < nr; i++)
+		if (in[i] >= 0 && !cand[in[i]]->live) {
+			Reloc *r = &ctx->relocs[rel0 + i];
+			r->sym = NULL;
+			r->sect = r->in;
+			r->addend = 0;
+		}
+	free(in);
+	free(tg);
+	free(cand);
+}
+
+static void compile_lazy(Ctx *ctx) {
+	for (;;) {
+		Sym *g = NULL;
+		for (int i = 0; i < ctx->nrelocs && !g; i++) {
+			Sym *s = ctx->relocs[i].sym;
+			if (s && s->body && !s->defined && !s->inline_only) g = s;
+		}
+		for (Sym *a = ctx->globals; a && !g; a = a->gnext) {
+			if (!a->alias_name || a->alias) continue;
+			Sym *t = lookup_file_scope(ctx, a->alias_name);
+			if (t && t->body && !t->defined && !t->inline_only) g = t;
+		}
+		if (!g) return;
+		TokVec v;
+		v.v = g->body;
+		v.n = v.cap = g->nbody;
+		replay(ctx, &v);
+		parse_func_in(ctx, g, g->ty);
+	}
+}
+
+static Type *va_list_type(void) {
+	static const char *names[4] = { "gp_offset", "fp_offset", "overflow_arg_area", "reg_save_area" };
+	Type *st = new_type(TY_STRUCT, 24, 8);
+	Member **tail = &st->members;
+	for (int i = 0; i < 4; i++) {
+		Member *m = (Member *)calloc(1, sizeof(Member));
+		m->name = intern(names[i]);
+		m->ty = i < 2 ? ty_uint : ptr_to(ty_void);
+		m->off = i < 2 ? 4 * i : 8 * (i - 1);
+		*tail = m;
+		tail = &m->next;
+	}
+	st->complete = 1;
+	return array_of(st, 1);
+}
+
 static void compile_unit(Ctx *ctx, const char *src, const char *file, int is_builtin) {
+	if (ctx->m32 && !is_builtin) { fprintf(stderr, "%s: error: C code can only be compiled for x86-64, not with -m32 or -m16\n", file); exit(1); }
 	ctx->unit++;
+	ctx->as_macros = NULL;
+	ctx->as_mcount = 0;
 	pp_begin_unit(ctx);
+	if (!ty_va_list) ty_va_list = va_list_type();
+	push_sym(ctx, id_va_list, SYM_TYPEDEF, ty_va_list);
 	push_file(ctx, src, file, is_builtin);
+	if (!is_builtin) push_includes(ctx, 0);
 	ctx->has_pk = 0;
 	ctx->has_pp_back = 0;
 	next(ctx);
+	Sym *g0 = ctx->globals;
+	int rel0 = ctx->nrelocs;
 	while (ctx->tok.kind != T_EOF) parse_toplevel(ctx);
+	compile_lazy(ctx);
+	if (ctx->fold) prune_statics(ctx, g0, rel0);
 	resolve_aliases(ctx, file);
 	pp_end_unit(ctx);
 	ctx->scope = NULL;
+	symmap_clear(&ctx->fsmap);
 	ctx->tags = NULL;
 }
 
-enum { RC_GP, RC_SEG, RC_CR, RC_DR, RC_XMM, RC_IP };
+enum { RC_GP, RC_SEG, RC_CR, RC_DR, RC_XMM, RC_IP, RC_ST };
 enum { OP_REG, OP_IMM, OP_MEM };
 
 typedef struct {
@@ -5220,7 +8037,7 @@ typedef struct {
 	int rc, num, size, hi;
 } AsReg;
 
-static AsReg as_regs[160];
+static AsReg as_regs[200];
 static int nas_regs;
 
 typedef struct AsSym AsSym;
@@ -5238,6 +8055,7 @@ struct AsSym {
 	int count, count_pass;
 	int fixed, hidden, csym;
 	Label *clab;
+	char *alias;
 	AsSym *next;
 };
 
@@ -5281,7 +8099,7 @@ typedef struct {
 typedef struct {
 	Ctx *ctx;
 	int pass, mode, sect, prev;
-	int stack[16], nstack;
+	int stack[16], pstack[16], nstack;
 	Code c;
 	Tok tok, pk;
 	int nl, has_pk;
@@ -5304,17 +8122,22 @@ typedef struct {
 	const char *sfile;
 	int sline;
 	int cond[16], ncond;
+	AsVal *szexpr;
+	long long *szval, *szprev;
+	int nsz, capsz, nszprev;
 	char *bss_name;
 	long *bpos;
 	char **bname;
 	int nbm, capbm;
+	struct { Lex *L; Tok q[2]; int nq, iq, first, macro; } xs[64];
+	int nxs;
 } As;
 
 enum {
 	AI_ALU, AI_SHIFT, AI_UNARY, AI_INCDEC, AI_IMUL, AI_MOV, AI_MOVABS, AI_LEA, AI_TEST, AI_XCHG,
 	AI_MOVX, AI_FIXED, AI_FIXSZ, AI_STR, AI_PUSH, AI_POP, AI_PUSHF, AI_PUSHA, AI_JMP, AI_CALL,
 	AI_JCC, AI_LOOP, AI_LJMP, AI_RET, AI_INT, AI_IN, AI_OUT, AI_PREFIX, AI_SETCC, AI_CMOV,
-	AI_0F, AI_BT, AI_BSWAP, AI_SHD, AI_GRP, AI_NOP, AI_SSE, AI_MOVD, AI_CVTI, AI_CVTF
+	AI_X87, AI_X87R, AI_X87A, AI_SSESH, AI_0F, AI_BT, AI_BSWAP, AI_SHD, AI_GRP, AI_NOP, AI_SSE, AI_MOVD, AI_CVTI, AI_CVTF
 };
 enum { F_SUF = 1, F_REGSRC = 2, F_BYTE = 4, F_MEM = 8, F_DT = 16, F_WQ = 32, F_W = 64, F_FAR = 128 };
 
@@ -5394,6 +8217,7 @@ static const AsIns as_table[] = {
 	{ "data16", AI_PREFIX, 0x66, 0, 0, 0, NULL }, { "data32", AI_PREFIX, 0x66, 0, 0, 0, NULL },
 	{ "addr16", AI_PREFIX, 0x67, 0, 0, 0, NULL }, { "addr32", AI_PREFIX, 0x67, 0, 0, 0, NULL },
 	{ "bsf", AI_0F, 0xBC, 0, 0, F_SUF, NULL }, { "bsr", AI_0F, 0xBD, 0, 0, F_SUF, NULL },
+	{ "lsl", AI_0F, 0x03, 1, 0, F_SUF, NULL }, { "lar", AI_0F, 0x02, 1, 0, F_SUF, NULL },
 	{ "popcnt", AI_0F, 0xB8, 0, 0, F_SUF, "\xF3" }, { "lzcnt", AI_0F, 0xBD, 0, 0, F_SUF, "\xF3" },
 	{ "tzcnt", AI_0F, 0xBC, 0, 0, F_SUF, "\xF3" },
 	{ "xadd", AI_0F, 0xC1, 0, 0, F_SUF | F_REGSRC | F_BYTE, NULL },
@@ -5411,6 +8235,138 @@ static const AsIns as_table[] = {
 	{ "verr", AI_GRP, 0, 4, 0, F_SUF, "\x0F\x00" }, { "verw", AI_GRP, 0, 5, 0, F_SUF, "\x0F\x00" },
 	{ "smsw", AI_GRP, 0, 4, 1, F_SUF, "\x0F\x01" }, { "lmsw", AI_GRP, 0, 6, 0, F_SUF, "\x0F\x01" },
 	{ "invlpg", AI_GRP, 0, 7, 0, F_MEM, "\x0F\x01" },
+	{ "rdpid", AI_GRP, 0, 7, 0, 0, "\xF3\x0F\xC7" },
+	{ "fnsave", AI_X87, 0xDD, 6, 0, 0, NULL }, { "fsave", AI_X87, 0xDD, 6, 1, 0, NULL },
+	{ "frstor", AI_X87, 0xDD, 4, 0, 0, NULL }, { "fldenv", AI_X87, 0xD9, 4, 0, 0, NULL },
+	{ "fnstenv", AI_X87, 0xD9, 6, 0, 0, NULL }, { "fstenv", AI_X87, 0xD9, 6, 1, 0, NULL },
+	{ "fldcw", AI_X87, 0xD9, 5, 0, 0, NULL }, { "fnstcw", AI_X87, 0xD9, 7, 0, 0, NULL },
+	{ "fstcw", AI_X87, 0xD9, 7, 1, 0, NULL }, { "fnstsw", AI_X87, 0xDD, 7, 0, 0, NULL },
+	{ "fstsw", AI_X87, 0xDD, 7, 1, 0, NULL },
+	{ "filds", AI_X87, 0xDF, 0, 0, 0, NULL }, { "fildl", AI_X87, 0xDB, 0, 0, 0, NULL },
+	{ "fildll", AI_X87, 0xDF, 5, 0, 0, NULL }, { "fildq", AI_X87, 0xDF, 5, 0, 0, NULL },
+	{ "fninit", AI_FIXED, 0, 0, 0, 0, "\xDB\xE3" }, { "finit", AI_FIXED, 0, 0, 0, 0, "\x9B\xDB\xE3" },
+	{ "fnclex", AI_FIXED, 0, 0, 0, 0, "\xDB\xE2" }, { "fclex", AI_FIXED, 0, 0, 0, 0, "\x9B\xDB\xE2" },
+	{ "fwait", AI_FIXED, 0, 0, 0, 0, "\x9B" }, { "wait", AI_FIXED, 0, 0, 0, 0, "\x9B" },
+	{ "emms", AI_FIXED, 0, 0, 0, 0, "\x0F\x77" },
+	{ "vmcall", AI_FIXED, 0, 0, 0, 0, "\x0F\x01\xC1" }, { "vmmcall", AI_FIXED, 0, 0, 0, 0, "\x0F\x01\xD9" },
+	{ "vmlaunch", AI_FIXED, 0, 0, 0, 0, "\x0F\x01\xC2" }, { "vmresume", AI_FIXED, 0, 0, 0, 0, "\x0F\x01\xC3" },
+	{ "vmxoff", AI_FIXED, 0, 0, 0, 0, "\x0F\x01\xC4" },
+	{ "stgi", AI_FIXED, 0, 0, 0, 0, "\x0F\x01\xDC" }, { "clgi", AI_FIXED, 0, 0, 0, 0, "\x0F\x01\xDD" },
+	{ "flds", AI_X87, 0xD9, 0, 0, 0, NULL }, { "fldl", AI_X87, 0xDD, 0, 0, 0, NULL },
+	{ "fadds", AI_X87, 0xD8, 0, 0, 0, NULL }, { "faddl", AI_X87, 0xDC, 0, 0, 0, NULL },
+	{ "fmuls", AI_X87, 0xD8, 1, 0, 0, NULL }, { "fmull", AI_X87, 0xDC, 1, 0, 0, NULL },
+	{ "fcoms", AI_X87, 0xD8, 2, 0, 0, NULL }, { "fcoml", AI_X87, 0xDC, 2, 0, 0, NULL },
+	{ "fcomps", AI_X87, 0xD8, 3, 0, 0, NULL }, { "fcompl", AI_X87, 0xDC, 3, 0, 0, NULL },
+	{ "fsubs", AI_X87, 0xD8, 4, 0, 0, NULL }, { "fsubl", AI_X87, 0xDC, 4, 0, 0, NULL },
+	{ "fsubrs", AI_X87, 0xD8, 5, 0, 0, NULL }, { "fsubrl", AI_X87, 0xDC, 5, 0, 0, NULL },
+	{ "fdivs", AI_X87, 0xD8, 6, 0, 0, NULL }, { "fdivl", AI_X87, 0xDC, 6, 0, 0, NULL },
+	{ "fdivrs", AI_X87, 0xD8, 7, 0, 0, NULL }, { "fdivrl", AI_X87, 0xDC, 7, 0, 0, NULL },
+	{ "faddp", AI_X87R, 0xDE, 0xC0, 2, 0, NULL },
+	{ "fmulp", AI_X87R, 0xDE, 0xC8, 2, 0, NULL },
+	{ "fsubp", AI_X87R, 0xDE, 0xE0, 2, 0, NULL },
+	{ "fsubrp", AI_X87R, 0xDE, 0xE8, 2, 0, NULL },
+	{ "fdivp", AI_X87R, 0xDE, 0xF0, 2, 0, NULL },
+	{ "fdivrp", AI_X87R, 0xDE, 0xF8, 2, 0, NULL },
+	{ "fld", AI_X87R, 0xD9, 0xC0, 0, 0, NULL }, { "fstp", AI_X87R, 0xDD, 0xD8, 0, 0, NULL },
+	{ "fxch", AI_X87R, 0xD9, 0xC8, 1, 0, NULL },
+	{ "f2xm1", AI_FIXED, 0, 0, 0, 0, "\xD9\xF0" },
+	{ "fabs", AI_FIXED, 0, 0, 0, 0, "\xD9\xE1" },
+	{ "fchs", AI_FIXED, 0, 0, 0, 0, "\xD9\xE0" },
+	{ "fcompp", AI_FIXED, 0, 0, 0, 0, "\xDE\xD9" },
+	{ "fcos", AI_FIXED, 0, 0, 0, 0, "\xD9\xFF" },
+	{ "fdecstp", AI_FIXED, 0, 0, 0, 0, "\xD9\xF6" },
+	{ "fincstp", AI_FIXED, 0, 0, 0, 0, "\xD9\xF7" },
+	{ "fldl2t", AI_FIXED, 0, 0, 0, 0, "\xD9\xE9" },
+	{ "fldl2e", AI_FIXED, 0, 0, 0, 0, "\xD9\xEA" },
+	{ "fldpi", AI_FIXED, 0, 0, 0, 0, "\xD9\xEB" },
+	{ "fldlg2", AI_FIXED, 0, 0, 0, 0, "\xD9\xEC" },
+	{ "fldln2", AI_FIXED, 0, 0, 0, 0, "\xD9\xED" },
+	{ "fnop", AI_FIXED, 0, 0, 0, 0, "\xD9\xD0" },
+	{ "fpatan", AI_FIXED, 0, 0, 0, 0, "\xD9\xF3" },
+	{ "fprem", AI_FIXED, 0, 0, 0, 0, "\xD9\xF8" },
+	{ "fprem1", AI_FIXED, 0, 0, 0, 0, "\xD9\xF5" },
+	{ "fptan", AI_FIXED, 0, 0, 0, 0, "\xD9\xF2" },
+	{ "frndint", AI_FIXED, 0, 0, 0, 0, "\xD9\xFC" },
+	{ "fscale", AI_FIXED, 0, 0, 0, 0, "\xD9\xFD" },
+	{ "fsin", AI_FIXED, 0, 0, 0, 0, "\xD9\xFE" },
+	{ "fsincos", AI_FIXED, 0, 0, 0, 0, "\xD9\xFB" },
+	{ "fsqrt", AI_FIXED, 0, 0, 0, 0, "\xD9\xFA" },
+	{ "ftst", AI_FIXED, 0, 0, 0, 0, "\xD9\xE4" },
+	{ "fucompp", AI_FIXED, 0, 0, 0, 0, "\xDA\xE9" },
+	{ "fxam", AI_FIXED, 0, 0, 0, 0, "\xD9\xE5" },
+	{ "fxtract", AI_FIXED, 0, 0, 0, 0, "\xD9\xF4" },
+	{ "fyl2x", AI_FIXED, 0, 0, 0, 0, "\xD9\xF1" },
+	{ "fyl2xp1", AI_FIXED, 0, 0, 0, 0, "\xD9\xF9" },
+	{ "fadd", AI_X87A, 0xC0, 0, 0, 0, NULL },
+	{ "fmul", AI_X87A, 0xC8, 0, 0, 0, NULL },
+	{ "fsub", AI_X87A, 0xE0, 0, 0, 0, NULL },
+	{ "fsubr", AI_X87A, 0xE8, 0, 0, 0, NULL },
+	{ "fdiv", AI_X87A, 0xF0, 0, 0, 0, NULL },
+	{ "fdivr", AI_X87A, 0xF8, 0, 0, 0, NULL },
+	{ "fst", AI_X87R, 0xDD, 0xD0, 0, 0, NULL },
+	{ "ffree", AI_X87R, 0xDD, 0xC0, 0, 0, NULL },
+	{ "fucom", AI_X87R, 0xDD, 0xE0, 1, 0, NULL },
+	{ "fucomp", AI_X87R, 0xDD, 0xE8, 1, 0, NULL },
+	{ "fcom", AI_X87R, 0xD8, 0xD0, 1, 0, NULL },
+	{ "fcomp", AI_X87R, 0xD8, 0xD8, 1, 0, NULL },
+	{ "fcomi", AI_X87R, 0xDB, 0xF0, 2, 0, NULL },
+	{ "fucomi", AI_X87R, 0xDB, 0xE8, 2, 0, NULL },
+	{ "fcomip", AI_X87R, 0xDF, 0xF0, 2, 0, NULL },
+	{ "fucomip", AI_X87R, 0xDF, 0xE8, 2, 0, NULL },
+	{ "fcmovb", AI_X87R, 0xDA, 0xC0, 2, 0, NULL },
+	{ "fcmove", AI_X87R, 0xDA, 0xC8, 2, 0, NULL },
+	{ "fcmovbe", AI_X87R, 0xDA, 0xD0, 2, 0, NULL },
+	{ "fcmovu", AI_X87R, 0xDA, 0xD8, 2, 0, NULL },
+	{ "fcmovnb", AI_X87R, 0xDB, 0xC0, 2, 0, NULL },
+	{ "fcmovne", AI_X87R, 0xDB, 0xC8, 2, 0, NULL },
+	{ "fcmovnbe", AI_X87R, 0xDB, 0xD0, 2, 0, NULL },
+	{ "fcmovnu", AI_X87R, 0xDB, 0xD8, 2, 0, NULL },
+	{ "fiadds", AI_X87, 0xDE, 0, 0, 0, NULL },
+	{ "fiaddl", AI_X87, 0xDA, 0, 0, 0, NULL },
+	{ "fimuls", AI_X87, 0xDE, 1, 0, 0, NULL },
+	{ "fimull", AI_X87, 0xDA, 1, 0, 0, NULL },
+	{ "ficoms", AI_X87, 0xDE, 2, 0, 0, NULL },
+	{ "ficoml", AI_X87, 0xDA, 2, 0, 0, NULL },
+	{ "ficomps", AI_X87, 0xDE, 3, 0, 0, NULL },
+	{ "ficompl", AI_X87, 0xDA, 3, 0, 0, NULL },
+	{ "fisubs", AI_X87, 0xDE, 4, 0, 0, NULL },
+	{ "fisubl", AI_X87, 0xDA, 4, 0, 0, NULL },
+	{ "fisubrs", AI_X87, 0xDE, 5, 0, 0, NULL },
+	{ "fisubrl", AI_X87, 0xDA, 5, 0, 0, NULL },
+	{ "fidivs", AI_X87, 0xDE, 6, 0, 0, NULL },
+	{ "fidivl", AI_X87, 0xDA, 6, 0, 0, NULL },
+	{ "fidivrs", AI_X87, 0xDE, 7, 0, 0, NULL },
+	{ "fidivrl", AI_X87, 0xDA, 7, 0, 0, NULL },
+	{ "fists", AI_X87, 0xDF, 2, 0, 0, NULL },
+	{ "fistps", AI_X87, 0xDF, 3, 0, 0, NULL },
+	{ "fisttps", AI_X87, 0xDF, 1, 0, 0, NULL },
+	{ "fisttpl", AI_X87, 0xDB, 1, 0, 0, NULL },
+	{ "fisttpll", AI_X87, 0xDD, 1, 0, 0, NULL },
+	{ "fisttpq", AI_X87, 0xDD, 1, 0, 0, NULL },
+	{ "fbld", AI_X87, 0xDF, 4, 0, 0, NULL },
+	{ "fbstp", AI_X87, 0xDF, 6, 0, 0, NULL },
+	{ "fild", AI_X87, 0xDF, 0, 0, 0, NULL },
+	{ "fist", AI_X87, 0xDF, 2, 0, 0, NULL },
+	{ "fistp", AI_X87, 0xDF, 3, 0, 0, NULL },
+	{ "fiadd", AI_X87, 0xDE, 0, 0, 0, NULL },
+	{ "fimul", AI_X87, 0xDE, 1, 0, 0, NULL },
+	{ "ficom", AI_X87, 0xDE, 2, 0, 0, NULL },
+	{ "ficomp", AI_X87, 0xDE, 3, 0, 0, NULL },
+	{ "fisub", AI_X87, 0xDE, 4, 0, 0, NULL },
+	{ "fisubr", AI_X87, 0xDE, 5, 0, 0, NULL },
+	{ "fidiv", AI_X87, 0xDE, 6, 0, 0, NULL },
+	{ "fidivr", AI_X87, 0xDE, 7, 0, 0, NULL },
+	{ "fisttp", AI_X87, 0xDF, 1, 0, 0, NULL },
+	{ "fldz", AI_FIXED, 0, 0, 0, 0, "\xD9\xEE" }, { "fld1", AI_FIXED, 0, 0, 0, 0, "\xD9\xE8" },
+	{ "fldt", AI_X87, 0xDB, 5, 0, 0, NULL }, { "fsts", AI_X87, 0xD9, 2, 0, 0, NULL },
+	{ "fstl", AI_X87, 0xDD, 2, 0, 0, NULL }, { "fstps", AI_X87, 0xD9, 3, 0, 0, NULL },
+	{ "fstpl", AI_X87, 0xDD, 3, 0, 0, NULL }, { "fstpt", AI_X87, 0xDB, 7, 0, 0, NULL },
+	{ "fistl", AI_X87, 0xDB, 2, 0, 0, NULL }, { "fistpl", AI_X87, 0xDB, 3, 0, 0, NULL },
+	{ "fistpll", AI_X87, 0xDF, 7, 0, 0, NULL }, { "fistpq", AI_X87, 0xDF, 7, 0, 0, NULL },
+	{ "movnti", AI_0F, 0xC3, 0, 0, F_SUF | F_REGSRC, NULL },
+	{ "prefetchnta", AI_GRP, 0, 0, 0, F_MEM, "\x0F\x18" }, { "prefetcht0", AI_GRP, 0, 1, 0, F_MEM, "\x0F\x18" },
+	{ "prefetcht1", AI_GRP, 0, 2, 0, F_MEM, "\x0F\x18" }, { "prefetcht2", AI_GRP, 0, 3, 0, F_MEM, "\x0F\x18" },
+	{ "prefetch", AI_GRP, 0, 0, 0, F_MEM, "\x0F\x0D" }, { "prefetchw", AI_GRP, 0, 1, 0, F_MEM, "\x0F\x0D" },
 	{ "fxsave", AI_GRP, 0, 0, 0, F_SUF | F_MEM | F_WQ, "\x0F\xAE" },
 	{ "fxrstor", AI_GRP, 0, 1, 0, F_SUF | F_MEM | F_WQ, "\x0F\xAE" },
 	{ "fxsave64", AI_GRP, 0, 0, 0, F_MEM | F_W, "\x0F\xAE" },
@@ -5441,6 +8397,15 @@ static const AsIns as_table[] = {
 	{ "andnps", AI_SSE, 0x55, 0, 0, 0, NULL }, { "andnpd", AI_SSE, 0x55, 0, 0, 0, "\x66" },
 	{ "orps", AI_SSE, 0x56, 0, 0, 0, NULL }, { "orpd", AI_SSE, 0x56, 0, 0, 0, "\x66" },
 	{ "xorps", AI_SSE, 0x57, 0, 0, 0, NULL }, { "xorpd", AI_SSE, 0x57, 0, 0, 0, "\x66" },
+	{ "pcmpeqb", AI_SSE, 0x74, 0, 0, 0, "\x66" }, { "pcmpeqw", AI_SSE, 0x75, 0, 0, 0, "\x66" },
+	{ "pcmpeqd", AI_SSE, 0x76, 0, 0, 0, "\x66" }, { "pcmpgtb", AI_SSE, 0x64, 0, 0, 0, "\x66" },
+	{ "pcmpgtw", AI_SSE, 0x65, 0, 0, 0, "\x66" }, { "pcmpgtd", AI_SSE, 0x66, 0, 0, 0, "\x66" },
+	{ "psrlw", AI_SSESH, 0xD1, 0x71, 2, 0, "\x66" }, { "psrld", AI_SSESH, 0xD2, 0x72, 2, 0, "\x66" },
+	{ "psrlq", AI_SSESH, 0xD3, 0x73, 2, 0, "\x66" }, { "psraw", AI_SSESH, 0xE1, 0x71, 4, 0, "\x66" },
+	{ "psrad", AI_SSESH, 0xE2, 0x72, 4, 0, "\x66" }, { "psllw", AI_SSESH, 0xF1, 0x71, 6, 0, "\x66" },
+	{ "pslld", AI_SSESH, 0xF2, 0x72, 6, 0, "\x66" }, { "psllq", AI_SSESH, 0xF3, 0x73, 6, 0, "\x66" },
+	{ "psrldq", AI_SSESH, 0, 0x73, 3, 0, "\x66" }, { "pslldq", AI_SSESH, 0, 0x73, 7, 0, "\x66" },
+	{ "pmovmskb", AI_CVTF, 0xD7, 0, 0, 0, "\x66" },
 	{ "pxor", AI_SSE, 0xEF, 0, 0, 0, "\x66" }, { "por", AI_SSE, 0xEB, 0, 0, 0, "\x66" },
 	{ "pand", AI_SSE, 0xDB, 0, 0, 0, "\x66" }, { "paddq", AI_SSE, 0xD4, 0, 0, 0, "\x66" },
 	{ "ucomisd", AI_SSE, 0x2E, 0, 0, 0, "\x66" }, { "ucomiss", AI_SSE, 0x2E, 0, 0, 0, NULL },
@@ -5493,6 +8458,8 @@ static void as_init(void) {
 		}
 		snprintf(b, sizeof(b), "cr%d", i); as_reg_add(b, RC_CR, i, 8, 0);
 		snprintf(b, sizeof(b), "dr%d", i); as_reg_add(b, RC_DR, i, 8, 0);
+		if (i < 8) { snprintf(b, sizeof(b), "db%d", i); as_reg_add(b, RC_DR, i, 8, 0); }
+		if (i < 8) { snprintf(b, sizeof(b), "st(%d)", i); as_reg_add(b, RC_ST, i, 10, 0); }
 		snprintf(b, sizeof(b), "xmm%d", i); as_reg_add(b, RC_XMM, i, 16, 0);
 	}
 	for (int i = 0; i < 4; i++) as_reg_add(rh[i], RC_GP, 4 + i, 1, 1);
@@ -5519,7 +8486,24 @@ static void as_init(void) {
 	id_dot = intern(".");
 }
 
+static char *as_lower(char *name) {
+	char b[64];
+	int n = (int)strlen(name), up = 0;
+	if (n >= (int)sizeof(b)) return name;
+	for (int i = 0; i < n; i++) { b[i] = (char)tolower((unsigned char)name[i]); up |= b[i] != name[i]; }
+	return up ? intern_str(b, n)->s : name;
+}
+
+static const AsIns *as_find1(char *name, int *suffix);
+
 static const AsIns *as_find(char *name, int *suffix) {
+	const AsIns *in = as_find1(name, suffix);
+	char *l = as_lower(name);
+	if (!in && l != name) in = as_find1(l, suffix);
+	return in;
+}
+
+static const AsIns *as_find1(char *name, int *suffix) {
 	for (int i = 0; i < nas_ins; i++)
 		if (as_ids[i] == name) { *suffix = 0; return &as_ins[i]; }
 	int n = (int)strlen(name);
@@ -5533,9 +8517,26 @@ static const AsIns *as_find(char *name, int *suffix) {
 	return NULL;
 }
 
+static Tok as_raw(As *A) {
+	while (A->nxs) {
+		int i = A->nxs - 1;
+		if (A->xs[i].L) {
+			Tok t = lex_next(A->xs[i].L);
+			if (A->xs[i].first) { t.bol = 1; A->xs[i].first = 0; }
+			if (t.kind != T_EOF) return t;
+			free((char *)A->xs[i].L->s);
+			free(A->xs[i].L);
+			A->xs[i].L = NULL;
+		}
+		if (A->xs[i].iq < A->xs[i].nq) return A->xs[i].q[A->xs[i].iq++];
+		A->nxs--;
+	}
+	return A->lx ? lex_next(A->lx) : pp_next(A->ctx);
+}
+
 static void as_next(As *A) {
 	if (A->has_pk) { A->tok = A->pk; A->has_pk = 0; }
-	else A->tok = A->lx ? lex_next(A->lx) : pp_next(A->ctx);
+	else A->tok = as_raw(A);
 	A->nl = A->tok.bol;
 	if (A->snip) {
 		A->ctx->tok = A->tok;
@@ -5545,7 +8546,7 @@ static void as_next(As *A) {
 }
 
 static Tok *as_peek(As *A) {
-	if (!A->has_pk) { A->pk = A->lx ? lex_next(A->lx) : pp_next(A->ctx); A->has_pk = 1; }
+	if (!A->has_pk) { A->pk = as_raw(A); A->has_pk = 1; }
 	return &A->pk;
 }
 
@@ -5698,12 +8699,12 @@ static AsVal as_apply(As *A, int op, AsVal l, AsVal r) {
 	case T_AMP: a &= b; break;
 	case T_PIPE: a |= b; break;
 	case T_CARET: a ^= b; break;
-	case T_LT: a = a < b; break;
-	case T_GT: a = a > b; break;
-	case T_LEQ: a = a <= b; break;
-	case T_GEQ: a = a >= b; break;
-	case T_EQ: a = a == b; break;
-	case T_NEQ: a = a != b; break;
+	case T_LT: a = -(a < b); break;
+	case T_GT: a = -(a > b); break;
+	case T_LEQ: a = -(a <= b); break;
+	case T_GEQ: a = -(a >= b); break;
+	case T_EQ: a = -(a == b); break;
+	case T_NEQ: a = -(a != b); break;
 	case T_AND: a = a && b; break;
 	case T_OR: a = a || b; break;
 	default: error_at(A->ctx, "invalid operator in expression");
@@ -5713,10 +8714,16 @@ static AsVal as_apply(As *A, int op, AsVal l, AsVal r) {
 
 static AsVal as_binary(As *A, int minprec);
 
+static const AsReg *as_reg(As *A);
+
 static AsVal as_primary(As *A) {
 	Tok t = A->tok;
 	if (as_at_end(A)) error_at(A->ctx, "expected an expression");
 	if (t.kind == T_NUM) { as_next(A); return as_const(t.val); }
+	if (t.kind == '%' && as_peek(A)->kind == T_IDENT) {
+		const AsReg *r = as_reg(A);
+		return as_const(((long long)1 << 40) | ((long long)r->rc << 24) | (r->num << 16) | (r->size << 8) | r->hi);
+	}
 	if (t.kind == T_LP) {
 		as_next(A);
 		AsVal v = as_binary(A, 1);
@@ -5732,6 +8739,7 @@ static AsVal as_primary(As *A) {
 	}
 	if (t.kind == T_IDENT) {
 		as_next(A);
+		if (as_is(A, T_AT) && !A->nl && as_peek(A)->kind == T_IDENT && (!strcmp(as_peek(A)->str, "PLT") || !strcmp(as_peek(A)->str, "plt"))) { as_next(A); as_next(A); }
 		AsVal r = as_const(0);
 		int n = (int)strlen(t.str);
 		if (t.str == id_dot) {
@@ -5766,6 +8774,34 @@ static AsVal as_binary(As *A, int minprec) {
 
 static AsVal as_expr(As *A) { return as_binary(A, 1); }
 
+static long long as_sizeexpr(As *A) {
+	AsVal v = as_expr(A);
+	as_fold(A, &v);
+	if (A->nsz == A->capsz) {
+		A->capsz = A->capsz ? A->capsz * 2 : 16;
+		A->szexpr = (AsVal *)realloc(A->szexpr, sizeof(AsVal) * A->capsz);
+		A->szval = (long long *)realloc(A->szval, sizeof(long long) * A->capsz);
+		A->szprev = (long long *)realloc(A->szprev, sizeof(long long) * A->capsz);
+		if (!A->szexpr || !A->szval || !A->szprev) { perror("realloc"); exit(1); }
+	}
+	int i = A->nsz++;
+	A->szexpr[i] = v;
+	A->szval[i] = as_known(&v) ? v.v : i < A->nszprev ? A->szprev[i] : 0;
+	return A->szval[i];
+}
+
+static void as_settle(As *A) {
+	for (int i = 0; i < A->nsz; i++) {
+		AsVal v = A->szexpr[i];
+		as_fold(A, &v);
+		if (!as_known(&v)) error_at(A->ctx, "expression must be constant here");
+		if (v.v != A->szval[i]) A->changed = 1;
+		A->szprev[i] = v.v;
+	}
+	A->nszprev = A->nsz;
+	if (A->changed && A->pass > 64) error_at(A->ctx, "the sizes in this assembly do not settle");
+}
+
 static long long as_absexpr(As *A) {
 	AsVal v = as_expr(A);
 	if (!as_known(&v)) error_at(A->ctx, "expression must be constant here");
@@ -5775,8 +8811,24 @@ static long long as_absexpr(As *A) {
 static const AsReg *as_reg(As *A) {
 	as_expect(A, '%');
 	if (!as_is(A, T_IDENT)) error_at(A->ctx, "expected a register name after '%%'");
+	char *l = as_lower(A->tok.str);
+	if (!strcmp(l, "st")) {
+		int n = 0;
+		as_next(A);
+		if (as_is(A, T_LP) && as_peek(A)->kind == T_NUM) {
+			as_next(A);
+			n = (int)A->tok.val;
+			as_next(A);
+			as_expect(A, T_RP);
+		}
+		if (n < 0 || n > 7) error_at(A->ctx, "invalid x87 register");
+		char b[8];
+		snprintf(b, sizeof(b), "st(%d)", n);
+		char *id = intern(b);
+		for (int i = 0; i < nas_regs; i++) if (as_regs[i].name == id) return &as_regs[i];
+	}
 	for (int i = 0; i < nas_regs; i++)
-		if (as_regs[i].name == A->tok.str) { as_next(A); return &as_regs[i]; }
+		if (as_regs[i].name == A->tok.str || as_regs[i].name == l) { as_next(A); return &as_regs[i]; }
 	error_at(A->ctx, "unknown register '%%%s'", A->tok.str);
 	return NULL;
 }
@@ -5853,6 +8905,7 @@ static void as_check(As *A, long long v, int size, int sign) {
 	if (size >= 8) return;
 	long long lo = -(1LL << (8 * size - 1));
 	long long hi = sign ? (1LL << (8 * size - 1)) - 1 : (long long)((1ULL << (8 * size)) - 1);
+	if (size == 4 && A->mode != 64) { lo = -0xFFFFFFFFLL; hi = 0xFFFFFFFFLL; }
 	if (v < lo || v > hi) error_at(A->ctx, "value %lld does not fit in %d byte%s", v, size, size == 1 ? "" : "s");
 }
 
@@ -6065,7 +9118,7 @@ static int as_near(As *A, AsVal *v, long end) {
 		long long d = s->off + v->v - end;
 		return d >= -128 && d <= 127;
 	}
-	if (s->pass == A->pass - 1) return s->sect == A->sect;
+	if (s->pass && s->pass == A->pass - 1) return s->sect == A->sect;
 	return A->pass == 1 && s->pass == 0;
 }
 
@@ -6417,6 +9470,53 @@ static void as_insn(As *A, char *name) {
 		as_rm(A, dsz, 0, op, 2, 0, &o[1], &o[0], 0);
 		break;
 	}
+	case AI_X87A: {
+		int b = (uint8_t)in->op;
+		if (n == 1 && o[0].kind == OP_MEM) {
+			op[0] = (char)0xD8;
+			as_rm(A, 0, 0, op, 1, (b - 0xC0) >> 3, NULL, &o[0], 0);
+			break;
+		}
+		int pre = 0xDE, r = 1;
+		if (n == 2 && as_isreg(&o[0], RC_ST) && as_isreg(&o[1], RC_ST) && (!o[0].reg || !o[1].reg)) {
+			pre = o[1].reg ? 0xDC : 0xD8;
+			r = o[1].reg ? o[1].reg : o[0].reg;
+		} else if (n == 1 && as_isreg(&o[0], RC_ST)) {
+			pre = 0xD8;
+			r = o[0].reg;
+		} else if (n != 0) error_at(ctx, "invalid operands for %s", name);
+		as_head(A, 0, NULL);
+		C8(c, (uint8_t)pre);
+		C8(c, (uint8_t)(b + r));
+		break;
+	}
+	case AI_X87R: {
+		int r = in->sz ? 1 : -1;
+		if (n == 1 && o[0].kind == OP_MEM && ((in->op == 0xD9 && in->ext == 0xC0) || (in->op == 0xDD && (in->ext == 0xD0 || in->ext == 0xD8)))) {
+			op[0] = (char)0xD9;
+			as_rm(A, 0, 0, op, 1, in->ext == 0xC0 ? 0 : in->ext == 0xD0 ? 2 : 3, NULL, &o[0], 0);
+			break;
+		}
+		if (n == 2 && in->sz == 2 && as_isreg(&o[0], RC_ST) && as_isreg(&o[1], RC_ST) && (!o[0].reg || !o[1].reg)) r = o[0].reg ? o[0].reg : o[1].reg;
+		else if (n == 1 && as_isreg(&o[0], RC_ST)) r = o[0].reg;
+		else if (n != 0 || r < 0) error_at(ctx, "invalid operands for %s", name);
+		as_head(A, 0, NULL);
+		C8(c, in->op);
+		C8(c, (uint8_t)(in->ext + r));
+		break;
+	}
+	case AI_X87:
+		as_nops(A, name, n, 1);
+		if (in->ext == 7 && in->op == 0xDD && as_isacc(&o[0]) && o[0].size == 2) {
+			if (in->sz) C8(c, 0x9B);
+			C8(c, 0xDF); C8(c, 0xE0);
+			break;
+		}
+		if (o[0].kind != OP_MEM) error_at(ctx, "invalid operand for %s", name);
+		if (in->sz) C8(c, 0x9B);
+		op[0] = (char)in->op;
+		as_rm(A, 0, 0, op, 1, in->ext, NULL, &o[0], 0);
+		break;
 	case AI_FIXED:
 		as_nops(A, name, n, 0);
 		as_head(A, in->sz, NULL);
@@ -6516,9 +9616,12 @@ static void as_insn(As *A, char *name) {
 		as_nops(A, name, n, 2);
 		AsOp *r = in->flags & F_REGSRC ? &o[0] : &o[1], *m = in->flags & F_REGSRC ? &o[1] : &o[0];
 		if (!as_isreg(r, RC_GP) || m->kind == OP_IMM) error_at(ctx, "invalid operands for %s", name);
-		sz = as_sz(A, suf, o, 2);
+		if (in->ext && as_isreg(m, RC_GP) && m->size == 2 && r->size > 2 && (!suf || suf == r->size)) sz = r->size;
+		else sz = as_sz(A, suf, o, 2);
 		if (sz == 1 && !(in->flags & F_BYTE)) error_at(ctx, "%s has no byte form", name);
 		op[0] = 0x0F; op[1] = (char)(in->op - (sz == 1));
+		if (in->ext && sz == 8) sz = 4;
+		if (in->op == 0xC3 && sz == 4) sz = 0;
 		as_rm(A, sz, in->code ? (uint8_t)in->code[0] : 0, op, 2, 0, r, m, 0);
 		break;
 	}
@@ -6567,6 +9670,11 @@ static void as_insn(As *A, char *name) {
 		else if ((in->flags & F_WQ) && suf == 8) sz = 8;
 		else if ((in->flags & F_DT) && suf && suf != 8) sz = suf == (A->mode == 16 ? 2 : 4) ? 0 : suf == 2 ? 2 : 4;
 		else if (as_isreg(&o[0], RC_GP) && (o[0].size == 8 || in->sz)) sz = o[0].size;
+		if ((uint8_t)in->code[0] == 0xF3) {
+			if (o[0].kind != OP_REG || (o[0].size != 8 && !(o[0].size == 4 && A->mode != 64))) error_at(ctx, "invalid operand for %s", name);
+			as_rm(A, 0, 0xF3, in->code + 1, 2, in->ext, NULL, &o[0], 0);
+			break;
+		}
 		as_rm(A, sz, 0, in->code, 2, in->ext, NULL, &o[0], 0);
 		break;
 	case AI_NOP:
@@ -6598,6 +9706,19 @@ static void as_insn(As *A, char *name) {
 		} else error_at(ctx, "invalid operands for %s", name);
 		break;
 	}
+	case AI_SSESH:
+		as_nops(A, name, n, 2);
+		if (!as_isreg(&o[1], RC_XMM)) error_at(ctx, "invalid operands for %s", name);
+		op[0] = 0x0F;
+		if (o[0].kind == OP_IMM) {
+			op[1] = (char)in->ext;
+			as_rm(A, 0, 0x66, op, 2, in->sz, NULL, &o[1], 1);
+			as_imm(A, &o[0].val, 1, 0);
+		} else if (in->op && (as_isreg(&o[0], RC_XMM) || o[0].kind == OP_MEM)) {
+			op[1] = (char)in->op;
+			as_rm(A, 0, 0x66, op, 2, 0, &o[1], &o[0], 0);
+		} else error_at(ctx, "invalid operands for %s", name);
+		break;
 	case AI_MOVD:
 		as_nops(A, name, n, 2);
 		as_movd(A, 0, &o[0], &o[1]);
@@ -6678,7 +9799,7 @@ static int as_section(As *A) {
 		name = intern_str((char *)b.data, (int)b.len)->s;
 		free(b.data);
 	}
-	int kind = strncmp(name, ".text", 5) == 0 ? SK_CODE : strncmp(name, ".rodata", 7) == 0 ? SK_RO :
+	int kind = strncmp(name, ".text", 5) == 0 || !strcmp(name, ".init") || !strcmp(name, ".fini") ? SK_CODE : strncmp(name, ".rodata", 7) == 0 ? SK_RO :
 		!strncmp(name, ".note", 5) || !strncmp(name, ".debug", 6) || !strcmp(name, ".comment") ? SK_NOALLOC : SK_DATA;
 	int nobits = strncmp(name, ".bss", 4) == 0;
 	if (as_is(A, T_COMMA)) {
@@ -6709,6 +9830,30 @@ static void as_align(As *A, long long a, int has_fill, long long fill, long long
 	long pad = (long)align_up((size_t)pos, (size_t)a) - pos;
 	if (max > 0 && pad > max) return;
 	int f = has_fill ? (int)(fill & 0xFF) : as_is_code(A->ctx, A->sect) ? 0x90 : 0;
+	if (f == 0x90 && A->mode == 64 && as_is_code(A->ctx, A->sect)) {
+		static const char *nops[12] = { "", "\x90", "\x66\x90", "\x0F\x1F\x00", "\x0F\x1F\x40\x00",
+			"\x0F\x1F\x44\x00\x00", "\x66\x0F\x1F\x44\x00\x00", "\x0F\x1F\x80\x00\x00\x00\x00",
+			"\x0F\x1F\x84\x00\x00\x00\x00\x00", "\x66\x0F\x1F\x84\x00\x00\x00\x00\x00",
+			"\x66\x2E\x0F\x1F\x84\x00\x00\x00\x00\x00", "\x66\x66\x2E\x0F\x1F\x84\x00\x00\x00\x00\x00" };
+		long r = pad % 11, q = pad / 11;
+		for (long i = 0; i < r; i++) as_byte(A, (uint8_t)nops[r][i]);
+		while (q-- > 0)
+			for (int i = 0; i < 11; i++) as_byte(A, (uint8_t)nops[11][i]);
+		return;
+	}
+	if (f == 0x90 && pad > 0 && as_is_code(A->ctx, A->sect)) {
+		static const char *n16[6] = { "", "\x90", "\x89\xF6", "\x8D\x74\x00", "\x8D\xB4\x00\x00", "\x2E\x8D\xB4\x00\x00" };
+		static const char *n32[9] = { "", "\x90", "\x66\x90", "\x8D\x76\x00", "\x8D\x74\x26\x00", "\x2E\x8D\x74\x26\x00",
+			"\x8D\xB6\x00\x00\x00\x00", "\x8D\xB4\x26\x00\x00\x00\x00", "\x2E\x8D\xB4\x26\x00\x00\x00\x00" };
+		const char **t = A->mode == 16 ? n16 : n32;
+		long m = A->mode == 16 ? 5 : 8;
+		if (pad >= 3 * m && pad - 2 <= 127) { as_byte(A, 0xEB); as_byte(A, (int)(pad - 2)); pad -= 2; }
+		long r = pad % m, q = pad / m;
+		for (long i = 0; i < r; i++) as_byte(A, (uint8_t)t[r][i]);
+		while (q-- > 0)
+			for (long i = 0; i < m; i++) as_byte(A, (uint8_t)t[m][i]);
+		return;
+	}
 	while (pad-- > 0) as_byte(A, f);
 }
 
@@ -6769,6 +9914,8 @@ static void as_set(As *A, char *name) {
 		s->sect = v.add->sect;
 		s->off = v.add->off + (long)v.v;
 		if (!s->type) s->type = v.add->type;
+	} else if (A->snip && v.add && !v.sub && !v.t && !v.v && !as_defined(A, v.add)) {
+		s->alias = v.add->name;
 	} else error_at(A->ctx, "'%s' must be set to a constant or to a defined symbol plus a constant", name);
 	s->pass = A->pass;
 }
@@ -6829,6 +9976,269 @@ static void as_incbin(As *A) {
 	fclose(f);
 }
 
+typedef struct { int a, b; } AsRange;
+
+static void as_tok_text(Buf *b, Tok *t) {
+	if (t->raw && t->rawlen) buf_append(b, t->raw, (size_t)t->rawlen);
+	else tok_spell(b, t);
+}
+
+static int as_line_toks(As *A, Tok **out) {
+	int n = 0, cap = 16;
+	Tok *v = (Tok *)malloc(sizeof(Tok) * cap);
+	while (!as_at_end(A)) {
+		if (n == cap) v = (Tok *)realloc(v, sizeof(Tok) * (cap *= 2));
+		v[n++] = A->tok;
+		as_next(A);
+	}
+	*out = v;
+	return n;
+}
+
+static int as_joins(int k) {
+	return k == '+' || k == '*' || k == '/' || k == '|' || k == '&' || k == '^' || k == '=' || k == '<' || k == '>' ||
+		k == T_SHL || k == T_SHR || k == T_EQ || k == T_NEQ || k == T_LEQ || k == T_GEQ || k == T_AND || k == T_OR || k == ':';
+}
+
+static int as_split(Tok *v, int n, AsRange **out) {
+	int na = 0, cap = 8, depth = 0, a = 0;
+	AsRange *r = (AsRange *)malloc(sizeof(AsRange) * cap);
+	if (!n) { *out = r; return 0; }
+	for (int i = 0; i <= n; i++) {
+		int end = i == n;
+		if (!end && depth == 0 && v[i].kind == T_COMMA) end = 1;
+		else if (!end && depth == 0 && i > a && v[i].space) {
+			int pk = v[i-1].kind, k = v[i].kind;
+			int nospace_after = i + 1 < n && !v[i+1].space;
+			if (pk != ')' && !as_joins(pk) && !as_joins(k) && (k != '-' || nospace_after)) end = 2;
+		}
+		if (end) {
+			if (na == cap) r = (AsRange *)realloc(r, sizeof(AsRange) * (cap *= 2));
+			r[na].a = a; r[na].b = i; na++;
+			if (end == 2) { a = i; } else a = i + 1;
+			if (end == 2) { if (v[i].kind == '(') depth++; continue; }
+			continue;
+		}
+		if (v[i].kind == '(' || v[i].kind == '[') depth++;
+		else if (v[i].kind == ')' || v[i].kind == ']') depth--;
+	}
+	*out = r;
+	return na;
+}
+
+static int as_wordy(int k) { return k == T_IDENT || k == T_NUM || k == T_FNUM || k == T_STR; }
+
+static char *as_range_text(Tok *v, AsRange r, int unquote) {
+	Buf b; buf_init(&b);
+	if (unquote && r.b == r.a + 1 && v[r.a].kind == T_STR) {
+		Tok *t = &v[r.a];
+		if (t->raw && t->rawlen >= 2 && t->raw[0] == '"') buf_append(&b, t->raw + 1, (size_t)t->rawlen - 2);
+		else buf_append(&b, t->str, (size_t)t->len);
+	} else
+		for (int i = r.a; i < r.b; i++) {
+			if (i > r.a && v[i].space && as_wordy(v[i-1].kind) && as_wordy(v[i].kind)) buf_append_byte(&b, ' ');
+			as_tok_text(&b, &v[i]);
+		}
+	buf_append_byte(&b, 0);
+	return (char *)b.data;
+}
+
+static char *as_capture(As *A, int endr) {
+	Buf b; buf_init(&b);
+	int depth = 0, semi = 0;
+	for (;;) {
+		Tok t = A->tok;
+		if (t.kind == T_EOF) error_at(A->ctx, endr ? "missing .endr" : "missing .endm");
+		int start = A->nl || !b.len || semi;
+		semi = t.kind == T_SEMI;
+		if (start && t.kind == T_IDENT) {
+			const char *d = t.str;
+			if (endr ? !strcmp(d, ".rept") || !strcmp(d, ".irp") || !strcmp(d, ".irpc") : !strcmp(d, ".macro")) depth++;
+			else if (!strcmp(d, endr ? ".endr" : ".endm") && !depth--) {
+				as_next(A);
+				buf_append_byte(&b, '\n');
+				buf_append_byte(&b, 0);
+				return (char *)b.data;
+			}
+		}
+		if (t.bol && b.len) buf_append_byte(&b, '\n');
+		else if (t.space) buf_append_byte(&b, ' ');
+		as_tok_text(&b, &t);
+		as_next(A);
+	}
+}
+
+static void as_subst(Buf *b, const char *body, int n, char **names, char **vals, int count) {
+	for (const char *p = body; *p; ) {
+		if (*p == '\\') {
+			if (p[1] == '@') { char t[24]; snprintf(t, sizeof(t), "%d", count); buf_append(b, t, strlen(t)); p += 2; continue; }
+			if (p[1] == '(' && p[2] == ')') { p += 3; continue; }
+			int len = 0;
+			while (isalnum((unsigned char)p[1 + len]) || p[1 + len] == '_') len++;
+			int hit = -1;
+			for (int i = 0; i < n && hit < 0; i++)
+				if ((int)strlen(names[i]) == len && !strncmp(names[i], p + 1, (size_t)len)) hit = i;
+			if (hit >= 0) { buf_append(b, vals[hit], strlen(vals[hit])); p += 1 + len; continue; }
+		}
+		buf_append_byte(b, (uint8_t)*p++);
+	}
+}
+
+static void as_push_text(As *A, Buf *b, int macro) {
+	if (A->nxs == 64) error_at(A->ctx, "macros nested too deeply");
+	buf_append_byte(b, 0);
+	int i = A->nxs++;
+	Lex *L = (Lex *)calloc(1, sizeof(Lex));
+	lex_init(L, (char *)b->data, A->ctx->tok.file ? A->ctx->tok.file : "<macro>");
+	L->as = 2;
+	L->line = A->ctx->tok.line;
+	A->xs[i].L = L;
+	A->xs[i].first = 1;
+	A->xs[i].macro = macro;
+	A->xs[i].nq = A->xs[i].iq = 0;
+	A->xs[i].q[A->xs[i].nq++] = A->tok;
+	if (A->has_pk) A->xs[i].q[A->xs[i].nq++] = A->pk;
+	A->has_pk = 0;
+	as_next(A);
+}
+
+static AsMacro *as_find_macro(Ctx *ctx, char *name) {
+	for (AsMacro *m = ctx->as_macros; m; m = m->next)
+		if (m->name == name) return m;
+	return NULL;
+}
+
+static void as_macro_def(As *A) {
+	Ctx *ctx = A->ctx;
+	if (A->tok.kind != T_IDENT || as_at_end(A)) error_at(ctx, "expected a macro name");
+	char *name = A->tok.str;
+	as_next(A);
+	if (as_is(A, T_COMMA)) as_next(A);
+	Tok *v;
+	int n = as_line_toks(A, &v);
+	AsRange *r;
+	int na = as_split(v, n, &r);
+	AsMacro *m = (AsMacro *)calloc(1, sizeof(AsMacro));
+	m->name = name;
+	m->pname = (char **)calloc((size_t)na + 1, sizeof(char *));
+	m->pdef = (char **)calloc((size_t)na + 1, sizeof(char *));
+	m->req = (int *)calloc((size_t)na + 1, sizeof(int));
+	m->vararg = (int *)calloc((size_t)na + 1, sizeof(int));
+	for (int i = 0; i < na; i++) {
+		int a = r[i].a, b = r[i].b;
+		if (a == b) continue;
+		if (v[a].kind != T_IDENT) error_at(ctx, "expected a macro parameter name");
+		int k = m->n++;
+		m->pname[k] = v[a].str;
+		a++;
+		if (a < b && v[a].kind == T_COLON && a + 1 < b && v[a+1].kind == T_IDENT) {
+			if (!strcmp(v[a+1].str, "req")) m->req[k] = 1;
+			else if (!strcmp(v[a+1].str, "vararg")) m->vararg[k] = 1;
+			else error_at(ctx, "unknown macro parameter qualifier '%s'", v[a+1].str);
+			a += 2;
+		}
+		if (a < b && v[a].kind == T_ASSIGN) { AsRange d = { a + 1, b }; m->pdef[k] = as_range_text(v, d, 1); }
+		else if (a < b) error_at(ctx, "bad macro parameter '%s'", m->pname[k]);
+		else m->pdef[k] = "";
+	}
+	free(v);
+	free(r);
+	m->body = as_capture(A, 0);
+	AsMacro **pp = &ctx->as_macros;
+	while (*pp && (*pp)->name != name) pp = &(*pp)->next;
+	if (*pp) { m->next = (*pp)->next; *pp = m; }
+	else { m->next = ctx->as_macros; ctx->as_macros = m; }
+}
+
+static void as_macro_call(As *A, AsMacro *m) {
+	Ctx *ctx = A->ctx;
+	Tok *v;
+	int n = as_line_toks(A, &v);
+	AsRange *r;
+	int na = as_split(v, n, &r);
+	char **vals = (char **)calloc((size_t)m->n + 1, sizeof(char *));
+	int pos = 0;
+	for (int i = 0; i < na; i++) {
+		int a = r[i].a, b = r[i].b;
+		if (b > a + 1 && v[a].kind == T_IDENT && v[a+1].kind == T_ASSIGN) {
+			int k = -1;
+			for (int j = 0; j < m->n; j++) if (m->pname[j] == v[a].str) k = j;
+			if (k >= 0) { AsRange d = { a + 2, b }; vals[k] = as_range_text(v, d, 1); continue; }
+		}
+		if (pos >= m->n) error_at(ctx, "too many arguments for macro '%s'", m->name);
+		if (m->vararg[pos]) {
+			AsRange d = { a, r[na-1].b };
+			vals[pos++] = as_range_text(v, d, 0);
+			break;
+		}
+		if (a < b) vals[pos] = as_range_text(v, r[i], 1);
+		pos++;
+	}
+	for (int k = 0; k < m->n; k++)
+		if (!vals[k]) {
+			if (m->req[k]) error_at(ctx, "missing value for required parameter '%s' of macro '%s'", m->pname[k], m->name);
+			vals[k] = m->pdef[k];
+		}
+	Buf b; buf_init(&b);
+	as_subst(&b, m->body, m->n, m->pname, vals, ctx->as_mcount++);
+	free(v);
+	free(r);
+	free(vals);
+	as_push_text(A, &b, 1);
+}
+
+static void as_repeat(As *A, char *d) {
+	Ctx *ctx = A->ctx;
+	Buf b; buf_init(&b);
+	if (!strcmp(d, ".rept")) {
+		long long cnt = as_absexpr(A);
+		if (!as_at_end(A)) error_at(ctx, "junk after .rept count");
+		char *body = as_capture(A, 1);
+		for (long long i = 0; i < cnt; i++) buf_append(&b, body, strlen(body));
+		free(body);
+	} else {
+		if (A->tok.kind != T_IDENT || as_at_end(A)) error_at(ctx, "expected a symbol after %s", d);
+		char *name = A->tok.str;
+		as_next(A);
+		if (as_is(A, T_COMMA)) as_next(A);
+		Tok *v;
+		int n = as_line_toks(A, &v);
+		AsRange *r;
+		int na = as_split(v, n, &r);
+		char *body = as_capture(A, 1);
+		if (!strcmp(d, ".irp")) {
+			if (!na) { char *e = ""; as_subst(&b, body, 1, &name, &e, ctx->as_mcount); }
+			for (int i = 0; i < na; i++) {
+				char *val = as_range_text(v, r[i], 1);
+				as_subst(&b, body, 1, &name, &val, ctx->as_mcount);
+				free(val);
+			}
+		} else {
+			AsRange all = { 0, n };
+			char *str = as_range_text(v, all, 1);
+			for (char *p = str; *p; p++) {
+				char one[2] = { *p, 0 };
+				char *val = one;
+				as_subst(&b, body, 1, &name, &val, ctx->as_mcount);
+			}
+			free(str);
+		}
+		free(v);
+		free(r);
+		free(body);
+	}
+	if (!b.len) { free(b.data); return; }
+	as_push_text(A, &b, 0);
+}
+
+static void as_exitm(As *A) {
+	int i = A->nxs - 1;
+	while (i >= 0 && !A->xs[i].macro) i--;
+	if (i < 0) error_at(A->ctx, ".exitm outside a macro");
+	for (int j = A->nxs - 1; j >= i; j--) if (A->xs[j].L) A->xs[j].L->i = A->xs[j].L->n;
+	while (!as_at_end(A)) as_next(A);
+}
+
 static void as_directive(As *A, char *d) {
 	Ctx *ctx = A->ctx;
 	long long a, b, c;
@@ -6839,11 +10249,13 @@ static void as_directive(As *A, char *d) {
 	else if (!strcmp(d, ".section")) as_enter(A, as_section(A));
 	else if (!strcmp(d, ".pushsection")) {
 		if (A->nstack == 16) error_at(ctx, "sections nested too deeply");
-		A->stack[A->nstack++] = A->sect;
+		A->stack[A->nstack] = A->sect;
+		A->pstack[A->nstack++] = A->prev;
 		as_enter(A, as_section(A));
 	} else if (!strcmp(d, ".popsection")) {
 		if (!A->nstack) error_at(ctx, ".popsection without .pushsection");
 		as_enter(A, A->stack[--A->nstack]);
+		A->prev = A->pstack[A->nstack];
 	} else if (!strcmp(d, ".previous")) as_enter(A, A->prev);
 	else if (!strcmp(d, ".code16")) A->mode = 16;
 	else if (!strcmp(d, ".code32")) A->mode = 32;
@@ -6854,11 +10266,11 @@ static void as_directive(As *A, char *d) {
 	else if (!strcmp(d, ".hidden") || !strcmp(d, ".protected") || !strcmp(d, ".internal")) as_syms(A, 0);
 	else if (!strcmp(d, ".type")) {
 		AsSym *s = as_sym(A, as_name(A));
-		as_expect(A, T_COMMA);
+		if (as_is(A, T_COMMA)) as_next(A);
 		if (as_is(A, T_AT) || as_is(A, '%')) as_next(A);
 		if (!as_is(A, T_IDENT) && !as_is(A, T_STR)) error_at(ctx, "expected a symbol type");
-		if (!strcmp(A->tok.str, "function")) s->type = 1;
-		else if (!strcmp(A->tok.str, "object")) s->type = 2;
+		if (!strcmp(A->tok.str, "function") || !strcmp(A->tok.str, "STT_FUNC")) s->type = 1;
+		else if (!strcmp(A->tok.str, "object") || !strcmp(A->tok.str, "STT_OBJECT")) s->type = 2;
 		as_next(A);
 	} else if (!strcmp(d, ".size")) {
 		AsSym *s = as_sym(A, as_name(A));
@@ -6876,14 +10288,14 @@ static void as_directive(As *A, char *d) {
 	else if (!strcmp(d, ".quad")) as_data(A, 8);
 	else if (!strcmp(d, ".ascii")) as_ascii(A, 0);
 	else if (!strcmp(d, ".asciz") || !strcmp(d, ".string")) as_ascii(A, 1);
-	else if (!strcmp(d, ".zero")) as_fill(A, as_absexpr(A), 1, 0);
+	else if (!strcmp(d, ".zero")) as_fill(A, as_sizeexpr(A), 1, 0);
 	else if (!strcmp(d, ".skip") || !strcmp(d, ".space")) {
-		a = as_absexpr(A);
+		a = as_sizeexpr(A);
 		b = 0;
 		if (as_is(A, T_COMMA)) { as_next(A); b = as_absexpr(A); }
 		as_fill(A, a, 1, b);
 	} else if (!strcmp(d, ".fill")) {
-		a = as_absexpr(A);
+		a = as_sizeexpr(A);
 		b = 1; c = 0;
 		if (as_is(A, T_COMMA)) { as_next(A); b = as_absexpr(A); }
 		if (as_is(A, T_COMMA)) { as_next(A); c = as_absexpr(A); }
@@ -6911,6 +10323,16 @@ static void as_directive(As *A, char *d) {
 	else if (!strcmp(d, ".lcomm")) as_comm(A, 0);
 	else if (!strcmp(d, ".incbin")) as_incbin(A);
 	else if (!strcmp(d, ".end")) A->done = 1;
+	else if (!strcmp(d, ".macro")) as_macro_def(A);
+	else if (!strcmp(d, ".rept") || !strcmp(d, ".irp") || !strcmp(d, ".irpc")) as_repeat(A, d);
+	else if (!strcmp(d, ".exitm")) as_exitm(A);
+	else if (!strcmp(d, ".purgem")) {
+		char *name = as_name(A);
+		AsMacro **pp = &A->ctx->as_macros;
+		while (*pp && (*pp)->name != name) pp = &(*pp)->next;
+		if (!*pp) error_at(A->ctx, "macro '%s' is not defined", name);
+		*pp = (*pp)->next;
+	} else if (!strcmp(d, ".endm") || !strcmp(d, ".endr")) error_at(A->ctx, "%s without a matching start", d);
 	else if (!strcmp(d, ".intel_syntax")) error_at(ctx, "only AT&T syntax is supported");
 	else if (!strcmp(d, ".file") || !strcmp(d, ".ident") || !strcmp(d, ".loc") || !strcmp(d, ".att_syntax") ||
 		!strncmp(d, ".cfi_", 5) || !strcmp(d, ".addrsig")) as_skip_line(A);
@@ -6928,6 +10350,25 @@ static int as_cond(As *A, char *d) {
 		if (!strcmp(k, "def") || !strcmp(k, "ndef") || !strcmp(k, "notdef")) {
 			AsSym *s = as_sym(A, as_name(A));
 			v = as_defined(A, s) == (k[0] == 'd');
+		} else if (!strcmp(k, "b") || !strcmp(k, "nb")) {
+			v = as_at_end(A) == (k[0] == 'b');
+			while (!as_at_end(A)) as_next(A);
+		} else if (!strcmp(k, "c") || !strcmp(k, "nc") || !strcmp(k, "eqs") || !strcmp(k, "nes")) {
+			Tok *tv;
+			int n = as_line_toks(A, &tv);
+			int i = 0, d = 0;
+			for (; i < n; i++) {
+				if (tv[i].kind == T_LP) d++;
+				else if (tv[i].kind == T_RP) d--;
+				else if (tv[i].kind == T_COMMA && !d) break;
+			}
+			if (i == n) error_at(ctx, "%s needs two operands separated by a comma", d);
+			AsRange ra = { 0, i }, rb = { i + 1, n };
+			char *x = as_range_text(tv, ra, 1), *y = as_range_text(tv, rb, 1);
+			v = !strcmp(x, y) == (k[0] == 'c' || k[0] == 'e');
+			free(x);
+			free(y);
+			free(tv);
 		} else {
 			long long x = as_absexpr(A);
 			if (!*k) v = x != 0;
@@ -6984,6 +10425,8 @@ static int as_stmt(As *A) {
 		return 1;
 	}
 	if (as_is(A, T_ASSIGN)) { as_next(A); as_set(A, t.str); return 0; }
+	AsMacro *m = as_find_macro(ctx, t.str);
+	if (m) { as_macro_call(A, m); return 1; }
 	if (t.str[0] == '.') { as_directive(A, t.str); return 0; }
 	as_insn(A, t.str);
 	return 0;
@@ -7034,9 +10477,14 @@ static void as_resolve(As *A) {
 		if (v.sub) error_at(ctx, "cannot subtract '%s' here", v.sub->name);
 		int local = s && as_defined(A, s) && !s->weak;
 		if (s && s->clab && !local) {
-			if (!f->pc || f->size != 4 || f->end != f->pos + 4 || f->sect != ctx->cur_text || v.v)
-				error_at(ctx, "a C label can only be the target of a jump");
-			patches_push(&s->clab->patches, (size_t)f->pos);
+			if (!f->pc || f->size != 4) error_at(ctx, "a C label can only be the target of a jump");
+			if (f->sect == ctx->cur_text && f->end == f->pos + 4 && !v.v) {
+				patches_push(&s->clab->patches, (size_t)f->pos);
+				continue;
+			}
+			patches_push(&s->clab->xrel, (size_t)ctx->nrelocs);
+			add_reloc(ctx, R_PC32, (size_t)f->pos, NULL, ctx->cur_text, v.v + 4 - (long long)(f->end - f->pos));
+			ctx->relocs[ctx->nrelocs - 1].in = f->sect;
 			continue;
 		}
 		if (s && !local && !s->hidden && (isdigit((unsigned char)s->name[0]) || s->local || !strncmp(s->name, ".L", 2))) as_undefined_local(A, s);
@@ -7085,8 +10533,8 @@ static void as_finish(As *A, const char *file, int nrel) {
 			}
 			if (!def && (s->local || !strncmp(s->name, ".L", 2))) continue;
 			Sym *g = NULL;
-			for (Sym *p = ctx->globals; p; p = p->gnext)
-				if (p->name == y->name && !p->is_static && (p->kind == SYM_FUNC || p->kind == SYM_VAR)) { g = p; break; }
+			for (Sym *p = global_chain(ctx, y->name); p; p = p->gsame)
+				if (!p->is_static && (p->kind == SYM_FUNC || p->kind == SYM_VAR)) { g = p; break; }
 			if (!g) {
 				y->is_static = 0;
 				y->gnext = ctx->globals;
@@ -7131,15 +10579,19 @@ static void assemble_unit(Ctx *ctx, const char *src, const char *file, int cpp) 
 		}
 		push_file(ctx, src, file, 0);
 		ctx->src->L.as = cpp ? 1 : 2;
+		if (cpp) push_includes(ctx, 1);
 		ctx->has_pk = 0;
 		ctx->has_pp_back = 0;
 		A->has_pk = 0;
-		A->mode = 64;
+		A->mode = ctx->m32 ? 32 : 64;
 		A->sect = A->prev = SEC_TEXT;
 		A->c.b = ctx->text.b;
-		A->nfix = A->njmp = A->nj = A->nstack = A->npend = A->nbm = A->ncond = 0;
+		A->nfix = A->njmp = A->nj = A->nstack = A->npend = A->nbm = A->ncond = A->nsz = 0;
 		A->changed = A->done = 0;
 		A->bss_name = NULL;
+		A->nxs = 0;
+		ctx->as_macros = NULL;
+		ctx->as_mcount = 0;
 		as_next(A);
 		while (A->tok.kind != T_EOF && !A->done) {
 			if (A->tok.kind == T_SEMI) { as_next(A); continue; }
@@ -7153,6 +10605,7 @@ static void assemble_unit(Ctx *ctx, const char *src, const char *file, int cpp) 
 		ctx->nonce = nonce;
 		lex_asm = 0;
 		as_relax(A);
+		as_settle(A);
 		if (!A->changed) break;
 	}
 	as_resolve(A);
@@ -7179,7 +10632,13 @@ static void as_finish_snippet(As *A) {
 			if (s->hidden || isdigit((unsigned char)s->name[0]) || s->is_abs || s->name == id_dot) continue;
 			int def = s->pass == A->pass;
 			int dotl = strncmp(s->name, ".L", 2) == 0;
-			if (def) {
+			if (def && s->alias) {
+				if (y->defined) error_at(ctx, "redefinition of '%s'", s->name);
+				y->defined = 1;
+				y->alias_name = s->alias;
+				y->asm_alias = 1;
+				y->weak_def = s->weak;
+			} else if (def) {
 				if (s->csym && y->defined) error_at(ctx, "redefinition of '%s'", s->name);
 				y->defined = 1;
 				y->sect = s->sect;
@@ -7224,8 +10683,11 @@ static void assemble_snippet(Ctx *ctx, const char *text, AsHide *hid, int nh, co
 	A->base = (size_t *)malloc(sizeof(size_t) * A->nbase);
 	for (int s = 0; s < A->nbase; s++) A->base[s] = s == SEC_BSS ? 0 : sec_buf(ctx, s)->len;
 	A->bss_base = ctx->bss_size;
+	int mcount = ctx->as_mcount;
 	for (A->pass = 1;; A->pass++) {
 		if (A->pass > 1) as_restore(A);
+		ctx->as_mcount = mcount;
+		A->nxs = 0;
 		lex_init(&L, text, file);
 		L.as = 2;
 		L.line = line;
@@ -7234,7 +10696,7 @@ static void assemble_snippet(Ctx *ctx, const char *text, AsHide *hid, int nh, co
 		A->mode = 64;
 		A->sect = A->prev = ctx->cur_text;
 		A->c.b = *sec_buf(ctx, A->sect);
-		A->nfix = A->njmp = A->nj = A->nstack = A->npend = 0;
+		A->nfix = A->njmp = A->nj = A->nstack = A->npend = A->nsz = 0;
 		A->changed = A->done = 0;
 		as_next(A);
 		while (A->tok.kind != T_EOF && !A->done) {
@@ -7244,6 +10706,7 @@ static void assemble_snippet(Ctx *ctx, const char *text, AsHide *hid, int nh, co
 		}
 		as_flush(A);
 		as_relax(A);
+		as_settle(A);
 		if (!A->changed) break;
 	}
 	as_resolve(A);
@@ -7258,11 +10721,11 @@ enum { AK_REG, AK_MEM, AK_IMM, AK_LABEL };
 typedef struct {
 	char *name;
 	int out, plus, early, kind;
-	int creg, cmem, cimm, n8;
+	int creg, cmem, cimm, n8, immset, fp;
 	int reg, fixed, match;
 	Type *ty;
 	int slot, vslot, pslot;
-	int mem;
+	int mem, greg;
 	long off;
 	Sym *sym;
 	long long imm;
@@ -7323,6 +10786,21 @@ static char *parse_asm_label(Ctx *ctx) {
 	return intern(s);
 }
 
+static int asm_imm_ok(AsmOp *o, long long k) {
+	int m = o->immset;
+	if (m & (1 << 26)) return 1;
+	if ((m & (1 << ('I' - 'A'))) && k >= 0 && k <= 31) return 1;
+	if ((m & (1 << ('J' - 'A'))) && k >= 0 && k <= 63) return 1;
+	if ((m & (1 << ('K' - 'A'))) && k >= -128 && k <= 127) return 1;
+	if ((m & (1 << ('L' - 'A'))) && (k == 0xFF || k == 0xFFFF || k == 0xFFFFFFFFLL)) return 1;
+	if ((m & (1 << ('M' - 'A'))) && k >= 0 && k <= 3) return 1;
+	if ((m & (1 << ('N' - 'A'))) && k >= 0 && k <= 255) return 1;
+	if ((m & (1 << ('O' - 'A'))) && k >= 0 && k <= 127) return 1;
+	if ((m & (1 << 28)) && k >= -2147483648LL && k <= 2147483647LL) return 1;
+	if ((m & (1 << ('Z' - 'A'))) && k >= 0 && k <= 0xFFFFFFFFLL) return 1;
+	return 0;
+}
+
 static void asm_constraint(Ctx *ctx, AsmOp *o, const char *c, AsmOp *outs, int nout) {
 	o->fixed = o->match = -1;
 	if (o->out) {
@@ -7336,11 +10814,16 @@ static void asm_constraint(Ctx *ctx, AsmOp *o, const char *c, AsmOp *outs, int n
 		case '&': o->early = 1; break;
 		case '%': case ' ': case '*': case '!': case '?': break;
 		case 'r': case 'q': case 'R': case 'Q': case 'l': case 'U': o->creg = 1; break;
-		case 'g': o->creg = o->cmem = o->cimm = 1; break;
+		case 'g': case 'X': o->creg = o->cmem = o->cimm = 1; o->immset |= 1 << 26; break;
+		case 'p': o->creg = o->cimm = 1; o->immset |= 1 << 26; break;
 		case 'm': case 'o': case 'V': case '<': case '>': o->cmem = 1; break;
-		case 'N': o->n8 = 1; o->cimm = 1; break;
-		case 'i': case 'n': case 's': case 'I': case 'J': case 'K': case 'L': case 'M': case 'O': case 'e': case 'Z': case 'E': case 'F':
-			o->cimm = 1; break;
+		case 'N': o->n8 = 1; o->cimm = 1; o->immset |= 1 << ('N' - 'A'); break;
+		case 'i': case 'n': case 's': case 'E': case 'F': o->cimm = 1; o->immset |= 1 << 26; break;
+		case 'I': case 'J': case 'K': case 'L': case 'M': case 'O': case 'e': case 'Z':
+			o->cimm = 1; o->immset |= 1 << (*c == 'e' ? 28 : *c - 'A'); break;
+		case 'x': o->fp = 1; break;
+		case 't': case 'f': o->fp = 2; break;
+		case 'u': o->fp = 3; break;
 		case 'a': f = RAX; break;
 		case 'b': f = RBX; break;
 		case 'c': f = RCX; break;
@@ -7370,7 +10853,8 @@ static void asm_constraint(Ctx *ctx, AsmOp *o, const char *c, AsmOp *outs, int n
 		if (f >= 0 && o->fixed < 0) o->fixed = f;
 	}
 	if (o->out && o->cimm && !o->creg && !o->cmem && o->fixed < 0) error_at(ctx, "an output cannot be an immediate");
-	if (!o->creg && !o->cmem && !o->cimm && o->fixed < 0 && o->match < 0) error_at(ctx, "invalid asm constraint");
+	if (o->fp) o->creg = o->cmem = o->cimm = 0;
+	if (!o->fp && !o->creg && !o->cmem && !o->cimm && o->fixed < 0 && o->match < 0) error_at(ctx, "invalid asm constraint");
 }
 
 static void asm_regvar(Ctx *ctx, AsmOp *o) {
@@ -7379,15 +10863,63 @@ static void asm_regvar(Ctx *ctx, AsmOp *o) {
 		if (s->is_local && s->stack_off == ctx->lv_off && s->asm_reg) { o->fixed = s->asm_reg - 1; return; }
 }
 
-static void asm_scalar(Ctx *ctx, Type *ty) {
+static Type *asm_scalar(Ctx *ctx, Type *ty, int load) {
+	if (ty->kind == TY_STRUCT && (ty->size == 1 || ty->size == 2 || ty->size == 4 || ty->size == 8)) {
+		Type *t = ty->size == 1 ? ty_uchar : ty->size == 2 ? ty_ushort : ty->size == 4 ? ty_uint : ty_ulong;
+		if (load) emit_load_type(&ctx->text, t);
+		return t;
+	}
 	if (!is_scalar(ty) || ty->size > 8) error_at(ctx, "asm register operand must be a scalar");
+	return ty;
+}
+
+static int asm_greg(Ctx *ctx, AsmOp *o) {
+	if (ctx->tok.kind != T_IDENT || peek(ctx)->kind != T_RP) return 0;
+	Sym *s = lookup(ctx, ctx->tok.str);
+	if (!s || !s->gregvar) return 0;
+	next(ctx);
+	o->kind = AK_REG;
+	o->greg = 1;
+	o->reg = o->fixed = s->gregvar - 1;
+	o->ty = s->ty;
+	return 1;
+}
+
+static void asm_fp_value(Ctx *ctx, AsmOp *o, Type *ty) {
+	if (o->fp == 1) {
+		if (!is_flonum(ty) || ty->kind == TY_LDOUBLE) error_at(ctx, "an \"x\" asm operand must be float or double");
+		o->ty = ty;
+	} else {
+		if (!is_arith(ty)) error_at(ctx, "an x87 asm operand must be arithmetic");
+		gen_cast(ctx, ty, ty_ldouble);
+		o->ty = ty_ldouble;
+	}
 }
 
 static void asm_output(Ctx *ctx, AsmOp *o) {
 	Code *c = &ctx->text;
+	if (asm_greg(ctx, o)) return;
+	if (o->fp) {
+		Type *ty = parse_assign(ctx);
+		if (!ctx->lv) error_at(ctx, "asm output operand is not an lvalue");
+		if (o->fp == 1 ? !is_flonum(ty) || ty->kind == TY_LDOUBLE : ty->kind != TY_LDOUBLE) error_at(ctx, "asm output operand has the wrong type for its constraint");
+		kv_forget(ctx, 0);
+		o->ty = ty;
+		o->kind = AK_REG;
+		gen_push(ctx);
+		o->slot = ctx->sp;
+		if (o->plus) {
+			emit_load_type(c, ty);
+			gen_push(ctx);
+			o->vslot = ctx->sp;
+		}
+		ctx->lv = 0;
+		return;
+	}
 	Mark m = mark_code(ctx);
 	Type *ty = parse_assign(ctx);
 	if (!ctx->lv) error_at(ctx, "asm output operand is not an lvalue");
+	kv_forget(ctx, 0);
 	int simple = Cpos(c) == ctx->lv_end;
 	o->ty = ty;
 	if (o->fixed < 0) asm_regvar(ctx, o);
@@ -7405,7 +10937,7 @@ static void asm_output(Ctx *ctx, AsmOp *o) {
 		ctx->lv = 0;
 		return;
 	}
-	asm_scalar(ctx, ty);
+	ty = o->ty = asm_scalar(ctx, ty, 0);
 	o->kind = AK_REG;
 	gen_push(ctx);
 	o->slot = ctx->sp;
@@ -7419,11 +10951,27 @@ static void asm_output(Ctx *ctx, AsmOp *o) {
 
 static void asm_input(Ctx *ctx, AsmOp *o, AsmOp *outs) {
 	Code *c = &ctx->text;
+	if (asm_greg(ctx, o)) return;
+	if (o->match >= 0 && outs[o->match].fp) {
+		o->fp = outs[o->match].fp;
+		asm_fp_value(ctx, o, rval(ctx, parse_assign(ctx)));
+		o->kind = AK_REG;
+		gen_push(ctx);
+		o->slot = ctx->sp;
+		return;
+	}
+	if (o->fp) {
+		asm_fp_value(ctx, o, rval(ctx, parse_assign(ctx)));
+		o->kind = AK_REG;
+		gen_push(ctx);
+		o->slot = ctx->sp;
+		return;
+	}
 	if (o->match >= 0) {
 		AsmOp *t = &outs[o->match];
 		Type *ty = rval(ctx, parse_assign(ctx));
 		if (t->kind == AK_MEM) { o->kind = AK_MEM; o->mem = t->mem; o->sym = t->sym; o->off = t->off; o->slot = t->slot; o->match = -1; return; }
-		asm_scalar(ctx, ty);
+		ty = asm_scalar(ctx, ty, 1);
 		o->kind = AK_REG;
 		o->ty = ty;
 		gen_push(ctx);
@@ -7434,7 +10982,7 @@ static void asm_input(Ctx *ctx, AsmOp *o, AsmOp *outs) {
 		TokVec v = capture_expr(ctx);
 		if (tokens_const(ctx, &v)) {
 			long long k = eval_tokens(ctx, &v);
-			if (!o->n8 || (k >= 0 && k <= 255)) {
+			if (asm_imm_ok(o, k)) {
 				o->kind = AK_IMM;
 				o->imm = k;
 				o->ty = ty_long;
@@ -7479,7 +11027,15 @@ static void asm_input(Ctx *ctx, AsmOp *o, AsmOp *outs) {
 		return;
 	}
 	ty = rval(ctx, ty);
-	asm_scalar(ctx, ty);
+	long long kv;
+	if (o->cimm && !is_flonum(ty) && expr_const(ctx, &kv) && asm_imm_ok(o, kv)) {
+		drop_code(ctx, m);
+		o->kind = AK_IMM;
+		o->imm = kv;
+		o->ty = ty_long;
+		return;
+	}
+	ty = asm_scalar(ctx, ty, 1);
 	o->kind = AK_REG;
 	o->ty = ty;
 	gen_push(ctx);
@@ -7527,6 +11083,9 @@ static void asm_optext(Ctx *ctx, Buf *b, AsmOp *o, int mod, int idx) {
 	t[0] = 0;
 	if (mod == 'z') {
 		snprintf(t, sizeof(t), "%c", "bwlq"[asm_size(o->ty) == 1 ? 0 : asm_size(o->ty) == 2 ? 1 : asm_size(o->ty) == 4 ? 2 : 3]);
+	} else if (o->kind == AK_REG && o->fp) {
+		if (o->fp == 1) snprintf(t, sizeof(t), "%%xmm%d", o->reg);
+		else snprintf(t, sizeof(t), o->reg ? "%%st(1)" : "%%st");
 	} else if (o->kind == AK_REG) {
 		if (mod == 'h') {
 			if (o->reg > RBX) error_at(ctx, "%%h needs %%rax, %%rbx, %%rcx or %%rdx");
@@ -7594,6 +11153,7 @@ static void asm_clobber(Ctx *ctx, const char *name, int *mask) {
 }
 
 static void asm_statement(Ctx *ctx, int top) {
+	ctx->sidefx++;
 	Code *c = &ctx->text;
 	const char *file = ctx->tok.file;
 	int line = ctx->tok.line;
@@ -7610,6 +11170,7 @@ static void asm_statement(Ctx *ctx, int top) {
 	if (ctx->tok.kind == T_RP && !is_goto) {
 		next(ctx);
 		expect(ctx, T_SEMI);
+		if (ctx->asm_text) { buf_append(ctx->asm_text, tmpl, strlen(tmpl)); buf_append_byte(ctx->asm_text, '\n'); }
 		assemble_snippet(ctx, tmpl, NULL, 0, file, line);
 		return;
 	}
@@ -7620,9 +11181,13 @@ static void asm_statement(Ctx *ctx, int top) {
 	int sp0 = ctx->sp;
 	if (consume(ctx, T_COLON)) nout = n = asm_operands(ctx, ops, 0, 1, 0);
 	if (consume(ctx, T_COLON)) n = asm_operands(ctx, ops, n, 0, nout);
+	int stpop = 0;
 	if (consume(ctx, T_COLON) && ctx->tok.kind == T_STR) {
 		for (;;) {
 			char *cl = asm_string(ctx);
+			const char *cn = *cl == '%' ? cl + 1 : cl;
+			if (!strcmp(cn, "st") || !strcmp(cn, "st(0)")) stpop |= 1;
+			else if (!strcmp(cn, "st(1)")) stpop |= 2;
 			asm_clobber(ctx, cl, &clob);
 			if (!consume(ctx, T_COMMA)) break;
 		}
@@ -7662,9 +11227,21 @@ static void asm_statement(Ctx *ctx, int top) {
 			for (int j = 0; j < nout; j++)
 				if (ops[j].kind == AK_REG && ops[j].early && ops[j].reg == ops[i].reg && ops[j].fixed >= 0)
 					error_at(ctx, "asm input uses the register of an early clobber output");
+	int usedx = 0;
+	for (int i = 0; i < n; i++) {
+		AsmOp *o = &ops[i];
+		if (!o->fp) continue;
+		if (o->fp >= 2) { o->reg = o->fp - 2; continue; }
+		if (!o->out && o->match >= 0) { o->reg = ops[o->match].reg; continue; }
+		int x = 0;
+		while (x < 16 && (usedx & (1 << x))) x++;
+		if (x == 16) error_at(ctx, "asm statement needs too many SSE registers");
+		usedx |= 1 << x;
+		o->reg = x;
+	}
 	for (int i = 0; i < nout; i++) {
 		AsmOp *o = &ops[i];
-		if (o->kind != AK_REG || o->fixed >= 0) continue;
+		if (o->kind != AK_REG || o->fixed >= 0 || o->fp) continue;
 		int u = used_out | used_in;
 		o->reg = asm_take(ctx, &u);
 		used_out |= 1 << o->reg;
@@ -7672,6 +11249,7 @@ static void asm_statement(Ctx *ctx, int top) {
 	}
 	for (int i = nout; i < n; i++) {
 		AsmOp *o = &ops[i];
+		if (o->fp) continue;
 		if (o->kind == AK_REG && o->match >= 0) { o->reg = ops[o->match].reg; used_in |= 1 << o->reg; continue; }
 		if ((o->kind == AK_REG && o->fixed < 0) || (o->kind == AK_MEM && o->mem == 0)) {
 			int u = used_out | used_in;
@@ -7695,8 +11273,25 @@ static void asm_statement(Ctx *ctx, int top) {
 		if (all & (1 << callee[i])) saves[nsave++] = callee[i];
 	if (is_goto && nsave) error_at(ctx, "asm goto cannot use %%rbx or %%r12 to %%r15");
 	for (int i = 0; i < nsave; i++) { emit_push(c, saves[i]); ctx->sp++; }
+	int nst = 0, tout = -1;
+	for (int st = 1; st >= 0; st--)
+		for (int i = 0; i < n; i++) {
+			AsmOp *o = &ops[i];
+			if (o->fp < 2 || o->reg != st || (o->out && !o->plus)) continue;
+			emit_load_rsp(c, R11, (ctx->sp - (o->plus ? o->vslot : o->slot)) * 8);
+			emit_x87(c, 0xDB, 5, R11, 0);
+			nst++;
+			break;
+		}
+	for (int i = 0; i < nout; i++) if (ops[i].fp >= 2 && ops[i].reg == 0) tout = i;
 	for (int i = 0; i < n; i++) {
 		AsmOp *o = &ops[i];
+		if (o->greg) continue;
+		if (o->fp == 1) {
+			if (!o->out || o->plus) emit_movq_xmm_load(c, o->reg, RSP, (ctx->sp - (o->plus ? o->vslot : o->slot)) * 8);
+			continue;
+		}
+		if (o->fp) continue;
 		if (o->kind == AK_REG && (!o->out || o->plus)) emit_load_rsp(c, o->reg, (ctx->sp - (o->plus ? o->vslot : o->slot)) * 8);
 		else if (o->kind == AK_MEM && o->mem == 0) emit_load_rsp(c, o->reg, (ctx->sp - o->slot) * 8);
 	}
@@ -7718,17 +11313,36 @@ static void asm_statement(Ctx *ctx, int top) {
 		nh++;
 	}
 	char *text = asm_expand(ctx, tmpl, ops, n);
-	assemble_snippet(ctx, text, hid, nh, file, line);
+	if (ctx->asm_text && !ctx->dead && !ctx->noasm) { buf_append(ctx->asm_text, text, strlen(text)); buf_append_byte(ctx->asm_text, '\n'); }
+	if (!ctx->dead && !ctx->noasm) assemble_snippet(ctx, text, hid, nh, file, line);
 	free(text);
 
 	int npush = 0;
-	for (int i = 0; i < nout; i++)
-		if (ops[i].kind == AK_REG) { emit_push(c, ops[i].reg); ctx->sp++; ops[i].pslot = ctx->sp; npush++; }
+	if (tout >= 0) {
+		emit_sub_rsp(c, 16);
+		emit_x87(c, 0xDB, 7, RSP, 0);
+		ctx->sp += 2;
+		npush += 2;
+		ops[tout].pslot = ctx->sp;
+		if (nst) nst--;
+	}
+	if (stpop & 1 && nst) nst--;
+	if (stpop & 2 && nst) nst--;
+	while (nst-- > 0) { C8(c,0xDD); C8(c,0xD8); }
+	for (int i = 0; i < nout; i++) {
+		if (ops[i].kind != AK_REG || ops[i].greg || ops[i].fp >= 2) continue;
+		if (ops[i].fp == 1) { emit_sub_rsp(c, 8); emit_movq_xmm_store(c, ops[i].reg, RSP, 0); }
+		else emit_push(c, ops[i].reg);
+		ctx->sp++;
+		ops[i].pslot = ctx->sp;
+		npush++;
+	}
 	for (int i = 0; i < nout; i++) {
 		AsmOp *o = &ops[i];
-		if (o->kind != AK_REG) continue;
+		if (o->kind != AK_REG || o->greg || (o->fp >= 2 && i != tout)) continue;
 		emit_load_rsp(c, RCX, (ctx->sp - o->slot) * 8);
-		emit_load_rsp(c, RAX, (ctx->sp - o->pslot) * 8);
+		if (o->fp >= 2) emit_rm_wide(c, 0x8D, RAX, RSP, (ctx->sp - o->pslot) * 8);
+		else emit_load_rsp(c, RAX, (ctx->sp - o->pslot) * 8);
 		emit_store_type(c, o->ty);
 	}
 	if (npush) { emit_add_rsp(c, npush * 8); ctx->sp -= npush; }
@@ -7738,6 +11352,15 @@ static void asm_statement(Ctx *ctx, int top) {
 }
 
 #define ELF_BASE 0x400000ULL
+
+static int array_sec_type(const char *n) {
+	const char *k[3] = { ".init_array", ".fini_array", ".preinit_array" };
+	for (int i = 0; i < 3; i++) {
+		size_t l = strlen(k[i]);
+		if (!strncmp(n, k[i], l) && (!n[l] || n[l] == '.')) return 14 + i;
+	}
+	return 1;
+}
 
 static void shdr(uint8_t *p, uint32_t name, uint32_t type, uint64_t flags, uint64_t addr,
 			uint64_t off, uint64_t size, uint32_t link, uint32_t info, uint64_t align, uint64_t entsize) {
@@ -7764,12 +11387,15 @@ static void add_elf_sym(Buf *symtab, Buf *strtab, Sym *s, uint64_t *sect_va, int
 }
 
 static void write_out(const char *out_path, Buf *file, int mode) {
-	remove(out_path);
+	struct stat st;
+	int regular = stat(out_path, &st) != 0 || S_ISREG(st.st_mode);
+	if (!strcmp(out_path, "-")) { fwrite(file->data, 1, file->len, stdout); return; }
+	if (regular) remove(out_path);
 	FILE *out=fopen(out_path,"wb");
 	if (!out) { perror(out_path); exit(1); }
 	if (fwrite(file->data,1,file->len,out)!=file->len) { perror("fwrite"); exit(1); }
 	fclose(out);
-	if (mode) chmod(out_path, mode);
+	if (mode && regular) chmod(out_path, mode);
 }
 
 static const char *find_builtin_boot(const char *name);
@@ -7888,6 +11514,7 @@ struct LdStmt {
 	LdPat *file, *secs;
 	int sortfile;
 	int phdr[8], nphdr, has_phdr;
+	char *phname[8];
 	uint8_t *fill;
 	int nfill;
 	int *pc;
@@ -7918,7 +11545,14 @@ typedef struct {
 	int has_flags;
 	LdExpr *at;
 	uint64_t off, vaddr, paddr, filesz, memsz, align;
+	int filehdr;
 } LdSeg;
+
+typedef struct {
+	char *name;
+	char **glob;
+	int nglob;
+} LdVer;
 
 struct Ld {
 	const char *path;
@@ -7938,6 +11572,8 @@ struct Ld {
 	LdOut *cur;
 	int has_delta, pass, final;
 	int line;
+	LdVer *vers;
+	int nvers;
 };
 
 typedef struct {
@@ -8104,6 +11740,7 @@ static LdExpr *ld_primary(LdLex *L) {
 static int ld_binop(LdLex *L, int *op, int *len) {
 	ld_ws(L);
 	const char *p = L->p;
+	if (!strncmp(p, "/DISCARD/", 9)) return 0;
 	static const char *two[] = { "||", "&&", "==", "!=", "<=", ">=", "<<", ">>", NULL };
 	static const char ops2[] = "OAENLGlr";
 	static const int prec2[] = { 1, 2, 6, 6, 7, 7, 8, 8 };
@@ -8178,7 +11815,14 @@ static int ld_assign_op(LdLex *L, char **name) {
 	return 0;
 }
 
+static LdStmt *ld_assert(LdLex *L);
+
 static LdStmt *ld_assignment(LdLex *L, char *name, int op, int provide) {
+	ld_ws(L);
+	if (!strcmp(name, ".") && op == '=' && !strncmp(L->p, "ASSERT", 6) && !isalnum((unsigned char)L->p[6]) && L->p[6] != '_') {
+		L->p += 6;
+		return ld_assert(L);
+	}
 	LdStmt *st = ld_stmt(L, LS_ASSIGN);
 	st->name = name;
 	st->op = op;
@@ -8338,7 +11982,17 @@ static int ld_phdr_index(Ld *ld, LdLex *L, char *name) {
 	return -1;
 }
 
+static void ld_resolve_phdrs(Ld *ld, LdLex *L) {
+	for (LdStmt *st = ld->top; st; st = st->next)
+		if (st->kind == LS_SECTION)
+			for (int i = 0; i < st->nphdr; i++) {
+				L->line = st->line;
+				st->phdr[i] = ld_phdr_index(ld, L, st->phname[i]);
+			}
+}
+
 static LdStmt *ld_section(Ld *ld, LdLex *L, char *name) {
+	(void)ld;
 	LdStmt *st = ld_stmt(L, LS_SECTION);
 	st->name = name;
 	if (!ld_at(L, ":")) {
@@ -8384,7 +12038,8 @@ static LdStmt *ld_section(Ld *ld, LdLex *L, char *name) {
 			st->has_phdr = 1;
 			if (!strcmp(ph, "NONE")) continue;
 			if (st->nphdr == 8) ld_err(L, "too many program headers for one section");
-			st->phdr[st->nphdr++] = ld_phdr_index(ld, L, ph);
+			st->phname[st->nphdr] = ph;
+			st->phdr[st->nphdr++] = -1;
 		} else if (L->p[0] == '=' && L->p[1] != '=') {
 			L->p++;
 			ld_fill_pattern(st, ld_expr(L), L);
@@ -8456,7 +12111,8 @@ static void ld_phdrs(Ld *ld, LdLex *L) {
 			g->type = ld_ptypes[i].type;
 		}
 		for (;;) {
-			if (ld_accept(L, "FILEHDR") || ld_accept(L, "PHDRS")) continue;
+			if (ld_accept(L, "FILEHDR")) { g->filehdr = 1; continue; }
+			if (ld_accept(L, "PHDRS")) continue;
 			if (ld_at(L, "AT")) {
 				ld_accept(L, "AT");
 				ld_expect(L, "(");
@@ -8476,12 +12132,46 @@ static void ld_phdrs(Ld *ld, LdLex *L) {
 	ld->nphdrs = ld->nsegs;
 }
 
-static Ld *ld_read(const char *path) {
+static void ld_version(Ld *ld, LdLex *L) {
+	ld_expect(L, "{");
+	while (!ld_accept(L, "}")) {
+		if (!*L->p) ld_err(L, "expected '}'");
+		ld->vers = (LdVer *)realloc(ld->vers, sizeof(LdVer) * (size_t)(ld->nvers + 1));
+		LdVer *v = &ld->vers[ld->nvers++];
+		memset(v, 0, sizeof(*v));
+		v->name = ld_need_word(L, LD_SECCH, "a version name");
+		ld_expect(L, "{");
+		int global = 1;
+		while (!ld_accept(L, "}")) {
+			if (!*L->p) ld_err(L, "expected '}'");
+			if (ld_accept(L, ";")) continue;
+			if (ld_accept(L, "global:")) { global = 1; continue; }
+			if (ld_accept(L, "local:")) { global = 0; continue; }
+			char *w = ld_need_word(L, LD_PATCH, "a symbol");
+			size_t n = strlen(w);
+			if (n && w[n - 1] == ':') {
+				if (!strcmp(w, "global:")) { global = 1; continue; }
+				if (!strcmp(w, "local:")) { global = 0; continue; }
+			}
+			if (global) {
+				v->glob = (char **)realloc(v->glob, sizeof(char *) * (size_t)(v->nglob + 1));
+				v->glob[v->nglob++] = w;
+			}
+			ld_accept(L, ";");
+		}
+		while (!ld_accept(L, ";")) {
+			if (!*L->p || ld_at(L, "}")) break;
+			ld_need_word(L, LD_SECCH, "a version name");
+		}
+	}
+}
+
+static Ld *ld_parse(const char *path, char *text) {
 	Ld *ld = (Ld *)calloc(1, sizeof(Ld));
 	ld->path = path;
 	ld->tail = &ld->top;
 	LdLex lx, *L = &lx;
-	L->p = read_file(path);
+	L->p = text;
 	L->file = path;
 	L->line = 1;
 	for (;;) {
@@ -8492,6 +12182,7 @@ static Ld *ld_read(const char *path) {
 		char *w = ld_need_word(L, LD_SECCH, "a command");
 		if (!strcmp(w, "SECTIONS")) ld_sections(ld, L);
 		else if (!strcmp(w, "PHDRS")) ld_phdrs(ld, L);
+		else if (!strcmp(w, "VERSION")) ld_version(ld, L);
 		else if (!strcmp(w, "ENTRY")) {
 			ld_expect(L, "(");
 			ld->entry = ld_need_word(L, LD_SECCH, "a symbol");
@@ -8503,12 +12194,13 @@ static Ld *ld_read(const char *path) {
 			ld_expect(L, ")");
 			if (!strcmp(f, "elf64-x86-64")) ld->format = 1;
 			else if (!strcmp(f, "binary")) ld->format = 2;
+			else if (!strcmp(f, "elf32-i386")) ld->format = 3;
 			else ld_err(L, "output format '%s' is not supported", f);
 		} else if (!strcmp(w, "OUTPUT_ARCH")) {
 			ld_expect(L, "(");
 			char *a = ld_need_word(L, "_.$-:", "an architecture");
 			ld_expect(L, ")");
-			if (strcmp(a, "i386:x86-64")) ld_err(L, "architecture '%s' is not supported", a);
+			if (strcmp(a, "i386:x86-64") && strcmp(a, "i386")) ld_err(L, "architecture '%s' is not supported", a);
 		} else if (!strcmp(w, "SEARCH_DIR")) {
 			ld_expect(L, "(");
 			ld_need_word(L, LD_PATCH, "a directory");
@@ -8519,7 +12211,29 @@ static Ld *ld_read(const char *path) {
 		else if ((op = ld_assign_op(L, &w)) != 0) { LdStmt *st = ld_assignment(L, w, op, 0); st->line = line; ld_add(ld, st); }
 		else ld_err(L, "'%s' is not supported", w);
 	}
+	ld_resolve_phdrs(ld, L);
 	return ld;
+}
+
+static Ld *ld_read(const char *path) { return ld_parse(path, read_file(path)); }
+
+static Ld *ld_default(Ctx *ctx) {
+	char *b = (char *)malloc(1024);
+	char base[64];
+	if (ctx->shared && !ctx->has_ttext) {
+		snprintf(b, 1024, "PHDRS { text PT_LOAD FILEHDR PHDRS FLAGS(5); data PT_LOAD FLAGS(6); dynamic PT_DYNAMIC FLAGS(6); } "
+			"SECTIONS { . = SIZEOF_HEADERS; .hash : { *(.hash) } :text .gnu.hash : { *(.gnu.hash) } .dynsym : { *(.dynsym) } "
+			".dynstr : { *(.dynstr) } .text : { *(.text .text.*) } .rodata : { *(.rodata .rodata.*) } "
+			". = ALIGN(0x1000) + (. & 0xfff); .dynamic : { *(.dynamic) } :data :dynamic "
+			".data : { *(.data .data.*) } :data .bss : { *(.bss .bss.*) *(COMMON) } }");
+		return ld_parse("<default script>", b);
+	}
+	if (ctx->has_ttext) snprintf(base, sizeof(base), "0x%llx", (unsigned long long)ctx->ttext);
+	else snprintf(base, sizeof(base), "%sSIZEOF_HEADERS", ctx->shared ? "" : ctx->elf32 ? "0x8048000 + " : "0x400000 + ");
+	snprintf(b, 512, "SECTIONS { . = %s; .text : { *(.text .text.*) } .rodata : { *(.rodata .rodata.*) } "
+		".data : { *(.data .data.*) } .bss : { *(.bss .bss.*) *(COMMON) } }", base);
+	ctx->has_ttext = 0;
+	return ld_parse("<default script>", b);
 }
 
 static int ld_glob(const char *p, const char *s) {
@@ -8698,7 +12412,7 @@ static void ld_orphans(Ctx *ctx, Ld *ld) {
 			LdStmt **at, *a = st->anchor;
 			if (st->byname && tail[k]) at = &tail[k]->next;
 			else if (a) {
-				while (a->next && (st->byname ? a->next->kind != LS_SECTION || a->next->orphan :
+				while (a->next && (st->byname ? (a->next->kind != LS_SECTION && !(a->next->kind == LS_ASSIGN && !strcmp(a->next->name, "."))) || a->next->orphan :
 					a->next->kind == LS_SECTION && a->next->orphan && !a->next->byname && a->next->exact && a->next->anchor == st->anchor)) a = a->next;
 				at = &a->next;
 			} else for (at = &ld->top; *at && (*at)->kind != LS_SECTION; at = &(*at)->next) {}
@@ -9152,7 +12866,13 @@ static void ld_define(Ctx *ctx, Ld *ld) {
 	}
 }
 
+static int ld_i386;
+
 static void ld_nops(uint8_t *p, size_t n) {
+	if (ld_i386) {
+		for (size_t i = 0; i < n; i++) p[i] = i + 1 == n && (n & 1) ? 0x90 : i & 1 ? 0x90 : 0x66;
+		return;
+	}
 	static const char *nops[] = { "", "\x90", "\x66\x90", "\x0f\x1f\x00", "\x0f\x1f\x40\x00", "\x0f\x1f\x44\x00\x00",
 		"\x66\x0f\x1f\x44\x00\x00", "\x0f\x1f\x80\x00\x00\x00\x00", "\x0f\x1f\x84\x00\x00\x00\x00\x00",
 		"\x66\x0f\x1f\x84\x00\x00\x00\x00\x00", "\x66\x2e\x0f\x1f\x84\x00\x00\x00\x00\x00" };
@@ -9265,6 +12985,10 @@ static void apply_relocs(Ctx *ctx, uint64_t *sect_va) {
 		Buf *b = sec_buf(ctx, r->in);
 		int n = rel_size[r->kind];
 		int pc = rel_pc(r->kind);
+		if (ctx->shared && !pc && r->kind != R_TPOFF32 && r->kind != R_TPOFF64 && !(r->sym && (!r->sym->defined || r->sym->sect == SEC_ABS))) {
+			fprintf(stderr, "error: -shared cannot make dynamic relocations, and one is needed for %s\n", r->sym ? r->sym->name : "a section address");
+			exit(1);
+		}
 		int64_t v = pc ? (int64_t)target - (int64_t)(sect_addr(ctx, sect_va, r->in, (long)r->pos) + n) : (int64_t)target;
 		if (r->kind == R_TPOFF32 || r->kind == R_TPOFF64) {
 			if (!ctx->has_tls) { fprintf(stderr, "error: '%s' is thread-local but there is no TLS section\n", r->sym ? r->sym->name : "?"); exit(1); }
@@ -9283,6 +13007,280 @@ static void apply_relocs(Ctx *ctx, uint64_t *sect_va) {
 	}
 }
 
+static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
+static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+static uint64_t rd64(const uint8_t *p) { return (uint64_t)rd32(p) | (uint64_t)rd32(p + 4) << 32; }
+
+static int rel386(int t) {
+	switch (t) {
+	case 2: case 4: return 2;
+	case 10: case 11: return 1;
+	case 12: return 20;
+	case 13: return 21;
+	case 14: return 22;
+	case 15: return 23;
+	}
+	return -1;
+}
+
+static void elf_to32(Ctx *ctx, Buf *f) {
+	(void)ctx;
+	uint8_t *E = f->data;
+	uint64_t phoff = rd64(E + 0x20), shoff = rd64(E + 0x28), entry = rd64(E + 0x18);
+	int phnum = rd16(E + 0x38), shnum = rd16(E + 0x3C), shstrndx = rd16(E + 0x3E);
+	uint8_t *old = (uint8_t *)malloc(f->len);
+	memcpy(old, f->data, f->len);
+	const uint8_t *osh = old + shoff, *oshs = old + rd64(osh + (size_t)shstrndx * 64 + 0x18);
+	Buf shs;
+	buf_init(&shs);
+	buf_append_byte(&shs, 0);
+	uint8_t *nsh = (uint8_t *)calloc((size_t)shnum, 40);
+	for (int i = 1; i < shnum; i++) {
+		const uint8_t *h = osh + (size_t)i * 64;
+		const char *nm = (const char *)oshs + rd32(h);
+		uint32_t type = rd32(h + 4);
+		uint64_t off = rd64(h + 0x18), size = rd64(h + 0x20), ent = rd64(h + 0x38), al = rd64(h + 0x30);
+		char nb[300];
+		if (type == 4 && !strncmp(nm, ".rela", 5)) { snprintf(nb, sizeof(nb), ".rel%s", nm + 5); nm = nb; }
+		uint32_t name = strtab_add(&shs, nm);
+		if (type == 2) {
+			buf_zero_to(f, align_up(f->len, 4));
+			size_t no = f->len;
+			for (uint64_t k = 0; k < size / 24; k++) {
+				const uint8_t *s = old + off + k * 24;
+				uint8_t e[16];
+				le32(e, rd32(s));
+				le32(e + 4, (uint32_t)rd64(s + 8));
+				le32(e + 8, (uint32_t)rd64(s + 16));
+				e[12] = s[4];
+				e[13] = s[5];
+				le16(e + 14, rd16(s + 6));
+				buf_append(f, e, 16);
+			}
+			off = no;
+			size = size / 24 * 16;
+			ent = 16;
+			al = 4;
+		} else if (type == 4) {
+			buf_zero_to(f, align_up(f->len, 4));
+			size_t no = f->len;
+			for (uint64_t k = 0; k < size / 24; k++) {
+				const uint8_t *s = old + off + k * 24;
+				uint64_t info = rd64(s + 8);
+				int t = rel386((int)(info & 0xFFFFFFFF));
+				if (t < 0) { fprintf(stderr, "error: relocation type %d cannot be written to a 32-bit file\n", (int)(info & 0xFFFFFFFF)); exit(1); }
+				uint8_t e[8];
+				le32(e, (uint32_t)rd64(s));
+				le32(e + 4, (uint32_t)((info >> 32) << 8) | (uint32_t)t);
+				buf_append(f, e, 8);
+			}
+			type = 9;
+			off = no;
+			size = size / 24 * 8;
+			ent = 8;
+			al = 4;
+		}
+		uint8_t *n = nsh + (size_t)i * 40;
+		le32(n, name);
+		le32(n + 4, type);
+		le32(n + 8, (uint32_t)rd64(h + 8));
+		le32(n + 12, (uint32_t)rd64(h + 0x10));
+		le32(n + 16, (uint32_t)off);
+		le32(n + 20, (uint32_t)size);
+		le32(n + 24, rd32(h + 0x28));
+		le32(n + 28, rd32(h + 0x2C));
+		le32(n + 32, (uint32_t)al);
+		le32(n + 36, (uint32_t)ent);
+	}
+	size_t shs_off = f->len;
+	buf_append(f, shs.data, shs.len);
+	le32(nsh + (size_t)shstrndx * 40 + 16, (uint32_t)shs_off);
+	le32(nsh + (size_t)shstrndx * 40 + 20, (uint32_t)shs.len);
+	buf_zero_to(f, align_up(f->len, 4));
+	size_t sh32 = f->len;
+	buf_append(f, nsh, (size_t)shnum * 40);
+	E = f->data;
+	memset(E, 0, 52);
+	E[0] = 0x7F; E[1] = 'E'; E[2] = 'L'; E[3] = 'F'; E[4] = 1; E[5] = 1; E[6] = 1;
+	le16(E + 0x10, 2); le16(E + 0x12, 3); le32(E + 0x14, 1);
+	le32(E + 0x18, (uint32_t)entry);
+	le32(E + 0x1C, phnum ? 52 : 0);
+	le32(E + 0x20, (uint32_t)sh32);
+	le16(E + 0x28, 52); le16(E + 0x2A, 32); le16(E + 0x2C, (uint16_t)phnum);
+	le16(E + 0x2E, 40); le16(E + 0x30, (uint16_t)shnum); le16(E + 0x32, (uint16_t)shstrndx);
+	for (int i = 0; i < phnum; i++) {
+		const uint8_t *p = old + phoff + (size_t)i * 56;
+		uint8_t *q = E + 52 + (size_t)i * 32;
+		le32(q, rd32(p));
+		le32(q + 4, (uint32_t)rd64(p + 8));
+		le32(q + 8, (uint32_t)rd64(p + 0x10));
+		le32(q + 12, (uint32_t)rd64(p + 0x18));
+		le32(q + 16, (uint32_t)rd64(p + 0x20));
+		le32(q + 20, (uint32_t)rd64(p + 0x28));
+		le32(q + 24, rd32(p + 4));
+		le32(q + 28, (uint32_t)rd64(p + 0x30));
+	}
+	memset(E + 52 + (size_t)phnum * 32, 0, 64 + (size_t)phnum * 56 - 52 - (size_t)phnum * 32);
+	free(old);
+	free(nsh);
+	free(shs.data);
+}
+
+
+static uint32_t elf_hash(const char *n) {
+	uint32_t h = 0, g;
+	while (*n) {
+		h = (h << 4) + (uint8_t)*n++;
+		g = h & 0xF0000000u;
+		if (g) h ^= g >> 24;
+		h &= ~g;
+	}
+	return h;
+}
+
+static uint32_t gnu_hash(const char *n) {
+	uint32_t h = 5381;
+	while (*n) h = h * 33 + (uint8_t)*n++;
+	return h;
+}
+
+static int dyn_cmp_gnb;
+
+static int dyn_cmp(const void *a, const void *b) {
+	const struct DynSym *x = (const struct DynSym *)a, *y = (const struct DynSym *)b;
+	uint32_t bx = x->gh % (uint32_t)dyn_cmp_gnb, by = y->gh % (uint32_t)dyn_cmp_gnb;
+	if (bx != by) return bx < by ? -1 : 1;
+	return strcmp(x->s->name, y->s->name);
+}
+
+static void ld_shared_prep(Ctx *ctx, Ld *ld) {
+	int cap = 0;
+	for (Sym *g = ctx->globals; g; g = g->gnext) {
+		if (!g->defined || g->is_static || (g->kind != SYM_FUNC && g->kind != SYM_VAR)) continue;
+		int ver = ld->nvers ? 0 : 1;
+		for (int i = 0; i < ld->nvers && !ver; i++)
+			for (int j = 0; j < ld->vers[i].nglob && !ver; j++)
+				if (ld_glob(ld->vers[i].glob[j], g->name)) ver = i + 2;
+		if (!ver) continue;
+		int dup = 0;
+		for (int i = 0; i < ctx->ndyn && !dup; i++) dup = ctx->dyn[i].s->name == g->name;
+		if (dup) continue;
+		if (ctx->ndyn == cap) ctx->dyn = realloc(ctx->dyn, sizeof(*ctx->dyn) * (size_t)(cap = cap ? cap * 2 : 16));
+		ctx->dyn[ctx->ndyn].s = g;
+		ctx->dyn[ctx->ndyn].ver = ver;
+		ctx->dyn[ctx->ndyn++].gh = gnu_hash(g->name);
+	}
+	int n = ctx->ndyn;
+	ctx->dyn_gnb = n < 4 ? 1 : (uint32_t)n / 2;
+	ctx->dyn_nbucket = n < 3 ? 1 : n < 17 ? 3 : 17;
+	dyn_cmp_gnb = (int)ctx->dyn_gnb;
+	if (n) qsort(ctx->dyn, (size_t)n, sizeof(*ctx->dyn), dyn_cmp);
+	buf_init(&ctx->dynstr);
+	buf_append_byte(&ctx->dynstr, 0);
+	ctx->dyn_soname = ctx->soname ? strtab_add(&ctx->dynstr, ctx->soname) : 0;
+	for (int i = 0; i < n; i++) ctx->dyn[i].name = strtab_add(&ctx->dynstr, ctx->dyn[i].s->name);
+	ctx->dyn_vname = (uint32_t *)calloc((size_t)ld->nvers + 1, sizeof(uint32_t));
+	for (int i = 0; i < ld->nvers; i++) ctx->dyn_vname[i] = strtab_add(&ctx->dynstr, ld->vers[i].name);
+	static const char *names[7] = { ".hash", ".gnu.hash", ".dynsym", ".dynstr", ".gnu.version", ".gnu.version_d", ".dynamic" };
+	size_t size[7];
+	size[0] = (2 + ctx->dyn_nbucket + (size_t)n + 1) * 4;
+	size[1] = 16 + 8 + ctx->dyn_gnb * 4 + (size_t)n * 4;
+	size[2] = ((size_t)n + 1) * 24;
+	size[3] = ctx->dynstr.len;
+	size[4] = ld->nvers ? ((size_t)n + 1) * 2 : 0;
+	size[5] = ld->nvers ? (size_t)(ld->nvers + 1) * 28 : 0;
+	size[6] = (size_t)(8 + (ctx->soname ? 1 : 0) + (ld->nvers ? 3 : 0)) * 16;
+	piece_begin(ctx);
+	for (int i = 0; i < 7; i++) {
+		ctx->dsec[i] = 0;
+		if (!size[i]) continue;
+		ctx->dsec[i] = section_index(ctx, intern(names[i]), SK_RO);
+		ctx->secs[ctx->dsec[i] - SEC_NAMED].align = i == 4 ? 2 : i == 3 ? 1 : 8;
+		Buf *b = sec_buf(ctx, ctx->dsec[i]);
+		buf_zero_to(b, b->len + size[i]);
+	}
+	piece_end(ctx, "<dynamic>");
+}
+
+static void ld_shared_fill(Ctx *ctx, Ld *ld) {
+	int n = ctx->ndyn;
+	uint8_t *hash = sec_buf(ctx, ctx->dsec[0])->data, *gh = sec_buf(ctx, ctx->dsec[1])->data, *sym = sec_buf(ctx, ctx->dsec[2])->data;
+	memcpy(sec_buf(ctx, ctx->dsec[3])->data, ctx->dynstr.data, ctx->dynstr.len);
+	for (int i = 0; i < n; i++) {
+		Sym *g = ctx->dyn[i].s;
+		uint8_t *e = sym + (size_t)(i + 1) * 24;
+		int shn = 0xFFF1;
+		if (g->sect != SEC_ABS) {
+			Piece *p = ld_sym_piece(ctx, g);
+			shn = p && p->out >= 0 ? ld->outs[p->out].shndx : 0;
+		}
+		le32(e, ctx->dyn[i].name);
+		e[4] = (uint8_t)(((g->weak ? 2 : 1) << 4) | (g->kind == SYM_FUNC ? 2 : 1));
+		le16(e + 6, (uint16_t)shn);
+		le64(e + 8, ld_sym_addr(ctx, g));
+		le64(e + 16, (uint64_t)g->size);
+	}
+	uint32_t nb = ctx->dyn_nbucket;
+	le32(hash, nb);
+	le32(hash + 4, (uint32_t)n + 1);
+	for (int i = n; i >= 1; i--) {
+		uint32_t b = elf_hash(ctx->dyn[i - 1].s->name) % nb;
+		le32(hash + 8 + 4 * ((size_t)nb + (size_t)i), rd32(hash + 8 + 4 * b));
+		le32(hash + 8 + 4 * b, (uint32_t)i);
+	}
+	uint32_t gnb = ctx->dyn_gnb;
+	le32(gh, gnb);
+	le32(gh + 4, 1);
+	le32(gh + 8, 1);
+	le32(gh + 12, 6);
+	uint64_t bloom = 0;
+	for (int i = 0; i < n; i++) {
+		uint32_t h = ctx->dyn[i].gh;
+		bloom |= 1ULL << (h % 64) | 1ULL << ((h >> 6) % 64);
+	}
+	le64(gh + 16, bloom);
+	for (int i = n - 1; i >= 0; i--) le32(gh + 24 + 4 * (size_t)(ctx->dyn[i].gh % gnb), (uint32_t)i + 1);
+	for (int i = 0; i < n; i++) {
+		uint32_t h = ctx->dyn[i].gh & ~1u;
+		if (i + 1 == n || ctx->dyn[i + 1].gh % gnb != ctx->dyn[i].gh % gnb) h |= 1;
+		le32(gh + 24 + 4 * (size_t)gnb + 4 * (size_t)i, h);
+	}
+	if (ld->nvers) {
+		uint8_t *vs = sec_buf(ctx, ctx->dsec[4])->data, *vd = sec_buf(ctx, ctx->dsec[5])->data;
+		for (int i = 0; i < n; i++) le16(vs + 2 * (size_t)(i + 1), (uint16_t)ctx->dyn[i].ver);
+		uint32_t vname = ctx->dyn_soname;
+		for (int i = 0; i <= ld->nvers; i++) {
+			const char *nm = i ? ld->vers[i - 1].name : ctx->soname ? ctx->soname : "";
+			uint8_t *e = vd + (size_t)i * 28;
+			le16(e, 1);
+			le16(e + 2, i ? 0 : 1);
+			le16(e + 4, (uint16_t)(i + 1));
+			le16(e + 6, 1);
+			le32(e + 8, elf_hash(nm));
+			le32(e + 12, 20);
+			le32(e + 16, i < ld->nvers ? 28 : 0);
+			le32(e + 20, i ? ctx->dyn_vname[i - 1] : vname);
+			le32(e + 24, 0);
+		}
+	}
+	uint8_t *d = sec_buf(ctx, ctx->dsec[6])->data;
+	uint64_t tags[16][2];
+	int nt = 0;
+	if (ctx->soname) { tags[nt][0] = 14; tags[nt++][1] = ctx->dyn_soname; }
+	tags[nt][0] = 4; tags[nt++][1] = ld_addr(ctx, ctx->dsec[0], 0);
+	tags[nt][0] = 0x6ffffef5; tags[nt++][1] = ld_addr(ctx, ctx->dsec[1], 0);
+	tags[nt][0] = 5; tags[nt++][1] = ld_addr(ctx, ctx->dsec[3], 0);
+	tags[nt][0] = 6; tags[nt++][1] = ld_addr(ctx, ctx->dsec[2], 0);
+	tags[nt][0] = 10; tags[nt++][1] = ctx->dynstr.len;
+	tags[nt][0] = 11; tags[nt++][1] = 24;
+	if (ld->nvers) {
+		tags[nt][0] = 0x6ffffff0; tags[nt++][1] = ld_addr(ctx, ctx->dsec[4], 0);
+		tags[nt][0] = 0x6ffffffc; tags[nt++][1] = ld_addr(ctx, ctx->dsec[5], 0);
+		tags[nt][0] = 0x6ffffffd; tags[nt++][1] = (uint64_t)ld->nvers + 1;
+	}
+	for (int i = 0; i < nt; i++) { le64(d + 16 * (size_t)i, tags[i][0]); le64(d + 16 * (size_t)i + 8, tags[i][1]); }
+}
+
 static void ld_write_elf(Ctx *ctx, Ld *ld, const char *out_path, uint64_t entry) {
 	int nsegs = ld->nsegs;
 	for (int i = 0; i < nsegs; i++) {
@@ -9294,6 +13292,7 @@ static void ld_write_elf(Ctx *ctx, Ld *ld, const char *out_path, uint64_t entry)
 	for (LdStmt *st = ld->top; st; st = st->next)
 		if (st->kind == LS_SECTION && !ld->outs[st->out].discard && ld->outs[st->out].kept) ord[n++] = st->out;
 	for (int k = 0; k < n; k++) ld->outs[ord[k]].shndx = k + 1;
+	if (ctx->shared) ld_shared_fill(ctx, ld);
 
 	size_t pos = 64 + 56 * (size_t)nsegs;
 	for (int i = 0; i < nsegs; i++) {
@@ -9324,6 +13323,14 @@ static void ld_write_elf(Ctx *ctx, Ld *ld, const char *out_path, uint64_t entry)
 			if (!g->has_flags) g->flags |= (o->flags & 1 ? 2 : 0) | (o->flags & 4 ? 1 : 0);
 		}
 		pos = (size_t)(g->off + g->filesz);
+		if (g->filehdr && g->vaddr >= g->off) {
+			uint64_t d = g->off;
+			g->vaddr -= d;
+			g->paddr -= d;
+			g->memsz += d;
+			g->filesz += d;
+			g->off = 0;
+		}
 	}
 	for (int k = 0; k < n; k++) {
 		LdOut *o = &ld->outs[ord[k]];
@@ -9396,6 +13403,16 @@ static void ld_write_elf(Ctx *ctx, Ld *ld, const char *out_path, uint64_t entry)
 	buf_zero_to(&symtab, 24);
 	int nlocal = 1;
 	uint8_t e[24];
+	for (Sym *s = ctx->globals; s; s = s->gnext) s->elf_index = 0;
+	if (ctx->emit_relocs)
+		for (int k = 0; k < n; k++) {
+			memset(e, 0, 24);
+			e[4] = 3;
+			le16(e+6, (uint16_t)(k + 1));
+			le64(e+8, ld->outs[ord[k]].vma);
+			buf_append(&symtab, e, 24);
+			nlocal++;
+		}
 	if (!ctx->freestanding) {
 		Piece *p = ld_piece_at(ctx, SEC_TEXT, 0);
 		memset(e, 0, 24);
@@ -9422,14 +13439,52 @@ static void ld_write_elf(Ctx *ctx, Ld *ld, const char *out_path, uint64_t entry)
 			le16(e+6, (uint16_t)shn);
 			le64(e+8, ld_sym_addr(ctx, s) - (s->tls ? (uint64_t)ctx->tls_lo : 0));
 			le64(e+16, (uint64_t)s->size);
+			s->elf_index = (int)(symtab.len / 24);
 			buf_append(&symtab, e, 24);
 			if (pass == 0) nlocal++;
 		}
 	}
 
+	Buf *rel = (Buf *)calloc((size_t)n + 1, sizeof(Buf));
+	if (ctx->emit_relocs)
+		for (int i = 0; i < ctx->nrelocs; i++) {
+			Reloc *r = &ctx->relocs[i];
+			Piece *p = ld_piece_at(ctx, r->in, (long)r->pos);
+			if (!p || p->out < 0 || !ld->outs[p->out].shndx) continue;
+			int k = ld->outs[p->out].shndx - 1, symi = 0, pc = r->kind == R_PC32 || r->kind == R_PLT32 || r->kind == R_PC16 || r->kind == R_PC8 || r->kind == R_PC64;
+			uint64_t P = ld_addr(ctx, r->in, (long)r->pos), S = 0;
+			if (r->sym) {
+				Sym *g = r->sym;
+				if (g->defined && g->elf_index) { symi = g->elf_index; S = ld_sym_addr(ctx, g); }
+			} else {
+				Piece *tp = ld_piece_at(ctx, r->sect, (long)r->addend);
+				if (!tp || tp->out < 0 || !ld->outs[tp->out].shndx) continue;
+				symi = ld->outs[tp->out].shndx;
+				S = ld->outs[tp->out].vma;
+			}
+			int sz = rel_size[r->kind];
+			const uint8_t *d = sec_buf(ctx, r->in)->data + r->pos;
+			uint64_t v = 0;
+			for (int b = 0; b < sz; b++) v |= (uint64_t)d[b] << (8 * b);
+			if (sz < 8 && (pc || r->kind == R_ABS32S) && (v >> (8 * sz - 1)) & 1) v |= ~0ULL << (8 * sz);
+			uint8_t re[24];
+			le64(re, P);
+			le64(re + 8, ((uint64_t)symi << 32) | (uint64_t)rel_elf[r->kind]);
+			le64(re + 16, pc ? v - S + P : v - S);
+			buf_append(&rel[k], re, 24);
+		}
+
 	buf_append_byte(&shstr, 0);
-	uint32_t *names = (uint32_t *)malloc(sizeof(uint32_t) * (n + 1));
+	uint32_t *names = (uint32_t *)malloc(sizeof(uint32_t) * (2 * n + 1));
 	for (int k = 0; k < n; k++) names[k] = strtab_add(&shstr, ld->outs[ord[k]].name);
+	int nrel = 0;
+	for (int k = 0; k < n; k++)
+		if (rel[k].len) {
+			char rn[300];
+			snprintf(rn, sizeof(rn), ".rela%s", ld->outs[ord[k]].name);
+			names[n + k] = strtab_add(&shstr, rn);
+			nrel++;
+		}
 	uint32_t n_sym = strtab_add(&shstr, ".symtab");
 	uint32_t n_str = strtab_add(&shstr, ".strtab");
 	uint32_t n_shs = strtab_add(&shstr, ".shstrtab");
@@ -9440,11 +13495,26 @@ static void ld_write_elf(Ctx *ctx, Ld *ld, const char *out_path, uint64_t entry)
 	buf_append(&file, strtab.data, strtab.len);
 	size_t shs_off = file.len;
 	buf_append(&file, shstr.data, shstr.len);
+	size_t *rel_off = (size_t *)calloc((size_t)n + 1, sizeof(size_t));
+	for (int k = 0; k < n; k++)
+		if (rel[k].len) {
+			buf_zero_to(&file, align_up(file.len, 8));
+			rel_off[k] = file.len;
+			buf_append(&file, rel[k].data, rel[k].len);
+		}
 	buf_zero_to(&file, align_up(file.len, 8));
 	size_t sh_off = file.len;
-	int nsh = n + 4;
+	int nsh = n + 4 + nrel;
 	buf_zero_to(&file, sh_off + (size_t)nsh * 64);
 	uint8_t *S = file.data + sh_off;
+	for (int k = 0, j = n + 4; k < n; k++)
+		if (rel[k].len) {
+			shdr(S + j * 64, names[n + k], 4, 0x40, 0, rel_off[k], rel[k].len, (uint32_t)(n + 1), (uint32_t)(k + 1), 8, 24);
+			j++;
+		}
+	for (int k = 0; k < n; k++) free(rel[k].data);
+	free(rel);
+	free(rel_off);
 	for (int k = 0; k < n; k++) {
 		LdOut *o = &ld->outs[ord[k]];
 		int nob = o->nobits || o->st->noload;
@@ -9457,11 +13527,11 @@ static void ld_write_elf(Ctx *ctx, Ld *ld, const char *out_path, uint64_t entry)
 
 	uint8_t *E = file.data;
 	E[0]=0x7F; E[1]='E'; E[2]='L'; E[3]='F'; E[4]=2; E[5]=1; E[6]=1;
-	le16(E+0x10,2); le16(E+0x12,62); le32(E+0x14,1);
+	le16(E+0x10,ctx->shared ? 3 : 2); le16(E+0x12,62); le32(E+0x14,1);
 	le64(E+0x18,entry);
 	le64(E+0x20,nsegs ? 64 : 0); le64(E+0x28,sh_off);
 	le16(E+0x34,64); le16(E+0x36,56); le16(E+0x38,(uint16_t)nsegs);
-	le16(E+0x3A,64); le16(E+0x3C,(uint16_t)nsh); le16(E+0x3E,(uint16_t)(nsh - 1));
+	le16(E+0x3A,64); le16(E+0x3C,(uint16_t)nsh); le16(E+0x3E,(uint16_t)(n + 3));
 	for (int i = 0; i < nsegs; i++) {
 		LdSeg *g = &ld->segs[i];
 		uint8_t *P = file.data + 64 + 56 * i;
@@ -9469,6 +13539,7 @@ static void ld_write_elf(Ctx *ctx, Ld *ld, const char *out_path, uint64_t entry)
 		le64(P+0x08,g->off); le64(P+0x10,g->vaddr); le64(P+0x18,g->paddr);
 		le64(P+0x20,g->filesz); le64(P+0x28,g->memsz); le64(P+0x30,g->align);
 	}
+	if (ctx->elf32) elf_to32(ctx, &file);
 	write_out(out_path, &file, 0755);
 	free(file.data); free(symtab.data); free(strtab.data); free(shstr.data); free(names); free(ord);
 }
@@ -9492,7 +13563,9 @@ static uint64_t ld_entry(Ctx *ctx, Ld *ld) {
 
 static void ld_link(Ctx *ctx, const char *out_path) {
 	Ld *ld = ctx->ld;
+	ld_i386 = ctx->elf32;
 	resolve_alias_syms(ctx);
+	if (ctx->shared) ld_shared_prep(ctx, ld);
 	ld_match(ctx, ld);
 	ld_layout(ctx, ld);
 	ld_define(ctx, ld);
@@ -9507,6 +13580,20 @@ static void ld_link(Ctx *ctx, const char *out_path) {
 	ctx->has_tls = tls_hi > 0;
 	ctx->tls_lo = (long long)tls_lo;
 	if (ctx->has_tls) ctx->tls_tp = (long long)(tls_lo + ld_alignup(tls_hi - tls_lo, tls_a));
+	if (ctx->map) {
+		Buf m;
+		buf_init(&m);
+		char line[600];
+		for (int i = 0; i < ld->nouts; i++) {
+			LdOut *o = &ld->outs[i];
+			if (o->discard || !o->kept) continue;
+			int k = snprintf(line, sizeof(line), "%-24s 0x%016llx 0x%016llx 0x%llx\n", o->name, (unsigned long long)o->vma,
+				(unsigned long long)o->lma, (unsigned long long)o->size);
+			buf_append(&m, line, (size_t)k);
+		}
+		write_out(ctx->map, &m, 0);
+		free(m.data);
+	}
 	for (int i = 0; i < ld->nouts; i++) {
 		LdOut *a = &ld->outs[i];
 		if (a->discard || !a->kept || !a->size || a->st->noload || ((a->flags & 0x400) && a->nobits)) continue;
@@ -9514,7 +13601,8 @@ static void ld_link(Ctx *ctx, const char *out_path) {
 			LdOut *b = &ld->outs[j];
 			if (b->discard || !b->kept || !b->size || b->st->noload || ((b->flags & 0x400) && b->nobits)) continue;
 			if (a->vma < b->vma + b->size && b->vma < a->vma + a->size)
-				ld_fail(ld, "section '%s' overlaps section '%s'", a->name, b->name);
+				ld_fail(ld, "section '%s' (0x%llx-0x%llx) overlaps section '%s' (0x%llx-0x%llx)", a->name, (unsigned long long)a->vma,
+					(unsigned long long)(a->vma + a->size), b->name, (unsigned long long)b->vma, (unsigned long long)(b->vma + b->size));
 			if (!a->nobits && !b->nobits && a->lma < b->lma + b->size && b->lma < a->lma + a->size)
 				ld_fail(ld, "the load addresses of '%s' and '%s' overlap", a->name, b->name);
 		}
@@ -9954,8 +14042,9 @@ static void write_object(Ctx *ctx, const char *out_path) {
 			(ctx->secs[x - SEC_NAMED].align > 1 ? ctx->secs[x - SEC_NAMED].align : 1);
 		int i = shndx[x];
 		int type = x == SEC_BSS || x >= ns || (x >= SEC_NAMED && ctx->secs[x - SEC_NAMED].tls == 2) ? 8 :
-			x >= SEC_NAMED && !strncmp(ctx->secs[x - SEC_NAMED].name, ".note", 5) ? 7 : 1;
-		shdr(S + i * 64, names[i], type, (uint64_t)(x >= ns ? 3 : sec_flags(ctx, x)), 0, offs[i], sizes[i], 0, 0, (uint64_t)a, 0);
+			x >= SEC_NAMED && !strncmp(ctx->secs[x - SEC_NAMED].name, ".note", 5) ? 7 :
+			x >= SEC_NAMED ? array_sec_type(ctx->secs[x - SEC_NAMED].name) : 1;
+		shdr(S + i * 64, names[i], type, (uint64_t)(x >= ns ? 3 : sec_flags(ctx, x)), 0, offs[i], sizes[i], 0, 0, (uint64_t)a, type > 1 && type != 7 && type != 8 ? 8 : 0);
 		if (rela[x]) {
 			i = rela[x];
 			shdr(S + i * 64, names[i], 4, 0x40, 0, offs[i], sizes[i], (uint32_t)sh_sym, (uint32_t)shndx[x], 8, 24);
@@ -9977,13 +14066,10 @@ static void write_object(Ctx *ctx, const char *out_path) {
 	free(rb); free(order); free(shndx); free(symsec); free(rela); free(nrel); free(offs); free(sizes); free(names);
 }
 
-static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
-static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
-static uint64_t rd64(const uint8_t *p) { return (uint64_t)rd32(p) | (uint64_t)rd32(p + 4) << 32; }
 
 static Sym *link_global(Ctx *ctx, char *name, int *created) {
-	for (Sym *g = ctx->globals; g; g = g->gnext)
-		if (g->name == name && !g->is_static && (g->kind == SYM_FUNC || g->kind == SYM_VAR)) { *created = 0; return g; }
+	for (Sym *g = global_chain(ctx, name); g; g = g->gsame)
+		if (!g->is_static && (g->kind == SYM_FUNC || g->kind == SYM_VAR)) { *created = 0; return g; }
 	Sym *g = (Sym *)calloc(1, sizeof(Sym));
 	g->name = name;
 	g->kind = SYM_VAR;
@@ -10184,7 +14270,8 @@ static void load_object(Ctx *ctx, const uint8_t *d, size_t n, const char *name) 
 typedef struct {
 	const uint8_t *data;
 	size_t size;
-	char name[64];
+	char name[256];
+	const char *path;
 	int loaded;
 } ArMember;
 
@@ -10201,20 +14288,30 @@ static int member_needed(Ctx *ctx, const ArMember *m) {
 		for (int k = 1; k < nsyms; k++) {
 			const uint8_t *e = symtab + 24 * k;
 			int bind = e[4] >> 4, shn = rd16(e + 6);
-			if (bind == 0 || shn == 0 || shn == 0xFFF2) continue;
+			if (bind == 0 || shn == 0) continue;
 			char *id = intern(strtab + rd32(e));
-			for (Sym *g = ctx->globals; g; g = g->gnext)
-				if (g->name == id && !g->is_static && !g->defined && (g->ref || g->common)) return 1;
+			for (Sym *g = global_chain(ctx, id); g; g = g->gsame)
+				if (!g->is_static && !g->defined && (!g->weak || g->strong_ref) && (shn == 0xFFF2 ? g->ref && !g->common : g->ref || g->common)) return 1;
 		}
 	}
 	return 0;
 }
 
-static void load_archive(Ctx *ctx, const uint8_t *d, size_t n, const char *name) {
-	ArMember *ms = NULL;
-	int nm = 0, cap = 0;
+typedef struct {
+	const char *name;
+	ArMember *ms;
+	int nm;
+} Ar;
+
+static uint8_t *read_binary(const char *path, size_t *n);
+
+static Ar *ar_open(const uint8_t *d, size_t n, const char *name) {
+	Ar *ar = (Ar *)calloc(1, sizeof(Ar));
+	int cap = 0, thin = n >= 8 && !memcmp(d, "!<thin>\n", 8);
 	const char *longnames = NULL;
 	size_t p = 8;
+	ar->name = name;
+	char *dir = dir_of(name);
 	while (p + 60 <= n) {
 		const uint8_t *h = d + p;
 		char nb[17], sb[11];
@@ -10222,42 +14319,72 @@ static void load_archive(Ctx *ctx, const uint8_t *d, size_t n, const char *name)
 		memcpy(sb, h + 48, 10); sb[10] = 0;
 		size_t size = (size_t)strtoul(sb, NULL, 10);
 		const uint8_t *data = h + 60;
-		if (p + 60 + size > n) link_error(name, "truncated archive");
+		int special = !strncmp(nb, "//", 2) || (nb[0] == '/' && !isdigit((unsigned char)nb[1]));
+		size_t step = thin && !special ? 0 : size;
+		if (p + 60 + step > n) link_error(name, "truncated archive");
 		if (!strncmp(nb, "//", 2)) longnames = (const char *)data;
-		else if (nb[0] != '/' || isdigit((unsigned char)nb[1])) {
-			if (nm == cap) {
+		else if (!special) {
+			if (ar->nm == cap) {
 				cap = cap ? cap * 2 : 16;
-				ms = (ArMember *)realloc(ms, sizeof(ArMember) * cap);
+				ar->ms = (ArMember *)realloc(ar->ms, sizeof(ArMember) * cap);
 			}
-			ArMember *m = &ms[nm++];
+			ArMember *m = &ar->ms[ar->nm++];
 			const char *src = nb;
 			if (nb[0] == '/' && longnames) src = longnames + strtoul(nb + 1, NULL, 10);
+			char full[1024];
 			int k = 0;
-			while (k < 63 && src[k] && src[k] != '/' && src[k] != '\n' && !(src == nb && src[k] == ' ')) { m->name[k] = src[k]; k++; }
-			m->name[k] = 0;
-			m->data = data;
-			m->size = size;
+			while (k < 1000 && src[k] && src[k] != '\n' && !(src[k] == '/' && (src[k+1] == '\n' || src[k+1] == 0 || src == nb)) && !(src == nb && src[k] == ' ')) { full[k] = src[k]; k++; }
+			full[k] = 0;
+			snprintf(m->name, sizeof(m->name), "%.255s", full);
+			if (thin) {
+				char path[2048];
+				if (full[0] == '/') snprintf(path, sizeof(path), "%s", full);
+				else snprintf(path, sizeof(path), "%s/%s", dir, full);
+				m->data = read_binary(path, &m->size);
+				m->path = intern(path);
+			} else {
+				m->data = data;
+				m->size = size;
+				m->path = NULL;
+			}
 			m->loaded = 0;
 		}
-		p += 60 + size + (size & 1);
+		p += 60 + step + (step & 1);
 	}
-	char full[512];
+	return ar;
+}
+
+static int ar_pull(Ctx *ctx, Ar *ar, int whole) {
+	char full[1200];
+	int any = 0;
 	for (int changed = 1; changed;) {
 		changed = 0;
 		for (Sym *g = ctx->globals; g; g = g->gnext) g->ref = 0;
 		for (int i = 0; i < ctx->nrelocs; i++) if (ctx->relocs[i].sym) ctx->relocs[i].sym->ref = 1;
-		for (int i = 0; i < nm; i++) {
-			if (ms[i].loaded || !member_needed(ctx, &ms[i])) continue;
-			ms[i].loaded = 1;
-			snprintf(full, sizeof(full), "%s(%s)", name, ms[i].name);
-			ctx->arch = name;
-			ctx->member = intern(ms[i].name);
-			load_object(ctx, ms[i].data, ms[i].size, intern(full));
+		for (int i = 0; i < ar->nm; i++) {
+			ArMember *m = &ar->ms[i];
+			if (m->loaded || !(whole || member_needed(ctx, m))) continue;
+			m->loaded = 1;
+			if (m->size >= 8 && (!memcmp(m->data, "!<arch>\n", 8) || !memcmp(m->data, "!<thin>\n", 8))) {
+				Ar *sub = ar_open(m->data, m->size, m->path ? m->path : ar->name);
+				if (ar_pull(ctx, sub, whole)) changed = any = 1;
+				continue;
+			}
+			if (m->path) snprintf(full, sizeof(full), "%s", m->path);
+			else snprintf(full, sizeof(full), "%s(%s)", ar->name, m->name);
+			ctx->arch = ar->name;
+			ctx->member = intern(m->name);
+			load_object(ctx, m->data, m->size, intern(full));
 			ctx->arch = ctx->member = NULL;
-			changed = 1;
+			changed = any = 1;
 		}
+		if (whole) break;
 	}
-	free(ms);
+	return any;
+}
+
+static void load_archive(Ctx *ctx, const uint8_t *d, size_t n, const char *name) {
+	ar_pull(ctx, ar_open(d, n, name), 0);
 }
 
 static void alloc_commons(Ctx *ctx) {
@@ -10329,13 +14456,13 @@ static void load_binary(Ctx *ctx, const char *path) {
 	free(d);
 }
 
-static void compile_input(Ctx *ctx, const char *path) {
-	int k = input_kind(path);
+static void compile_input(Ctx *ctx, const char *path, int k) {
+	if (!k) k = input_kind(path);
 	if (k == 'o' || k == 'a') {
 		size_t n;
 		uint8_t *d = read_binary(path, &n);
 		if (k == 'a') {
-			if (n < 8 || memcmp(d, "!<arch>\n", 8)) link_error(path, "not an archive");
+			if (n < 8 || (memcmp(d, "!<arch>\n", 8) && memcmp(d, "!<thin>\n", 8))) link_error(path, "not an archive");
 			load_archive(ctx, d, n, path);
 		} else load_object(ctx, d, n, path);
 		return;
@@ -10345,6 +14472,45 @@ static void compile_input(Ctx *ctx, const char *path) {
 	if (k == 's' || k == 'S') assemble_unit(ctx, src, path, k == 'S');
 	else compile_unit(ctx, src, path, 0);
 	piece_end(ctx, path);
+}
+
+static void link_inputs(Ctx *ctx, const char **inputs, int *kinds, int *binary, int n) {
+	int whole = 0, group = 0, ng = 0, capg = 0;
+	Ar **gs = NULL;
+	for (int i = 0; i < n; i++) {
+		int k = kinds[i];
+		if (k == 'W' || k == 'w') { whole = k == 'W'; continue; }
+		if (k == 'G') { group = 1; ng = 0; continue; }
+		if (k == 'g') {
+			for (int changed = 1; changed;) {
+				changed = 0;
+				for (int j = 0; j < ng; j++) changed |= ar_pull(ctx, gs[j], 0);
+			}
+			group = 0;
+			continue;
+		}
+		if (binary[i]) { load_binary(ctx, inputs[i]); continue; }
+		if (!k) k = input_kind(inputs[i]);
+		if (k == 'o') {
+			char m[8];
+			FILE *f = fopen(inputs[i], "rb");
+			if (f) {
+				if (fread(m, 1, 8, f) == 8 && (!memcmp(m, "!<arch>\n", 8) || !memcmp(m, "!<thin>\n", 8))) k = 'a';
+				fclose(f);
+			}
+		}
+		if (k != 'a') { compile_input(ctx, inputs[i], k); continue; }
+		size_t sz;
+		uint8_t *d = read_binary(inputs[i], &sz);
+		if (sz < 8 || (memcmp(d, "!<arch>\n", 8) && memcmp(d, "!<thin>\n", 8))) link_error(inputs[i], "not an archive");
+		Ar *ar = ar_open(d, sz, inputs[i]);
+		ar_pull(ctx, ar, whole);
+		if (group) {
+			if (ng == capg) gs = (Ar **)realloc(gs, sizeof(Ar *) * (size_t)(capg = capg ? capg * 2 : 16));
+			gs[ng++] = ar;
+		}
+	}
+	free(gs);
 }
 
 static void emit_start(Ctx *ctx, Sym *main_sym, Sym *exit_sym, Sym *init_sym, Sym *environ_sym) {
@@ -10373,6 +14539,7 @@ static void emit_start(Ctx *ctx, Sym *main_sym, Sym *exit_sym, Sym *init_sym, Sy
 
 static void ctx_init(Ctx *ctx) {
 	memset(ctx, 0, sizeof(*ctx));
+	ctx->k_end = (size_t)-1;
 	code_init(&ctx->text);
 	buf_init(&ctx->rodata);
 	buf_init(&ctx->data);
@@ -10382,82 +14549,291 @@ static void ctx_init(Ctx *ctx) {
 }
 
 static int ignored_flag(const char *a) {
-	static const char *names[] = { "-fno-pic", "-fno-PIC", "-fno-pie", "-fno-PIE", "-static", "-fno-builtin",
-		"-fno-strict-aliasing", "-fno-omit-frame-pointer", "-fno-stack-protector", "-mno-red-zone",
-		"-mtls-direct-seg-refs", "-mcmodel=kernel", "-mcmodel=small", "-m64", "-MD", "-MMD", "-pipe",
-		"-Wa,-divide", "-Wa,--divide", NULL };
+	static const char *names[] = { "-static", "-pipe", "-P", "-C", "-no-pie", "-w", "-pedantic", NULL };
+	static const char *refused[] = { "-funsigned-char", "-fshort-enums", NULL };
+	for (int i = 0; refused[i]; i++) if (!strcmp(a, refused[i])) return 0;
 	for (int i = 0; names[i]; i++) if (!strcmp(a, names[i])) return 1;
-	if (a[1] == 'O' && (!a[2] || (strchr("0123s", a[2]) && !a[3]))) return 1;
+	if (a[1] == 'O' && (!a[2] || (strchr("0123sgz", a[2]) && !a[3]))) return 1;
 	if (a[1] == 'g') return 1;
-	if (a[1] == 'W' && a[2] && a[2] != ',' && a[3] != ',') return 1;
+	if (a[1] == 'f' || (a[1] == 'm' && a[2])) return 1;
+	if (a[1] == 'W' && a[2] && strncmp(a, "-Wl,", 4) && strncmp(a, "-Wp,", 4)) return 1;
 	return 0;
 }
 
+static void preprocess_input(Ctx *ctx, const char *path, int k, Buf *out) {
+	if (!k) k = input_kind(path);
+	int as = k == 'S' || k == 's';
+	char *src = read_file(path);
+	lex_asm = as;
+	pp_begin_unit(ctx);
+	if (as) pp_define_str(ctx, "__ASSEMBLER__ 1");
+	push_file(ctx, src, path, 0);
+	ctx->src->L.as = as;
+	push_includes(ctx, as);
+	ctx->has_pk = 0;
+	ctx->has_pp_back = 0;
+	int first = 1;
+	for (;;) {
+		Tok t = pp_next(ctx);
+		if (t.kind == T_EOF) break;
+		if (!first && t.bol) buf_append_byte(out, '\n');
+		else if (!first && t.space) buf_append_byte(out, ' ');
+		if (t.raw) buf_append(out, t.raw, (size_t)t.rawlen);
+		else tok_spell(out, &t);
+		first = 0;
+	}
+	buf_append_byte(out, '\n');
+	pp_end_unit(ctx);
+	lex_asm = 0;
+}
+
+static void write_deps(Ctx *ctx, const char *depfile, const char *target) {
+	Buf b; buf_init(&b);
+	buf_append(&b, target, strlen(target));
+	buf_append_byte(&b, ':');
+	for (int i = 0; i < ctx->ndeps; i++) {
+		buf_append(&b, " \\\n  ", 5);
+		buf_append(&b, ctx->deps[i], strlen(ctx->deps[i]));
+	}
+	buf_append_byte(&b, '\n');
+	write_out(depfile, &b, 0);
+	free(b.data);
+}
+
+static const char *include_dir(const char *argv0) {
+	static char path[4096];
+	const char *slash = strrchr(argv0, '/');
+	if (!slash) return "include";
+	snprintf(path, sizeof(path), "%.*s/lib/include", (int)(slash - argv0), argv0);
+	return path;
+}
+
+static Ctx *unit_ctx(Ctx *base) {
+	Ctx *u = (Ctx *)malloc(sizeof(Ctx));
+	ctx_init(u);
+	memcpy(u->incdirs, base->incdirs, sizeof(base->incdirs));
+	u->nincdirs = base->nincdirs;
+	memcpy(u->defines, base->defines, sizeof(base->defines));
+	u->ndefines = base->ndefines;
+	memcpy(u->includes, base->includes, sizeof(base->includes));
+	u->nincludes = base->nincludes;
+	memcpy(u->undefs, base->undefs, sizeof(base->undefs));
+	u->nundefs = base->nundefs;
+	u->nostdlib = base->nostdlib;
+	u->freestanding = base->freestanding;
+	u->nostdinc = base->nostdinc;
+	u->no_common = base->no_common;
+	u->no_float = base->no_float;
+	u->gnu = base->gnu;
+	u->fold = base->fold;
+	u->gnu89 = base->gnu89;
+	u->m32 = base->m32;
+	u->kmodel = base->kmodel;
+	u->no_sse = base->no_sse;
+	u->track_deps = base->track_deps;
+	u->track = 1;
+	return u;
+}
+
+static char *derived_name(const char *path, const char *ext) {
+	static char name[1024];
+	const char *b = strrchr(path, '/');
+	b = b ? b + 1 : path;
+	snprintf(name, sizeof(name), "%s", b);
+	char *dot = strrchr(name, '.');
+	if (dot) *dot = 0;
+	if (strlen(name) + strlen(ext) < sizeof(name)) strcat(name, ext);
+	return name;
+}
+
+static int lang_kind(Ctx *ctx, const char *l) {
+	(void)ctx;
+	if (!strcmp(l, "c")) return 'c';
+	if (!strcmp(l, "assembler")) return 's';
+	if (!strcmp(l, "assembler-with-cpp")) return 'S';
+	if (!strcmp(l, "none")) return 0;
+	fprintf(stderr, "unknown language: %s\n", l);
+	exit(1);
+}
+
 int main(int argc, char **argv) {
-	const char *out = "a.out";
-	const char *inputs[64];
-	int binary_in[64], as_binary = 0;
-	const char *entry = NULL, *script = NULL;
-	int ninputs = 0, compile_only = 0, out_given = 0, oformat_given = 0;
+	const char *out = NULL;
+	char **args = (char **)malloc(sizeof(char *) * (size_t)(argc * 2 + 64));
+	int nargs = 0;
+	for (int i = 1; i < argc; i++) {
+		if (!strncmp(argv[i], "-Wl,", 4)) {
+			char *p = argv[i] + 4;
+			for (;;) {
+				char *c = strchr(p, ',');
+				if (c) *c = 0;
+				args = (char **)realloc(args, sizeof(char *) * (size_t)(nargs + 2));
+				args[nargs++] = p;
+				if (!c) break;
+				p = c + 1;
+			}
+		} else {
+			args = (char **)realloc(args, sizeof(char *) * (size_t)(nargs + 2));
+			args[nargs++] = argv[i];
+		}
+	}
+	const char **inputs = (const char **)malloc(sizeof(char *) * (size_t)(nargs + 1));
+	int *binary_in = (int *)malloc(sizeof(int) * (size_t)(nargs + 1));
+	int *in_kind = (int *)malloc(sizeof(int) * (size_t)(nargs + 1));
+	int as_binary = 0, lang = 0, mode = 0, version = 0, want_deps = 0, ld_style = 0;
+	const char *entry = NULL, *script = NULL, *depfile = NULL, *deptarget = NULL;
+	int ninputs = 0, oformat_given = 0, nlibdirs = 0;
+	const char **libdirs = (const char **)malloc(sizeof(char *) * (size_t)(nargs + 1));
 	Ctx *ctx = (Ctx *)malloc(sizeof(Ctx));
 	ctx_init(ctx);
-	for (int i=1;i<argc;i++) {
-		const char *a = argv[i];
-		if (strcmp(a,"-o")==0&&i+1<argc) { out=argv[++i]; out_given = 1; }
-		else if (strcmp(a,"-c")==0) compile_only = 1;
-		else if (a[0]=='-' && a[1]=='I' && ctx->nincdirs < 64) ctx->incdirs[ctx->nincdirs++] = a[2] ? a+2 : (i+1<argc ? argv[++i] : ".");
-		else if (a[0]=='-' && a[1]=='D' && ctx->ndefines < 64) ctx->defines[ctx->ndefines++] = a[2] ? a+2 : (i+1<argc ? argv[++i] : "");
+	for (int i=0;i<nargs;i++) {
+		const char *a = args[i];
+		int more = i + 1 < nargs;
+		if (strcmp(a,"-o")==0&&more) out=args[++i];
+		else if (strcmp(a,"-c")==0) mode = 'c';
+		else if (strcmp(a,"-E")==0) mode = 'E';
+		else if (strcmp(a,"-S")==0) mode = 'S';
+		else if (strcmp(a,"-x")==0&&more) lang = lang_kind(ctx, args[++i]);
+		else if (!strncmp(a,"-x",2)&&a[2]) lang = lang_kind(ctx, a+2);
+		else if (!strcmp(a,"-v") || !strcmp(a,"--version") || !strcmp(a,"-V")) version = 1;
+		else if (!strcmp(a,"-dumpversion")) { printf("4.9.0\n"); return 0; }
+		else if (!strcmp(a,"-dumpmachine")) { printf("x86_64-linux-gnu\n"); return 0; }
+		else if (!strncmp(a,"-print-file-name=",17)) {
+			printf("%s\n", strcmp(a+17,"include") ? a+17 : include_dir(argv[0]));
+			return 0;
+		}
+		else if (!strncmp(a,"-std=",5)) { ctx->gnu = !strncmp(a+5,"gnu",3); ctx->gnu89 = !strcmp(a+5,"gnu89") || !strcmp(a+5,"gnu90"); }
+		else if (!strcmp(a,"-ansi")) ctx->gnu = 0;
+		else if (strcmp(a,"-include")==0&&more) { if (ctx->nincludes < 64) ctx->includes[ctx->nincludes++] = args[++i]; else i++; }
+		else if ((!strcmp(a,"-isystem") || !strcmp(a,"-idirafter") || !strcmp(a,"-iquote"))&&more) {
+			if (ctx->nincdirs < 64) ctx->incdirs[ctx->nincdirs++] = args[++i]; else i++;
+		}
+		else if (a[0]=='-' && a[1]=='U' && ctx->nundefs < 64) ctx->undefs[ctx->nundefs++] = a[2] ? a+2 : (more ? args[++i] : "");
+		else if (!strcmp(a,"-MD") || !strcmp(a,"-MMD")) want_deps = 1;
+		else if (!strcmp(a,"-MF")&&more) depfile = args[++i];
+		else if ((!strcmp(a,"-MT") || !strcmp(a,"-MQ"))&&more) deptarget = args[++i];
+		else if (!strcmp(a,"-MP") || !strcmp(a,"-M") || !strcmp(a,"-MM")) {}
+		else if (!strncmp(a,"-Wp,",4)) {
+			char buf[1024];
+			snprintf(buf, sizeof(buf), "%s", a+4);
+			char *c = strchr(buf, ',');
+			if (c && (!strncmp(buf,"-MD,",4) || !strncmp(buf,"-MMD,",5))) { want_deps = 1; depfile = intern(c+1); }
+			else if (buf[0]=='-' && buf[1]=='D' && ctx->ndefines < 64) ctx->defines[ctx->ndefines++] = intern(buf+2);
+			else if (buf[0]=='-' && buf[1]=='U' && ctx->nundefs < 64) ctx->undefs[ctx->nundefs++] = intern(buf+2);
+		}
+		else if (!strncmp(a,"-Wa,",4)) {}
+		else if (a[0]=='-' && a[1]=='I' && ctx->nincdirs < 64) ctx->incdirs[ctx->nincdirs++] = a[2] ? a+2 : (more ? args[++i] : ".");
+		else if (a[0]=='-' && a[1]=='D' && ctx->ndefines < 64) ctx->defines[ctx->ndefines++] = a[2] ? a+2 : (more ? args[++i] : "");
 		else if (strcmp(a,"-nostdlib")==0) ctx->nostdlib = 1;
+		else if (strcmp(a,"-nostartfiles")==0) ctx->nostart = 1;
+		else if (a[0]=='-' && a[1]=='L' && (a[2] || more)) libdirs[nlibdirs++] = a[2] ? a+2 : args[++i];
+		else if (a[0]=='-' && a[1]=='l' && (a[2] || more)) {
+			const char *n = a[2] ? a+2 : args[++i];
+			char *found = NULL;
+			for (int d = 0; d < nlibdirs && !found; d++) {
+				char path[4096];
+				if (n[0] == ':') snprintf(path, sizeof(path), "%s/%s", libdirs[d], n + 1);
+				else snprintf(path, sizeof(path), "%s/lib%s.a", libdirs[d], n);
+				FILE *lf = fopen(path, "rb");
+				if (lf) { fclose(lf); found = intern(path); }
+			}
+			if (!found) { fprintf(stderr, "error: cannot find -l%s\n", n); return 1; }
+			binary_in[ninputs] = as_binary;
+			in_kind[ninputs] = 0;
+			inputs[ninputs++] = found;
+		}
 		else if (strcmp(a,"-ffreestanding")==0) ctx->freestanding = ctx->nostdlib = 1;
 		else if (strcmp(a,"-nodefaultlibs")==0) ctx->nostart = ctx->nostdlib = 1;
 		else if (strcmp(a,"-nostdinc")==0) ctx->nostdinc = 1;
 		else if (strcmp(a,"-fno-common")==0) ctx->no_common = 1;
 		else if (strcmp(a,"-fcommon")==0) ctx->no_common = 0;
 		else if (strcmp(a,"-N")==0) ctx->omagic = 1;
-		else if ((strcmp(a,"-m")==0&&i+1<argc) || strncmp(a,"-melf",5)==0) {
-			const char *m = a[2] ? a+2 : argv[++i];
-			if (strcmp(m,"elf_x86_64")) { fprintf(stderr,"unsupported emulation: %s\n",m); return 1; }
+		else if ((strcmp(a,"-m")==0&&more) || strncmp(a,"-melf",5)==0) {
+			const char *m = a[2] ? a+2 : args[++i];
+			if (!strcmp(m,"elf_i386")) ctx->elf32 = 1;
+			else if (strcmp(m,"elf_x86_64")) { fprintf(stderr,"unsupported emulation: %s\n",m); return 1; }
+			if (!ld_style) ld_style = 2;
 		}
-		else if (a[0]=='-' && ignored_flag(a)) {}
+		else if (!strcmp(a,"-r") || !strcmp(a,"--relocatable")) { mode = 'r'; ld_style = 1; }
+		else if (!strcmp(a,"-shared")) { ctx->shared = 1; ld_style = 1; }
+		else if (!strcmp(a,"-Map")&&more) ctx->map = args[++i];
+		else if (!strncmp(a,"-Map=",5)) ctx->map = a + 5;
+		else if ((!strcmp(a,"-soname") || !strcmp(a,"-h"))&&more) ctx->soname = args[++i];
+		else if (!strncmp(a,"-soname=",8)) ctx->soname = a + 8;
+		else if (!strcmp(a,"-Bsymbolic")) {}
+		else if (!strcmp(a,"-z")&&more) { a = args[++i]; if (!strncmp(a,"max-page-size=",14)) ctx->max_page = strtoull(a+14, NULL, 0); }
+		else if (!strncmp(a,"-z",2)&&a[2]) { if (!strncmp(a+2,"max-page-size=",14)) ctx->max_page = strtoull(a+16, NULL, 0); }
+		else if (!strcmp(a,"--emit-relocs") || !strcmp(a,"-q")) ctx->emit_relocs = 1;
+		else if (!strcmp(a,"--build-id") || !strncmp(a,"--build-id=",11) || !strcmp(a,"--discard-none") || !strcmp(a,"--strip-debug") ||
+			!strcmp(a,"--gc-sections") || !strcmp(a,"--no-undefined") || !strncmp(a,"--hash-style=",13) || !strcmp(a,"-EL") || !strcmp(a,"--eh-frame-hdr") ||
+			!strcmp(a,"--warn-common") || !strcmp(a,"--verbose") || !strcmp(a,"--sort-common") || !strncmp(a,"--sort-section=",15)) {}
+		else if (!strcmp(a,"--sort-section")&&more) i++;
+		else if (!strcmp(a,"--whole-archive") || !strcmp(a,"--no-whole-archive") || !strcmp(a,"--start-group") || !strcmp(a,"--end-group") ||
+			!strcmp(a,"-(") || !strcmp(a,"-)")) {
+			binary_in[ninputs] = 0;
+			in_kind[ninputs] = a[2] == 'w' ? 'W' : a[2] == 'n' ? 'w' : a[2] == 's' || a[1] == '(' ? 'G' : 'g';
+			inputs[ninputs++] = a;
+		}
 		else if (strcmp(a,"-mgeneral-regs-only")==0) ctx->no_float = 1;
-		else if (strcmp(a,"-e")==0&&i+1<argc) entry=argv[++i];
-		else if (strcmp(a,"-T")==0&&i+1<argc) script=argv[++i];
-		else if (strcmp(a,"-Ttext")==0&&i+1<argc) {
+		else if (!strcmp(a,"-m32") || !strcmp(a,"-m16")) ctx->m32 = 1;
+		else if (!strncmp(a,"-mcmodel=",9)) ctx->kmodel = !strcmp(a+9,"kernel");
+		else if (!strcmp(a,"-mno-sse")) ctx->no_sse = 1;
+		else if (!strcmp(a,"-msse")) ctx->no_sse = 0;
+		else if (!strcmp(a,"-m64")) ctx->m32 = 0;
+		else if (a[0]=='-' && a[1]=='O' && (!a[2] || (strchr("0123sgz", a[2]) && !a[3]))) ctx->fold = strcmp(a, "-O0") != 0;
+		else if (a[0]=='-' && ignored_flag(a)) {}
+		else if (strcmp(a,"-e")==0&&more) entry=args[++i];
+		else if (strcmp(a,"-T")==0&&more) script=args[++i];
+		else if (strcmp(a,"-Ttext")==0&&more) {
 			char *end;
-			a = argv[++i];
+			a = args[++i];
 			ctx->ttext = strtoull(a, &end, 0);
 			ctx->has_ttext = 1;
 			if (!*a || *end) { fprintf(stderr,"bad address: %s\n",a); return 1; }
 		}
-		else if (strcmp(a,"-oformat")==0&&i+1<argc) {
-			a = argv[++i];
+		else if (strcmp(a,"-oformat")==0&&more) {
+			a = args[++i];
 			oformat_given = 1;
 			ctx->binary = strcmp(a,"elf") != 0;
 			ctx->image = strcmp(a,"img") == 0;
 			ctx->multiboot = strcmp(a,"multiboot") == 0;
 			if (ctx->binary && !ctx->image && !ctx->multiboot && strcmp(a,"bin") != 0) { fprintf(stderr,"unknown output format: %s\n",a); return 1; }
 		}
-		else if (strcmp(a,"-b")==0&&i+1<argc) {
-			a = argv[++i];
+		else if (strcmp(a,"-b")==0&&more) {
+			a = args[++i];
 			if (strcmp(a,"binary") && strcmp(a,"elf64-x86-64") && strcmp(a,"default")) { fprintf(stderr,"unknown input format: %s\n",a); return 1; }
 			as_binary = strcmp(a,"binary") == 0;
 		}
-		else if (a[0]=='-') { fprintf(stderr,"unknown arg: %s\n",a); return 1; }
-		else if (ninputs < 64) { binary_in[ninputs] = as_binary; inputs[ninputs++] = a; }
+		else if (a[0]=='-' && a[1]) { fprintf(stderr,"unknown arg: %s\n",a); return 1; }
+		else { binary_in[ninputs] = as_binary; in_kind[ninputs] = lang; inputs[ninputs++] = a; }
 	}
+	if (version && ninputs == 0) { printf("sccc version 1.0 (x86-64)\n"); return 0; }
+	int sources = 0;
+	for (int i = 0; i < ninputs; i++) {
+		int k = in_kind[i] ? in_kind[i] : input_kind(inputs[i]);
+		if (!binary_in[i] && (k == 'c' || k == 's' || k == 'S')) sources = 1;
+	}
+	if (ctx->elf32 && sources) { fprintf(stderr,"-m elf_i386 links objects assembled with -m32 or -m16, not sources\n"); return 1; }
+	if (ld_style == 1 || (ld_style == 2 && !sources)) ctx->nostdlib = ctx->nostart = 1;
+	ctx->track_deps = want_deps;
+	if (script && mode == 'r') script = NULL;
 	if (script) {
-		if (compile_only) { fprintf(stderr,"-T needs a link, not -c\n"); return 1; }
+		if (mode) { fprintf(stderr,"-T needs a link, not -c, -E or -S\n"); return 1; }
 		if (ctx->has_ttext) { fprintf(stderr,"-Ttext cannot be used with -T\n"); return 1; }
 		ctx->ld = ld_read(script);
 		ctx->track = 1;
 		if (!oformat_given) ctx->binary = ctx->ld->format == 2;
+		if (ctx->ld->format == 3) ctx->elf32 = 1;
+		ctx->ld->entry_cmd = entry;
+	} else if ((ctx->shared || ctx->elf32) && !mode && !sources) {
+		ctx->ld = ld_default(ctx);
+		ctx->track = 1;
 		ctx->ld->entry_cmd = entry;
 	}
 	if (ctx->image && !ctx->has_ttext && !script) { ctx->ttext = 0x100000; ctx->has_ttext = 1; }
 	if (ctx->multiboot && !ctx->has_ttext && !script) { ctx->ttext = 0x101000; ctx->has_ttext = 1; }
 	if (ctx->multiboot && (ctx->ttext & 0xFFF)) { fprintf(stderr,"-Ttext must be page aligned for multiboot\n"); return 1; }
 	if (ctx->no_float && !ctx->nostdlib) { fprintf(stderr,"-mgeneral-regs-only needs -nostdlib or -ffreestanding\n"); return 1; }
-	if (ninputs == 0) { fprintf(stderr,"usage: %s <file.c|.s|.S|.o|.a>... [-c] [-o <out>] [-I dir] [-D name[=val]] [-nostdlib]\n"
+	if (ninputs == 0) { fprintf(stderr,"usage: %s <file.c|.s|.S|.o|.a>... [-c|-E|-S] [-o <out>] [-I dir] [-D name[=val]] [-nostdlib]\n"
 			"       [-ffreestanding] [-e sym] [-Ttext addr] [-T script] [-oformat elf|bin|img|multiboot]\n"
 			"       [-mgeneral-regs-only]\n",argv[0]); return 1; }
 
@@ -10467,12 +14843,16 @@ int main(int argc, char **argv) {
 	id_syscall = intern("__syscall");
 	id_va_start = intern("__builtin_va_start");
 	id_va_arg = intern("__builtin_va_arg");
+	id_va_end = intern("__builtin_va_end");
+	id_va_copy = intern("__builtin_va_copy");
+	id_va_list = intern("__builtin_va_list");
 	id_exit = intern("exit");
 	id_libc_init = intern("__libc_init");
 	id_environ = intern("environ");
 	id_defined = intern("defined");
 	id_file = intern("__FILE__");
 	id_line = intern("__LINE__");
+	id_counter = intern("__COUNTER__");
 	id_va_args = intern("__VA_ARGS__");
 	id_func = intern("__func__");
 	id_function = intern("__FUNCTION__");
@@ -10500,39 +14880,40 @@ int main(int argc, char **argv) {
 	id_naked = intern("naked");
 	for (int i = 0; mach_builtins[i].name; i++) mach_ids[i] = intern(mach_builtins[i].name);
 
-	if (compile_only) {
-		if (out_given && ninputs > 1) { fprintf(stderr,"-o with -c needs a single input file\n"); return 1; }
+	if (mode == 'E') {
+		Buf b; buf_init(&b);
+		for (int i = 0; i < ninputs; i++) {
+			Ctx *u = unit_ctx(ctx);
+			preprocess_input(u, inputs[i], in_kind[i], &b);
+			if (want_deps) write_deps(u, depfile ? depfile : derived_name(inputs[i], ".d"), deptarget ? deptarget : out ? out : derived_name(inputs[i], ".o"));
+		}
+		write_out(out ? out : "-", &b, 0);
+		return 0;
+	}
+	if (mode == 'r') {
+		if (!out) out = "a.out";
+		link_inputs(ctx, inputs, in_kind, binary_in, ninputs);
+		write_object(ctx, out);
+		return 0;
+	}
+	if (mode) {
+		if (out && ninputs > 1) { fprintf(stderr,"-o with -c or -S needs a single input file\n"); return 1; }
 		if (as_binary) { fprintf(stderr,"-b binary needs a link, not -c\n"); return 1; }
 		for (int i = 0; i < ninputs; i++) {
-			int k = input_kind(inputs[i]);
+			int k = in_kind[i] ? in_kind[i] : input_kind(inputs[i]);
 			if (k == 'o' || k == 'a') { fprintf(stderr,"%s: error: -c needs a C or assembly file\n", inputs[i]); return 1; }
-			Ctx *u = (Ctx *)malloc(sizeof(Ctx));
-			ctx_init(u);
-			memcpy(u->incdirs, ctx->incdirs, sizeof(ctx->incdirs));
-			u->nincdirs = ctx->nincdirs;
-			memcpy(u->defines, ctx->defines, sizeof(ctx->defines));
-			u->ndefines = ctx->ndefines;
-			u->nostdlib = ctx->nostdlib;
-			u->freestanding = ctx->freestanding;
-			u->nostdinc = ctx->nostdinc;
-			u->no_common = ctx->no_common;
-			u->no_float = ctx->no_float;
-			u->track = 1;
-			compile_input(u, inputs[i]);
-			char obj[1024];
-			if (out_given) snprintf(obj, sizeof(obj), "%s", out);
-			else {
-				const char *b = strrchr(inputs[i], '/');
-				b = b ? b + 1 : inputs[i];
-				snprintf(obj, sizeof(obj), "%s", b);
-				char *dot = strrchr(obj, '.');
-				if (dot) *dot = 0;
-				if (strlen(obj) + 3 < sizeof(obj)) strcat(obj, ".o");
-			}
-			write_object(u, obj);
+			Ctx *u = unit_ctx(ctx);
+			Buf text; buf_init(&text);
+			if (mode == 'S') u->asm_text = &text;
+			compile_input(u, inputs[i], k);
+			const char *o = out ? out : derived_name(inputs[i], mode == 'S' ? ".s" : ".o");
+			if (mode == 'S') write_out(o, &text, 0);
+			else write_object(u, o);
+			if (want_deps) write_deps(u, depfile ? depfile : derived_name(o, ".d"), deptarget ? deptarget : o);
 		}
 		return 0;
 	}
+	if (!out) out = "a.out";
 
 	Type *mt = func_type(ty_int);
 	mt->oldstyle = 1;
@@ -10550,10 +14931,7 @@ int main(int argc, char **argv) {
 	if (main_sym) emit_start(ctx, main_sym, exit_sym, init_sym, environ_sym);
 	piece_end(ctx, "<start>");
 
-	for (int i = 0; i < ninputs; i++) {
-		if (binary_in[i]) load_binary(ctx, inputs[i]);
-		else compile_input(ctx, inputs[i]);
-	}
+	link_inputs(ctx, inputs, in_kind, binary_in, ninputs);
 	if (!ctx->nostdlib) {
 		ctx->in_libc = 1;
 		for (int i = 0; i < ctx->nsecs; i++)

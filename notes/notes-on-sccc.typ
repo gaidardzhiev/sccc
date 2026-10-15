@@ -28,7 +28,7 @@
 #align(center)[#text(weight: "bold", size: 10pt)[ABSTRACT]]
 #pad(x: 2.2em)[
   #text(size: 9.8pt)[
-  SCCC is a self-compiling C compiler and toolchain for x86-64. It compiles C and assembles x86 source, produces relocatable ELF objects, reads objects and archives, resolves symbols and relocations, and writes executable files. Its linker accepts GNU-style linker scripts. Hosted programs use an embedded C library; kernels can be built as ELF executables, flat binaries, BIOS disk images, or Multiboot images. The compiler follows the System V x86-64 calling convention. These notes describe the C implementation, assembler, linker, runtime, boot code, and self-compilation, including the build of xv6-x86_64 and its user programs.
+  SCCC is a self-compiling C compiler and x86-64 toolchain. Its C parser emits machine code as it reads the source; the assembler uses the same instruction encoder. The toolchain writes relocatable ELF objects and executables, reads archives, interprets GNU ld scripts, and produces flat and bootable images. It also links ELF32 boot code and shared ELF objects. SCCC compiles itself to identical second- and third-stage binaries. It builds xv6-x86_64 and Linux 5.4.302, together with musl 1.2.5 and BusyBox 1.36.1; the Linux system boots to an interactive BusyBox shell. These notes describe the compiler, assembler, linking and runtime machinery, kernel build interfaces, and operating-system builds.
   ]
 ]
 
@@ -42,11 +42,11 @@ A hosted compilation reads the input files, the embedded headers, and the embedd
 
 The C front end uses recursive descent for expressions, declarations, and statements. It constructs types while parsing and emits instructions while reading expressions. A normal expression returns a value or an address in `RAX`; the `lv` state distinguishes the two. The C emitter and the assembler share the machine-code encoder. They feed section buffers and relocation records to the output stage.
 
-The compiler is itself written in C99. GCC builds the first executable, which compiles `sccc.c` into a second compiler. The second produces a third. The last two executables are compared byte for byte. The resulting toolchain also builds xv6-x86_64: C kernel files, assembly start-up files, and user programs are compiled and linked by SCCC, and the operating system boots to its shell.
+The compiler is itself written in C99. GCC builds the first executable, which compiles `sccc.c` into a second compiler. The second produces a third. The last two executables are compared byte for byte. SCCC builds xv6-x86_64 and Linux 5.4.302, including their assembly and linker-script inputs. It also compiles musl 1.2.5 and BusyBox 1.36.1. Both operating systems boot in QEMU: xv6 reaches its shell, and Linux starts the BusyBox init process and an interactive `ash` shell. The Linux build also runs file-system commands and reboots from userspace.
 
 = Structure
 
-The compiler is one C program. The principal parts of `sccc.c` are tokenization and preprocessing, types and declarations, C expressions and statements, x86 instruction encoding, assembly parsing, ELF object input and output, symbol and archive handling, linker-script evaluation, section layout, and executable output. The code that produces BIOS and Multiboot images uses boot assembly from `lib/boot`.
+The compiler is one C program. The principal parts of `sccc.c` are tokenization and preprocessing, types and declarations, C expressions and statements, x86 instruction encoding, assembly parsing, ELF object input and output, symbol and archive handling, linker-script evaluation, section layout, and executable output. The output paths also write ELF32 objects, relocatable links, and shared ELF files. The code that produces BIOS and Multiboot images uses boot assembly from `lib/boot`.
 
 `Ctx` carries the current tokens, sources, macros, scopes, types, symbol definitions, section buffers, and relocations. A single invocation can read several C and assembly translation units, followed by objects and archives. The driver also has a compile-only path. It writes one relocatable object per source input instead of running the executable linker when `-c` is given.
 
@@ -66,7 +66,7 @@ Names are interned in a hash table of 8192 buckets. Each `Str` holds the spellin
 
 = The language
 
-The source language is C with the types and constructs implemented by the parser in `sccc.c`. Its basic types are `void`, `_Bool`, `char`, `short`, `int`, `long`, `float`, and `double`, together with signed and unsigned forms of the integer types. On the target, `char` and `_Bool` occupy one byte, `short` two, `int` four, and `long` eight. Pointers occupy eight bytes. Floating-point objects occupy four or eight bytes. A declaration of `long double` is handled by the `double` type path in `declspec`; it does not introduce an extended-precision representation. `signed char` and `long long` have type records of their own. They behave exactly like `char` and `long` in code generation, but they are different objects, so `_Generic` and `__builtin_types_compatible_p` can tell them apart.
+The source language is C with the types and constructs implemented by the parser in `sccc.c`. Its basic types are `void`, `_Bool`, `char`, `short`, `int`, `long`, `float`, `double`, and `long double`, together with signed and unsigned integer forms and complex floating types. On the target, `char` and `_Bool` occupy one byte, `short` two, `int` four, and `long` eight. Pointers occupy eight bytes. `float` and `double` occupy four and eight bytes; `long double` uses the x87 80-bit extended format stored in a 16-byte slot. `signed char` and `long long` have type records of their own. They behave like `char` and `long` in ordinary integer code generation, but they remain distinct types for `_Generic` and `__builtin_types_compatible_p`.
 
 `typedef`, enumerations, pointers, arrays, functions, structures, unions, and bit-fields are part of the parser. The recognized storage-class words include `static`, `extern`, and `typedef`. `auto`, `register`, and `inline` are read and discarded by `declspec`; `const`, `volatile`, and `restrict` are likewise accepted without a separate qualified type. Consequently, these spellings do not introduce an independent qualifier-enforcement or volatile-access mechanism in the generated code.
 
@@ -140,6 +140,35 @@ int chosen = flag ? result : 0;
 Multiplication is emitted before addition. Comparisons produce integer truth values. `&&` and `||` use conditional jumps to skip the right operand when the left operand determines the result. This is a different code path from bitwise `&` and `|`, which evaluate both operands and combine their bits. The conditional operator also generates two control-flow paths and patches a jump where they meet.
 
 The source handles prefix and postfix `++` and `--`, compound assignments, casts, `sizeof`, pointer arithmetic, and direct or indirect calls. Signed comparisons and unsigned comparisons select different condition codes. Integer division uses `idiv` for signed values and `div` for unsigned values. Floating-point arithmetic uses SSE instructions and separate integer/float conversion routines. The bit pattern of a floating value is carried through ordinary expression storage in a general-purpose register; SSE registers are used while arithmetic or comparison is performed.
+
+
+== Long double and complex values
+
+`long double` has its own type and the x87 extended format. The lexer turns decimal and hexadecimal long-double constants into ten-byte significand-and-exponent values. The conversion path uses the `Big` routines for multiword integer arithmetic and rounding, then places the resulting extended value in a sixteen-byte slot. A cast from `double` to `long double` loads a value onto the x87 register stack; a cast back stores it with the requested precision. The `gen_ldcast` routine handles integer, single-precision, double-precision, and extended-precision conversions. Ordinary `float` and `double` expressions continue to use SSE2.
+
+```c
+long double x = 1.0L / 10.0L;
+long double y = x * 10.0L;
+int same = y == 1.0L;
+```
+
+The compiler uses x87 instructions for operations involving `long double`, and it saves intermediate values in stack slots when the expression requires an address. The return convention follows the x86-64 ABI: a scalar `long double` result is returned in `st(0)`. The type system also constructs complex floating types. A complex value consists of real and imaginary components, and the arithmetic generator handles the corresponding addition, subtraction, multiplication, division, and conversions. These operations are part of the same expression parser as the integer and SSE paths.
+
+== Variable-length arrays
+
+An automatic array can take its length from a run-time expression. The size expression is evaluated where the declaration appears, multiplied by the element size, and rounded to the alignment used for the stack. The compiler adjusts `rsp` and records the resulting address in the variable's stack slot. `sizeof` on that array uses the size computed for the particular instance.
+
+```c
+int checksum(int n) {
+    int a[n];
+    for (int i = 0; i < n; i++) a[i] = i * 3;
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += a[i];
+    return sum;
+}
+```
+
+A block saves the stack position at entry. Leaving the block restores it, including when control leaves through `break`, `continue`, `goto`, or `return`. `alloca` shares this dynamic stack allocation machinery. A kernel can therefore compile source that sizes temporary arrays from run-time values without changing the executable's data layout.
 
 = Preprocessing and tokenization
 
@@ -259,13 +288,33 @@ A conditional branch can be emitted before its target has a position in the text
 
 `switch` first saves its controlling value. The case labels record positions in the body. After the body has been emitted, the compiler writes a chain of comparisons and jumps to those positions, with a final jump to `default` when present. `goto` names are stored in a function-local label list. A forward goto adds a patch to its label; defining the label resolves the pending jumps. Undefined and duplicate labels are diagnosed.
 
+
+= Constant folding and function expansion
+
+Optimization happens while the parser still has the expression and its type. The `-O` family enables constant folding, the removal of code under constant conditions, the omission of statements after an unconditional transfer, and the expansion of selected inline functions. There is still one C parsing pass and no intermediate syntax tree. In a kernel build these local transformations also determine which sections and symbols reach the linker.
+
+An integer constant is passed to `emit_const`, which chooses the encoding used to place it in `RAX`. `fold_binop` combines constant operands using the C conversion rules. When a local scalar has a known value, `kv_valid` and `kv` in its `Sym` record let `rval` substitute the constant for a load. Assignments, address-taking, calls, and control-flow boundaries invalidate or constrain that knowledge. The `kv_forget` routines implement those transitions.
+
+```c
+static int scale(int x) { return x * 8; }
+
+int next(int n) {
+    if (0) return 99;
+    return scale(n + 1);
+}
+```
+
+With optimization enabled the dead branch is not emitted. Inline expansion can substitute the body of `scale` at the call site. `capture_body` keeps the function's token sequence, and `replay` reads those tokens again with the call arguments bound to parameters. `compile_lazy` emits a retained static function when a live relocation requires it. `prune_statics` walks relocations between static data objects to retain the ones reachable from live code or exported data. These decisions are made from emitted code and symbol references rather than from an intermediate representation.
+
+The `dead_begin`, `dead_end`, and `after_jump` routines stop instruction emission for paths excluded by constant control flow or by a `return`, `goto`, `break`, or `continue`. Labels referenced by live code restore emission at the necessary point. `-O0` keeps the direct, unoptimized translation; `-O1`, `-O2`, `-O3`, and `-Os` select the same compact set of local transformations. GNU inline attributes are carried on function symbols and affect whether their captured bodies are expanded or emitted as callable functions.
+
 = Functions and calls
 
 A generated function saves `rbp`, establishes a frame pointer, and reserves stack space after the size of its locals and temporaries is known. Parameters received in registers are copied into frame locations. An epilogue restores the stack and returns. The code generator counts temporary pushes so calls are made with the stack aligned to 16 bytes.
 
 == System V argument classification
 
-Calls use the System V x86-64 convention. Each scalar integer or pointer uses an INTEGER argument location. A `float` or `double` uses an SSE location. The six INTEGER registers are `RDI`, `RSI`, `RDX`, `RCX`, `R8`, and `R9`, and the eight SSE registers are `XMM0` through `XMM7`. The two register lists are allocated independently. Arguments left over after their registers are exhausted go on the stack.
+Calls use the System V x86-64 convention. Each scalar integer or pointer uses an INTEGER argument location. A `float` or `double` uses an SSE location. The six INTEGER registers are `RDI`, `RSI`, `RDX`, `RCX`, `R8`, and `R9`, and the eight SSE registers are `XMM0` through `XMM7`. The two register lists are allocated independently. Arguments left over after their registers are exhausted go on the stack. A scalar `long double` uses the x87 return register `st(0)`; the ordinary SSE register rules apply to `float` and `double`.
 
 Structures and unions of up to sixteen bytes are classified one eight-byte unit at a time. The class of each unit depends on its members, with INTEGER taking precedence when integer and floating fields occupy the same unit. Large or unaligned aggregates are passed in memory. A register-returned aggregate uses the appropriate combination of `RAX`, `RDX`, `XMM0`, and `XMM1`. When a return value needs memory, the caller passes its address in `RDI`; the callee returns the address in `RAX`.
 
@@ -415,7 +464,7 @@ The header also contains a `finish` routine. It waits for serial output to drain
 
 = Kernel programs
 
-The `baremetal` directory contains six kernel programs written in C. Each uses the disk image output, starts through the generated boot sector, and runs without the Linux runtime. Their output goes through COM1; `hello` also writes directly to VGA text memory at physical address `0xb8000`.
+The `baremetal` directory contains seven kernel programs written in C. Each uses the disk image output, starts through the generated boot sector, and runs without the Linux runtime. Their output goes through COM1; `hello` also writes directly to VGA text memory at physical address `0xb8000`.
 
 The `hello` kernel initializes the serial port, writes a line of text, fills the 80-by-25 VGA character cells, and verifies that the character-and-attribute words can be read back. It prints the result over serial before stopping the emulator. The kernel does not call `printf`. Its output routine is a loop over I/O-port writes in `kernel.h`.
 
@@ -427,9 +476,11 @@ The `keyboard` kernel handles PS/2 keyboard interrupts on vector 33. Its handler
 
 The `memory` kernel receives the E820 map passed by the BIOS boot sector. It creates a bitmap covering the first gigabyte in 4096-byte page frames, marks only usable memory above 2 MB available, and allocates and releases frames while checking their contents. It also finds a consecutive 256-frame run and uses it as a one-megabyte heap. The heap keeps a linked list of blocks, splits a block for allocation, and coalesces adjacent free blocks on release. A test performs 3000 pseudorandom allocations and frees, checking data and 16-byte alignment. Both the page-frame and heap tests finish with their free counts restored.
 
+The `tasks` kernel adds interrupt stubs and context switches written in a separate `.S` file. It installs handlers for breakpoint, division error, invalid opcode, and general protection faults. A timer interrupt enters through the IDT, three tasks switch through saved interrupt frames using `int $0x80`, and a coroutine changes context through `switch_to`. Assembly calls back into C through a table of function pointers. This program exercises the connection between C functions, interrupt frames, assembler labels, and kernel stack layouts.
+
 The `initcall` kernel is laid out the way larger kernels organize their start-up code. Each init function is registered with a macro that places a function pointer in the section `initcalls`, and `kmain` walks the table from `__start_initcalls` to `__stop_initcalls`. One init function builds new page tables in static arrays declared with `aligned(4096)`. They identity map the first gigabyte and map it a second time at `0xffffffff80000000`. The function loads them with `__write_cr3` and checks a variable through both addresses. Another runs a small bytecode program through a table of label addresses and `goto *`. A third classifies characters with case ranges and fills a table with range designators. The last checks that an undefined weak symbol has address 0 and that an alias calls its target. Output goes through `_Generic` and statement-expression macros.
 
-The six programs exercise different parts of the compiler while running on the processor directly: volatile memory accesses, integer types and pointer arithmetic, hardware operations, function wrappers, control-flow patching, constant data, global initialization, and structure layouts. The `baremetal/run.sh` suite compiles each kernel, boots it in QEMU and Bochs, and compares its serial output with the checked-in `.out` file. QEMU completion is also checked through the debug-exit status; Bochs completion is checked through its shutdown request. The source of the kernels and their expected output live together in the repository.
+The seven programs exercise different parts of the compiler while running on the processor directly: volatile memory accesses, integer types and pointer arithmetic, hardware operations, function wrappers, control-flow patching, constant data, global initialization, and structure layouts. The `baremetal/run.sh` suite compiles each kernel, boots it in QEMU and Bochs, and compares its serial output with the checked-in `.out` file. QEMU completion is also checked through the debug-exit status; Bochs completion is checked through its shutdown request. The source of the kernels and their expected output live together in the repository.
 
 ```sh
 make baremetal
@@ -466,6 +517,102 @@ The console excerpt is from the xv6 run built with SCCC. Reaching the shell requ
 
 The `make xv6` test performs a longer check. `tools/xv6.sh` builds xv6 with SCCC and builds a GCC/GNU-toolchain reference, boots both with QEMU, runs xv6 `usertests`, and compares normalized serial output. `make xv6run` is the interactive route; `make xv6` is the automated operating-system test. The xv6 source is kept separately from the compiler sources. The observed shell boot and the test driver use the same compilation and linking paths.
 
+
+= Compiling Linux
+
+The Linux build uses the compiler as the C compiler, assembler, and linker under Kbuild. `tools/linuxrun.sh` obtains Linux 5.4.302 from kernel.org, checks its checksum, applies `tools/linux.config` to a `tinyconfig`, and creates an out-of-tree build under `linux/build-sccc`. The selected configuration enables x86-64, the PVH entry, serial console output, an initial RAM filesystem, and ELF program loading. The build produces `vmlinux` using `sccc` for `CC`, `AS`, and `LD`; Kbuild's host-side utilities are built with `HOSTCC=gcc`.
+
+```sh
+make linuxrun
+# or run the build stages separately:
+tools/linuxrun.sh fetch
+tools/linuxrun.sh config
+tools/linuxrun.sh build
+tools/linuxrun.sh init
+```
+
+Kbuild supplies C sources, preprocessed assembly, relocatable objects, archives, linker command lines, and the `vmlinux` linker script. Linux also uses GNU C syntax, attributes, inline assembly, local and global symbol bindings, and generated headers. SCCC reads the same files and places the resulting sections into the kernel image. The build therefore exercises the compiler as an independent toolchain through a considerably larger translation workload than its own source.
+
+== The first user process
+
+The Linux test has two boot stages. The first runs the kernel without an initramfs. Serial output reaches the missing-init panic after the kernel has initialized its subsystems. The second stage supplies an initramfs containing a statically compiled `/init` from `tools/linuxinit.c`. The script creates the archive with the kernel's `gen_init_cpio` tool, then passes it to QEMU with `-initrd`.
+
+```c
+void _start(void) {
+    put("sccc init: hello from userspace\n");
+    put("sccc init: pid ");
+    putnum(sys(39, 0, 0, 0, 0));
+    put("\n");
+    sys(169, 0xfee1dead, 672274793, 0x01234567, 0);
+    for (;;) sys(34, 0, 0, 0, 0);
+}
+```
+
+The program starts without the hosted C runtime and issues Linux system calls through inline assembly. It writes to the serial console and obtains its PID from the running kernel. The printed message establishes that control has passed from the kernel's ELF loader into an SCCC-compiled user program. QEMU boots the PVH kernel directly with `-kernel`; when KVM is available the script enables it.
+
+== Debugging the kernel build
+
+Kernel object files are useful units of comparison because GCC and SCCC produce the same ELF object format and use the same external calling convention. During the Linux bring-up, I substituted GCC-built objects for SCCC-built ones until the boot failure narrowed to one object. Comparing its machine code and relocations with the GCC output then exposed the offending generation error. The final kernel links objects from both compilers in the same program during this diagnostic process.
+
+This method separates the parser and code generator from the linker and boot environment. A kernel that works with a single GCC object substituted identifies the source unit to inspect; an instruction or relocation comparison can then be made around the failing function. The mixed-object ABI and ELF tests already used by SCCC serve the same purpose at a smaller scale.
+
+
+= Building musl and BusyBox
+
+The kernel boot is followed by a userspace built with SCCC. `tools/busyboxrun.sh` obtains musl 1.2.5 and BusyBox 1.36.1, checks their release archives, and creates the runtime and shell used by the kernel. It uses the kernel's installed UAPI headers for types and system interfaces and keeps the runtime, application, and kernel builds in separate directories.
+
+== The C library
+
+musl is configured with SCCC as its C compiler and built into a static `libc.a`. SCCC compiles the library's C and assembly sources, leaving the normal archive creation to `ar` and `ranlib`. The resulting library provides the C startup files and functions that a separate application expects from a Linux C library. It is distinct from SCCC's embedded library, which remains the runtime used for an ordinary single-command compilation.
+
+The `tools/musl-sccc` wrapper supplies musl's include path and the kernel UAPI headers for compilation. At link time it uses `-nostdlib`, adds `crt1.o` and `crti.o` ahead of the user inputs, then places `libc.a` and `crtn.o` after them. In this way the application uses musl's startup and library, while SCCC emits the object files and performs the link.
+
+```sh
+# The wrapper is used by the BusyBox build as CC:
+tools/musl-sccc -c example.c -o example.o
+tools/musl-sccc example.o -o example
+```
+
+== BusyBox and the initramfs
+
+BusyBox is configured from `allnoconfig` and `tools/busybox.config`, then compiled with `tools/musl-sccc`. Its applets share one executable and are reached through symbolic links under `/bin`, `/sbin`, and `/usr`. The initramfs also holds `/etc/inittab` and `/etc/init.d/rcS`. The startup script mounts `proc`, `sysfs`, `devtmpfs`, and `tmpfs` before starting an interactive shell.
+
+```sh
+make busyboxrun
+make busyboxcheck
+```
+
+`busyboxrun` builds Linux with the configuration in `tools/linux-busybox.config` added to the basic kernel configuration. It enables the filesystem and process interfaces needed by the shell, including procfs, sysfs, tmpfs, devtmpfs, futexes, and the usual event and timer facilities. QEMU loads the kernel with the initramfs and starts BusyBox as `/init`. The shell can run applets from its own executable, use pipes and redirections, create background jobs, read `/proc`, and power off the virtual machine.
+
+The automated session runs `uname -a`, `ls /`, `cat /proc/meminfo`, `ps`, `mount`, shell arithmetic, a pipe, a here-document, a background process, and a nonexistent command whose exit status is checked. The final command powers off the guest. `make busyboxcheck` also builds musl and BusyBox with GCC, runs `tools/musltest.c` and `tools/bbtest.sh` against both toolchains, and compares the outputs. The comparison includes formatted I/O, command substitution, shell functions, file operations, sorting, text utilities, and process handling.
+
+== Booting Linux 5.4.302
+
+The `make busyboxrun` target builds musl 1.2.5, installs the Linux UAPI headers, compiles BusyBox 1.36.1, and then builds Linux 5.4.302 with SCCC. `tools/busyboxrun.sh` assembles the initramfs and starts the kernel in QEMU with the serial console on `ttyS0`. The kernel identifies its compiler as `sccc version 1.0 (x86-64)` and proceeds through memory initialization, ACPI and PCI discovery, interrupt-controller setup, and serial-device initialization before launching `/init`.
+
+The following lines are from the interactive `make busyboxrun` session:
+
+```text
+Linux version 5.4.302 (root@v4n) (sccc version 1.0 (x86-64))
+Console: colour dummy device 80x25
+printk: console [ttyS0] enabled
+Unpacking initramfs...
+Run /init as init process
+init started: BusyBox v1.36.1
+sccc busybox: system ready
+BusyBox v1.36.1 built-in shell (ash)
+~ # ls
+bin   dev   etc   init  proc  root  sbin  sys   tmp   usr
+~ # pwd
+/
+~ # reboot
+The system is going down NOW!
+Requesting system reboot
+reboot: Restarting system
+```
+
+The shell is the BusyBox executable linked against the musl library compiled by SCCC. Its startup script has mounted the virtual filesystems and started the shell from the initramfs. `ls` reads the root directory, `pwd` reports `/`, and `reboot` initiates an orderly shutdown through the Linux userspace and kernel interfaces. The QEMU session ends after the guest restarts. This run exercises C compilation, x86 assembly, ELF object and archive linking, the kernel linker script, musl startup code, process creation, system calls, the initramfs, and the interactive shell in one build.
+
 = Multiple source files
 
 Each C file has its own preprocessing run and file-scope names. Definitions that need external linkage become global symbols in the output. Assembly labels declared with `.globl` participate in that same symbol namespace. SCCC can therefore compile several C and assembly files at once or compile them separately and link the results later.
@@ -500,6 +647,20 @@ Directives select `.text`, `.rodata`, `.data`, `.bss`, or a named section. Data 
 An assembly unit is read in passes. A forward branch initially may not know whether its target fits an eight-bit displacement. If it does not fit, the next pass uses the longer branch form. The passes repeat until no further branch grows. Unresolved cross-section and external references become relocations for the linker. Assembly and C are thus joined at the section and symbol level, not by textual inclusion.
 
 The source test `tools/ascorpus.py` compares instruction encodings with an external assembler over a generated corpus. The mechanism being tested is the shared encoder, so this also exercises instruction forms used by the C compiler.
+
+
+== Assembler macros and repetitions
+
+The assembly front end also has macro expansion. `.macro` records a body and its formal parameters; invocation substitutes the arguments and pushes the resulting text back into the assembler input. `as_macro_def`, `as_macro_call`, and `as_subst` do the recording and substitution. The assembler uses the same stack of text inputs for `.rept`, `.irp`, and `.irpc`, so a repeated instruction block is assembled by the ordinary instruction parser after substitution.
+
+```asm
+.macro save_reg reg
+    pushq \reg
+.endm
+save_reg %rbx
+```
+
+An assembly macro is expanded before instruction encoding. Numeric local labels, section changes, and relocation expressions in its body are then handled by the existing assembler passes. This is used with the assembly fragments and generated sources encountered in kernel builds.
 
 = Inline assembly
 
@@ -557,6 +718,42 @@ The example follows the kernel script in `baremetal/higher`. The boot code is lo
 Section placement is iterative where an expression refers to an address not yet known. Each input section is assigned to its first matching output-section rule. Unmatched sections are placed as orphans according to their kind. The final program headers group sections with compatible load mappings. For binary output the writer emits the loadable bytes starting at the lowest load address, omitting uninitialized storage. The image writers can then add the appropriate BIOS or Multiboot prefix.
 
 The tests in `tests/ldscript/` exercise executable, flat, higher-half, and orphan-section layouts. `tools/ldfuzz.py` compares additional generated script cases. This parser is part of SCCC's executable linker; it does not invoke GNU ld to interpret the script.
+
+
+= The compiler driver for kernel builds
+
+Kbuild treats the compiler, assembler, and linker as separate programs and passes the options used by GNU tools. SCCC accepts those commands through one driver. `-E` preprocesses a source unit, `-x` specifies its language, `-include` injects a header before it, and `-isystem`, `-iquote`, and `-idirafter` select include search directories. `-std=gnu89`, `gnu99`, and `gnu11` set the GNU language mode and the corresponding `extern inline` rules. The driver defines the GNU compatibility macros used by kernel headers. The dependency options `-M`, `-MM`, `-MF`, `-MT`, `-MQ`, and `-MP` are processed by `write_deps`.
+
+The linker path accepts archives as inputs and implements `--whole-archive`, `--no-whole-archive`, `--start-group`, and `--end-group` to control member extraction. Other Kbuild link options select section collection, retained relocation information, GNU symbol versions, a build ID, and an ELF hash table. Input options such as `-z max-page-size=` are passed to the layout machinery. The command-line parser builds the link context used by `link_inputs` and the ELF writers.
+
+The important output switches select a kind of file, not a separate external tool: `-c` writes objects, `-r` performs an intermediate relocatable link, `-shared` writes ELF shared objects, and `-T` lays out sections under a script. This is how Kbuild's compile, assemble, intermediate link, vDSO link, and final `vmlinux` link enter SCCC through the same executable.
+
+= Kernel object formats and shared ELF
+
+The Linux build exercises three ELF output paths alongside the ordinary x86-64 executable writer. Early x86 boot code uses 16-bit and 32-bit instructions and ELF32 objects; later kernel code uses ELF64 relocatable objects. The link of `vmlinux` uses a GNU ld script, and the vDSO is constructed as an ELF shared object. Each path retains the same symbol and relocation machinery, with an ELF header and relocation representation for the selected class.
+
+== ELF32 boot objects
+
+The assembler understands `.code16`, `.code32`, and `.code64`. Command-line `-m16` and `-m32` select the starting assembly mode. The linker emulation `-m elf_i386` writes ELF32 from these objects. `elf_to32` writes the ELF32 headers and relocations after the relevant addresses and offsets have been assigned. `rel386` handles the relocation forms used by the 32-bit link. Kbuild uses this path for real-mode boot components before the processor transitions to long mode.
+
+```sh
+./sccc -m32 -c boot.s -o boot.o
+./sccc -m elf_i386 -T boot.ld boot.o -o boot.elf
+```
+
+The assembler may change mode within one source file. The C compiler continues to generate x86-64 code; the 16-bit and 32-bit paths belong to the assembler and ELF writer. Linux therefore reaches its 64-bit C code through startup instructions that have been assembled and linked by the same program.
+
+== Relocatable links and the vDSO
+
+The `-r` option links several inputs into a new relocatable object. Defined symbols and input sections are combined, while relocations that still require a final address remain in the output. This corresponds to the intermediate links performed by Kbuild between directories and at later kernel build stages. Archive extraction and weak-symbol rules apply at the same point in the link.
+
+The `-shared` path writes ELF type `ET_DYN`. It builds `.dynsym`, `.dynstr`, `.hash`, `.gnu.hash`, and `.dynamic`, using the functions `elf_hash`, `gnu_hash`, `ld_shared_prep`, and `ld_shared_fill`. The script interpreter reads `VERSION` blocks through `ld_version` and assigns the symbol versions used in a Linux vDSO. The vDSO is the small kernel-provided shared ELF image mapped into each process so user code can call selected kernel services without a conventional system call on every invocation.
+
+GNU ld script support now also assigns program headers through `PHDRS` and `ld_resolve_phdrs`. Entry addresses, output-section boundaries, load addresses, and segment permissions come from the script and its expressions. The linker can use `--emit-relocs` to retain relocation data and `--build-id`, `--gc-sections`, and `--eh-frame-hdr` when requested by a kernel build. The resulting files carry the layout that the boot loader and kernel expect.
+
+== Kernel addresses and calling conventions
+
+`-mcmodel=kernel` encodes kernel symbol addresses as sign-extended 32-bit immediates, with `R_X86_64_32S` relocations. This is the addressing form for code linked into the upper two gigabytes of the virtual address space. The `-mno-sse` flag keeps the variadic argument prologue from saving XMM registers, while `-mgeneral-regs-only` rejects floating-point expressions in kernel code. These flags affect instruction selection and function entry code; the ordinary System V argument classification remains the basis for separately compiled C objects.
 
 = GNU C and C11 extensions
 
@@ -649,26 +846,39 @@ The bootstrap rule builds two self-compiled generations and compares the bytes:
 cmp sccc2 sccc3
 ```
 
-For the source accompanying these notes the comparison succeeds. In the inspected build the host-built compiler occupies 436448 bytes and the second and third generations each occupy 858576 bytes. The latter two files are byte-identical. The first executable was built by GCC from the same C source, but the others were generated entirely by SCCC.
+For the source accompanying these notes the comparison succeeds. In this build the host-built compiler occupies 613400 bytes and the second and third generations each occupy 1184856 bytes. The latter two files are byte-identical. The first executable was built by GCC from the same C source, but the others were generated entirely by SCCC.
 
-`make check` tests the language and the toolchain from several directions. The C driver compiles and runs small programs and checks diagnostics. The feature and example suites compile source directly and also through intermediate object files. `tests/link/` covers symbol resolution, weak and common definitions, TLS, and object linking. `tests/ldscript/` checks scripted section placement. The ABI fuzzer compiles calling-convention cases across SCCC and GCC. The assembler corpus checks instruction encodings, and the linker fuzzer exercises generated link scripts. Bare-metal tests boot the kernel examples in QEMU and Bochs.
+`make check` tests the language and the toolchain from several directions. The source tree contains 182 C-driver cases, 22 feature programs, and 47 example programs. The C driver compiles and runs small programs and checks diagnostics. The feature and example suites compile source directly and also through intermediate object files. `tests/link/` covers symbol resolution, weak and common definitions, TLS, and object linking. `tests/ldscript/` checks scripted section placement. The ABI fuzzer compiles calling-convention cases across SCCC and GCC. The assembler corpus checks instruction encodings, and the linker fuzzer exercises generated link scripts. Bare-metal tests boot the kernel examples in QEMU and Bochs.
 
-The operating-system test is separate:
+The operating-system builds have their own targets:
 
 ```sh
-make xv6       # rebuild xv6, run its tests, compare with GCC
-make xv6run    # build xv6 and enter its shell in QEMU
+make xv6          # run the xv6 user tests and compare with GCC
+make xv6run       # boot xv6 to its interactive shell
+make linuxrun     # compile and boot Linux with an SCCC-built /init
+make busyboxrun   # build musl, BusyBox, and the Linux userspace
+make busyboxcheck # compare SCCC and GCC userspace builds
 ```
 
-The xv6 build uses the compiler for kernel C, assembly, object linking, and the user-space programs. The observed boot reaches `init: starting sh` and accepts commands at the `$` prompt. The automated xv6 script runs `usertests` and compares its output against a GCC-built reference. The project carries the test scripts and the selected upstream xv6 revision, so the commands identify the experiment rather than relying on hand-built binaries.
+The xv6 build uses the compiler for kernel C, assembly, object linking, and user programs. Its boot reaches `init: starting sh` and accepts commands at the `$` prompt. The automated xv6 script runs `usertests` and compares the output against a GCC-built reference. The Linux script builds `vmlinux` and boots it through QEMU's PVH entry. `make busyboxrun` builds Linux 5.4.302, musl 1.2.5, and BusyBox 1.36.1, then starts an interactive `ash` shell from the initramfs. The recorded session executes `ls`, `pwd`, and `reboot`. The library and shell differential tests compare their results with the GCC builds.
 
 Byte identity demonstrates that the compiler reproduces its own output. The language, ABI, assembler, linker, bare-metal, and xv6 tests exercise different properties. Self-hosting checks a fixed point in the compiler build; compiling the operating system checks a larger body of C and assembly under a different runtime.
 
 = Source size and executable size
 
-The compiler now contains 10599 lines in `sccc.c`; the C test driver contains 773 lines. `builtin.h` contains 2373 lines of generated embedded headers and library text, together with the embedded boot sources used by the image writers. Those sources are compiled or assembled by SCCC when a build needs them.
+The compiler now contains 14977 lines in `sccc.c`; the C test driver contains 1326 lines. `builtin.h` contains 2373 lines of generated embedded headers and library text, together with the embedded boot sources used by the image writers. Those sources are compiled or assembled by SCCC when a build needs them.
 
-The compiler source contains an AT&T syntax assembler, relocatable ELF object writer and reader, static-archive extraction, ABI argument classification, inline assembly, linker-script interpretation, TLS layout, and the final executable linker. Separate compilation produces an object representation; mixed-source links require global symbol resolution; scripts can place a higher-half kernel at a virtual address distinct from its physical load address.
+The compiler source contains an AT&T syntax assembler, relocatable ELF object writer and reader, static-archive extraction, ABI argument classification, inline assembly, linker-script interpretation, TLS layout, ELF32 object links, and shared ELF construction. Separate compilation produces an object representation; mixed-source links require global symbol resolution; scripts place kernel sections at their virtual and physical load addresses. The newest C front end also includes dynamic arrays, x87 `long double`, complex arithmetic, constant folding, dead-code elimination, and inline function expansion.
+
+The self-compile timing on the author's x86-64 machine was approximately 0.08 seconds for the current `sccc.c`. TCC compiled the same source in 0.05 seconds, GCC at `-O0` in 2.0 seconds, and GCC at `-O2` in 13.8 seconds. These are compilation times for one source file on the same machine. They measure how quickly each compiler constructs the executable, not the running speed of the code it generates.
+
+```
+compiler       compile sccc.c
+TCC                 0.05 s
+SCCC                0.08 s
+GCC -O0             2.0 s
+GCC -O2            13.8 s
+```
 
 The host-compiled SCCC and self-compiled stages have different executable sizes because GCC and SCCC emit different instruction sequences. The bootstrap requires identity only between `sccc2` and `sccc3`. The new test commands measure assembler, linker, ABI, and operating-system behavior in addition to compiler reproduction.
 
@@ -680,13 +890,13 @@ The assembler is a second front end for the same instruction encoder. `assemble_
 
 The script parser and layout engine appear in the `ld_` functions. The parser records assignments, input-section patterns, and output-section rules. The matching and layout passes assign file offsets, virtual addresses, and load addresses; `ld_write_elf` writes the resulting ELF file. `write_elf` remains the driver for the original output formats and for links without a script. Image construction uses the assembly sources under `lib/boot` and the same encoder.
 
-The xv6 build traverses nearly the whole system: C compilation, preprocessed assembly, separate object emission, archive and symbol handling, the System V ABI, scripted kernel layout, and executable writing. The bare-metal kernels exercise early boot and device operations; xv6 adds process creation, a file system, and separately linked user programs. Together they give a concrete description of what SCCC produces.
+The xv6 build traverses C compilation, preprocessed assembly, separate object emission, archive and symbol handling, the System V ABI, scripted kernel layout, and executable writing. The bare-metal kernels exercise early boot and devices; xv6 adds processes, a file system, and separately linked user programs. The Linux build adds Kbuild option parsing, relocatable intermediate links, ELF32 entry code, kernel address models, and shared vDSO layout. Building musl and BusyBox adds an independently developed C runtime, a shell, system utilities, and interactive userspace on top of the SCCC-built kernel.
 
 = Conclusion
 
-SCCC is a self-compiling x86-64 C toolchain. Its C parser emits machine instructions directly; its assembler reads `.s`, `.S`, and inline assembly; its object writer emits relocatable ELF files; and its linker reads objects, selects archive members, processes linker scripts, resolves relocations, and constructs final executables. The generated functions use the System V calling convention. The same toolchain writes hosted Linux executables and freestanding boot images.
+SCCC is a self-compiling x86-64 C toolchain. Its C parser emits machine instructions directly; its assembler reads `.s`, `.S`, and inline assembly; its object writer produces ELF relocatable files; and its linker reads objects and archives, processes linker scripts, resolves relocations, and constructs final executables. It also writes ELF32 boot objects and shared ELF images, handles kernel address models, and builds a Linux vDSO. Its functions use the System V calling convention.
 
-The compiler compiles itself to identical second- and third-stage executables. It also compiles and links xv6-x86_64, including the kernel and its user programs, and the operating system boots to a shell under QEMU. The source traces the operations from C declarations and assembly operands to relocations, section addresses, and the bytes the processor executes.
+The compiler compiles itself to identical second- and third-stage executables. It builds xv6-x86_64 and boots it to a shell. It also builds Linux 5.4.302, musl 1.2.5, and BusyBox 1.36.1. The Linux system initializes its devices, starts `/init`, enters an interactive `ash` shell, runs commands from the initramfs, and reboots. SCCC provides the compiler, assembler, linker, and runtime construction needed to take these sources from C and assembly to running operating systems.
 
-#strong[Availability.]The source code of the compiler, library, hosted and bare-metal tests, kernel examples, and bootstrap Makefile carry the GPL-3.0-only license and are distributed at:\
+#strong[Availability.] The source code of the compiler, library, hosted and bare-metal tests, kernel examples, and bootstrap Makefile carry the GPL-3.0-only license and are distributed at:\
 `https://github.com/gaidardzhiev/sccc`
